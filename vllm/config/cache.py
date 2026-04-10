@@ -152,6 +152,14 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
+    compaction_window_size: int = 0
+    """KV cache compaction: maximum number of tokens before eviction triggers.
+    0 = disabled (default). When set, the scheduler evicts the oldest post-prompt
+    KV blocks when a request's KV length exceeds this window."""
+    compaction_stride: int = 0
+    """KV cache compaction: number of tokens to evict per compaction event.
+    Must be a multiple of block_size."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -180,6 +188,9 @@ class CacheConfig:
             "num_cpu_blocks",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
+            # Compaction is a runtime scheduler feature
+            "compaction_window_size",
+            "compaction_stride",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors

@@ -625,6 +625,10 @@ class EngineArgs:
 
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
+
+    # KV cache compaction
+    compaction_window_size: int = CacheConfig.compaction_window_size
+    compaction_stride: int = CacheConfig.compaction_stride
     tokens_only: bool = False
 
     shutdown_timeout: int = 0
@@ -1592,7 +1596,24 @@ class EngineArgs:
             mamba_cache_mode=self.mamba_cache_mode,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            compaction_window_size=self.compaction_window_size,
+            compaction_stride=self.compaction_stride,
         )
+
+        # Compaction incompatibility guards.
+        if self.compaction_window_size > 0:
+            assert not self.enable_prefix_caching, (
+                "Prefix caching is incompatible with KV cache compaction"
+            )
+            assert self.pipeline_parallel_size <= 1, (
+                "Pipeline parallelism is incompatible with KV cache compaction"
+            )
+            assert self.compaction_stride > 0, (
+                "compaction_stride must be > 0 when compaction_window_size is set"
+            )
+            assert self.compaction_window_size > self.compaction_stride, (
+                "compaction_window_size must exceed compaction_stride"
+            )
 
         ray_runtime_env = None
         if is_ray_initialized():

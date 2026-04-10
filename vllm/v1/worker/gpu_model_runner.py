@@ -682,6 +682,10 @@ class GPUModelRunner(
         self.num_computed_tokens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
+        # KV cache compaction: pre-allocated GPU buffer for position offsets.
+        self.position_offsets_gpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.int64, device=self.device
+        )
         self.prev_num_draft_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
@@ -1256,6 +1260,24 @@ class GPUModelRunner(
                         self.input_batch.num_tokens_no_spec[req_index] += (
                             optimistic_num_accepted
                         )
+
+            # Handle compacted requests: remove from batch, re-add with
+            # fresh state. This rebuilds the block_table, token_ids_cpu,
+            # and num_computed_tokens in InputBatch from the trimmed data.
+            if req_id in req_data.rebuild_req_ids:
+                req_state.num_computed_tokens = num_computed_tokens
+                req_state.block_ids = new_block_ids
+                req_state.position_offset = req_data.position_offsets.get(
+                    req_id, 0
+                )
+                if req_id in req_data.all_token_ids:
+                    all_tids = req_data.all_token_ids[req_id]
+                    prompt_len = req_state.num_prompt_tokens
+                    req_state.output_token_ids = list(all_tids[prompt_len:])
+                if req_index is not None:
+                    self.input_batch.remove_request(req_id)
+                reqs_to_add.append(req_state)
+                continue
 
             # Update the cached states.
             req_state.num_computed_tokens = num_computed_tokens
@@ -1993,7 +2015,8 @@ class GPUModelRunner(
         self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
         self.num_scheduled_tokens.copy_to_gpu(num_reqs)
         num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
-        self.positions[:total_num_scheduled_tokens] = (
+        # Physical positions (for slot_mapping: block_idx = pos // block_size).
+        physical_positions = (
             self.num_computed_tokens[req_indices_gpu].to(torch.int64)
             + self.query_pos.gpu[:total_num_scheduled_tokens]
         )
@@ -2002,10 +2025,23 @@ class GPUModelRunner(
         )
         self.seq_lens[num_reqs:].fill_(0)
 
+        # Slot mapping uses physical positions (block indices within the
+        # spliced block_table).
         self.input_batch.block_table.compute_slot_mapping(
             num_reqs,
             self.query_start_loc.gpu[: num_reqs + 1],
-            self.positions[:total_num_scheduled_tokens],
+            physical_positions,
+        )
+
+        # RoPE positions = physical + offset (correct absolute positions).
+        # Bulk-copy position_offsets from CPU to pre-allocated GPU buffer.
+        self.position_offsets_gpu[:num_reqs].copy_(
+            self.input_batch.position_offsets_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
+        self.positions[:total_num_scheduled_tokens] = (
+            physical_positions
+            + self.position_offsets_gpu[req_indices_gpu]
         )
 
         # Copy the tensors to the GPU.

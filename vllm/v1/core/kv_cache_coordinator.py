@@ -12,6 +12,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
     KVCacheBlock,
 )
+from vllm.v1.core.compaction.manager import CompactingKVCacheManager
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
     SingleTypeKVCacheManager,
@@ -41,6 +42,8 @@ class KVCacheCoordinator(ABC):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        compaction_window_size: int = 0,
+        compaction_stride: int = 0,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
@@ -56,17 +59,35 @@ class KVCacheCoordinator(ABC):
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
         self.use_eagle = use_eagle
-        self.single_type_managers = tuple(
-            get_manager_for_kv_cache_spec(
-                kv_cache_spec=kv_cache_group.kv_cache_spec,
-                block_pool=self.block_pool,
-                enable_caching=enable_caching,
-                kv_cache_group_id=i,
-                dcp_world_size=dcp_world_size,
-                pcp_world_size=pcp_world_size,
-            )
-            for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
-        )
+
+        managers: list[SingleTypeKVCacheManager] = []
+        for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
+            spec = kv_cache_group.kv_cache_spec
+            if (
+                compaction_window_size > 0
+                and isinstance(spec, FullAttentionSpec)
+            ):
+                mgr = CompactingKVCacheManager(
+                    kv_cache_spec=spec,
+                    block_pool=self.block_pool,
+                    enable_caching=enable_caching,
+                    kv_cache_group_id=i,
+                    dcp_world_size=dcp_world_size,
+                    pcp_world_size=pcp_world_size,
+                    compaction_window_size=compaction_window_size,
+                    compaction_stride=compaction_stride,
+                )
+            else:
+                mgr = get_manager_for_kv_cache_spec(
+                    kv_cache_spec=spec,
+                    block_pool=self.block_pool,
+                    enable_caching=enable_caching,
+                    kv_cache_group_id=i,
+                    dcp_world_size=dcp_world_size,
+                    pcp_world_size=pcp_world_size,
+                )
+            managers.append(mgr)
+        self.single_type_managers = tuple(managers)
 
     def get_num_blocks_to_allocate(
         self,
@@ -271,6 +292,8 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        compaction_window_size: int = 0,
+        compaction_stride: int = 0,
     ):
         super().__init__(
             kv_cache_config,
@@ -282,6 +305,8 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            compaction_window_size=compaction_window_size,
+            compaction_stride=compaction_stride,
         )
         self.num_single_type_manager = len(self.single_type_managers)
 
@@ -317,6 +342,8 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        compaction_window_size: int = 0,
+        compaction_stride: int = 0,
     ):
         super().__init__(
             kv_cache_config,
@@ -328,6 +355,8 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            compaction_window_size=compaction_window_size,
+            compaction_stride=compaction_stride,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
@@ -382,6 +411,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        compaction_window_size: int = 0,
+        compaction_stride: int = 0,
     ):
         super().__init__(
             kv_cache_config,
@@ -393,6 +424,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            compaction_window_size=compaction_window_size,
+            compaction_stride=compaction_stride,
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -554,7 +587,13 @@ def get_kv_cache_coordinator(
     pcp_world_size: int,
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
+    compaction_window_size: int = 0,
+    compaction_stride: int = 0,
 ) -> KVCacheCoordinator:
+    compaction_kwargs = dict(
+        compaction_window_size=compaction_window_size,
+        compaction_stride=compaction_stride,
+    )
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
             kv_cache_config,
@@ -565,6 +604,7 @@ def get_kv_cache_coordinator(
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            **compaction_kwargs,
         )
     if len(kv_cache_config.kv_cache_groups) == 1:
         return UnitaryKVCacheCoordinator(
@@ -577,6 +617,7 @@ def get_kv_cache_coordinator(
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            **compaction_kwargs,
         )
     return HybridKVCacheCoordinator(
         kv_cache_config,
@@ -588,4 +629,5 @@ def get_kv_cache_coordinator(
         pcp_world_size=pcp_world_size,
         hash_block_size=hash_block_size,
         metrics_collector=metrics_collector,
+        **compaction_kwargs,
     )

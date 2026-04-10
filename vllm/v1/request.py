@@ -135,6 +135,18 @@ class Request:
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 
+        # --- Compaction state ---
+        # Cumulative evicted tokens. Used ONLY for RoPE position correction.
+        self.position_offset: int = 0
+        # Monotonic counter: total output tokens EVER generated (never
+        # decremented). Used by check_stop for max_tokens because
+        # len(_output_token_ids) shrinks after compaction.
+        self.num_total_generated: int = 0
+        # History of compaction events (included in API response metadata).
+        self.compaction_events: list = []
+        # Flag: request was compacted and needs model runner rebuild.
+        self.needs_rebuild: bool = False
+
         # Multi-modal related
         self.mm_features = mm_features or []
 
@@ -207,9 +219,11 @@ class Request:
         if isinstance(token_ids, int):
             self._output_token_ids.append(token_ids)
             self._all_token_ids.append(token_ids)
+            self.num_total_generated += 1
         else:
             self._output_token_ids.extend(token_ids)
             self._all_token_ids.extend(token_ids)
+            self.num_total_generated += len(token_ids)
 
         self.update_block_hashes()
 

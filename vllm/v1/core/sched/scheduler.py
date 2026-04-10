@@ -56,7 +56,9 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.core.compaction.manager import CompactingKVCacheManager, CompactionEvent
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.utils import ConstantList
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -233,6 +235,8 @@ class Scheduler(SchedulerInterface):
             pcp_world_size=self.pcp_world_size,
             hash_block_size=self.block_size,
             metrics_collector=self.kv_metrics_collector,
+            compaction_window_size=self.cache_config.compaction_window_size,
+            compaction_stride=self.cache_config.compaction_stride,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -240,6 +244,12 @@ class Scheduler(SchedulerInterface):
             self.connector, "bind_gpu_block_pool"
         ):
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
+
+        # Compaction: check if any KV cache manager supports compaction.
+        self._compaction_enabled = any(
+            isinstance(mgr, CompactingKVCacheManager)
+            for mgr in self.kv_cache_manager.coordinator.single_type_managers
+        )
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
@@ -962,6 +972,19 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        # Cannot preempt compacted requests — trimmed tokens are unrecoverable.
+        # Abort instead: free blocks and mark finished to avoid KV block leak.
+        if request.position_offset > 0:
+            logger.warning(
+                "Attempted to preempt compacted request %s "
+                "(position_offset=%d) — aborting request instead.",
+                request.request_id, request.position_offset,
+            )
+            self.kv_cache_manager.free(request)
+            self.encoder_cache_manager.free(request)
+            request.status = RequestStatus.FINISHED_ABORTED
+            self.finished_req_ids.add(request.request_id)
+            return
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
@@ -974,6 +997,71 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
+
+    # --- Compaction helpers ---
+
+    def _should_compact(self, request: Request) -> bool:
+        """Check if any KV cache group needs compaction for this request."""
+        for mgr in self.kv_cache_manager.coordinator.single_type_managers:
+            if isinstance(mgr, CompactingKVCacheManager) and mgr.needs_compaction(
+                request.request_id,
+                request.num_computed_tokens,
+                request.num_prompt_tokens,
+            ):
+                return True
+        return False
+
+    def _compact_request(self, request: Request) -> int:
+        """Compact a request: splice blocks, trim tokens, update state.
+
+        After this, the request looks like a shorter sequence to all consumers.
+        """
+        total_evicted = 0
+        for mgr in self.kv_cache_manager.coordinator.single_type_managers:
+            if not isinstance(mgr, CompactingKVCacheManager):
+                continue
+            tokens_evicted = mgr.compact_request(
+                request.request_id, request.num_prompt_tokens
+            )
+            if tokens_evicted > 0:
+                total_evicted = tokens_evicted
+                break  # Only one KV group for standard models
+
+        if total_evicted == 0:
+            return 0
+
+        # Record event BEFORE mutating state.
+        event = CompactionEvent(
+            num_output_tokens_at_compaction=request.num_total_generated,
+            tokens_evicted=total_evicted,
+            blocks_evicted=total_evicted // self.block_size,
+            position_offset_after=request.position_offset + total_evicted,
+        )
+        request.compaction_events.append(event)
+
+        # --- Mutate request to look like a shorter sequence ---
+        prompt_len = request.num_prompt_tokens
+        evict_end = prompt_len + total_evicted
+
+        # 1. Trim all_token_ids: remove evicted tokens (oldest post-prompt)
+        del request._all_token_ids[prompt_len:evict_end]
+        request.all_token_ids = ConstantList(request._all_token_ids)
+
+        # 2. Trim output_token_ids: remove first total_evicted entries
+        del request._output_token_ids[:total_evicted]
+        request.output_token_ids = ConstantList(request._output_token_ids)
+
+        # 3. Reduce num_computed_tokens (guard against underflow)
+        assert request.num_computed_tokens >= total_evicted, (
+            f"Compaction underflow: num_computed={request.num_computed_tokens}, "
+            f"evicting={total_evicted}"
+        )
+        request.num_computed_tokens -= total_evicted
+
+        # 4. Update position offset
+        request.position_offset += total_evicted
+
+        return total_evicted
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -1067,6 +1155,8 @@ class Scheduler(SchedulerInterface):
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
         resumed_req_ids = set()
+        rebuild_req_ids: set[str] = set()
+        position_offsets: dict[str, int] = {}
 
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
@@ -1088,15 +1178,35 @@ class Scheduler(SchedulerInterface):
                     req.num_computed_tokens : req.num_computed_tokens + num_tokens
                 ]
                 new_token_ids.append(token_ids)
-            scheduled_in_prev_step = req_id in self.prev_step_scheduled_req_ids
-            if idx >= num_running_reqs:
-                assert not scheduled_in_prev_step
-                resumed_req_ids.add(req_id)
-            if not scheduled_in_prev_step:
+
+            # Compaction rebuild: MUST come before scheduled_in_prev_step check
+            # to ensure trimmed all_token_ids and full block_ids are sent.
+            if req.needs_rebuild:
+                rebuild_req_ids.add(req_id)
+                position_offsets[req_id] = req.position_offset
                 all_token_ids[req_id] = req.all_token_ids.copy()
-            new_block_ids.append(
-                req_to_new_blocks[req_id].get_block_ids(allow_none=True)
-            )
+                # Send full block_ids (not just new) for rebuild.
+                full_block_ids = tuple(
+                    [blk.block_id for blk in group]
+                    for group in self.kv_cache_manager.coordinator.get_blocks(
+                        req_id
+                    )
+                )
+                new_block_ids.append(full_block_ids)
+                req.needs_rebuild = False
+            else:
+                scheduled_in_prev_step = (
+                    req_id in self.prev_step_scheduled_req_ids
+                )
+                if idx >= num_running_reqs:
+                    assert not scheduled_in_prev_step
+                    resumed_req_ids.add(req_id)
+                if not scheduled_in_prev_step:
+                    all_token_ids[req_id] = req.all_token_ids.copy()
+                new_block_ids.append(
+                    req_to_new_blocks[req_id].get_block_ids(allow_none=True)
+                )
+
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
@@ -1110,6 +1220,8 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            rebuild_req_ids=rebuild_req_ids,
+            position_offsets=position_offsets,
         )
 
     def _try_schedule_encoder_inputs(
@@ -1441,6 +1553,26 @@ class Scheduler(SchedulerInterface):
                         "Unexpected: grammar rejected tokens %s for request %s.",
                         new_token_ids,
                         req_id,
+                    )
+
+            # --- KV cache compaction ---
+            # After tokens are appended and stop is checked, compact if needed.
+            # Must be AFTER stop check (don't compact finished requests).
+            if (
+                not stopped
+                and self._compaction_enabled
+                and request.num_output_placeholders == 0
+            ):
+                while self._should_compact(request):
+                    tokens_evicted = self._compact_request(request)
+                    if tokens_evicted == 0:
+                        break
+                    request.needs_rebuild = True
+                if request.needs_rebuild:
+                    # Ensure _make_cached_request_data sends trimmed
+                    # all_token_ids by removing from prev_step set.
+                    self.prev_step_scheduled_req_ids.discard(
+                        request.request_id
                     )
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:

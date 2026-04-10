@@ -53,6 +53,9 @@ class CachedRequestState:
     pooling_params: PoolingParams | None = None
     pooling_states: PoolingStates | None = None
 
+    # KV cache compaction: cumulative evicted tokens for RoPE correction.
+    position_offset: int = 0
+
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             self.prompt_token_ids, self.prompt_embeds
@@ -148,6 +151,15 @@ class InputBatch:
             pin_memory=pin_memory,
         )
         self.num_computed_tokens_cpu = self.num_computed_tokens_cpu_tensor.numpy()
+
+        # KV cache compaction: position offsets for RoPE correction.
+        self.position_offsets_cpu_tensor = torch.zeros(
+            (max_num_reqs,),
+            device="cpu",
+            dtype=torch.int64,
+            pin_memory=pin_memory,
+        )
+        self.position_offsets_cpu = self.position_offsets_cpu_tensor.numpy()
 
         # Block table.
         self.block_table = MultiGroupBlockTable(
@@ -351,6 +363,7 @@ class InputBatch:
         self.num_tokens_no_spec[req_index] = request.num_tokens
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
+        self.position_offsets_cpu[req_index] = request.position_offset
         self.block_table.add_row(request.block_ids, req_index)
 
         if sampling_params := request.sampling_params:
@@ -722,6 +735,9 @@ class InputBatch:
             ]
             self.num_prompt_tokens[empty_index] = self.num_prompt_tokens[last_req_index]
             self.num_computed_tokens_cpu[empty_index] = self.num_computed_tokens_cpu[
+                last_req_index
+            ]
+            self.position_offsets_cpu[empty_index] = self.position_offsets_cpu[
                 last_req_index
             ]
             self.block_table.move_row(last_req_index, empty_index)
