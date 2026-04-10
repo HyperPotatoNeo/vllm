@@ -123,6 +123,25 @@ class Scheduler(SchedulerInterface):
         self.connector_prefix_cache_stats: PrefixCacheStats | None = None
         self.recompute_kv_load_failures = True
         if self.vllm_config.kv_transfer_config is not None:
+            # Refuse to even construct an LMCache connector when compaction
+            # is enabled: the LMCache V1 adapter uses
+            # request._output_token_ids[0] as a "first_tok" fingerprint, which
+            # compaction invalidates. Checking here (before connector
+            # construction) avoids loading the lmcache package at all and
+            # gives a clear error before any side effects.
+            if self.cache_config.compaction_window_size > 0:
+                kv_connector_name = (
+                    self.vllm_config.kv_transfer_config.kv_connector or ""
+                ).lower()
+                assert "lmcache" not in kv_connector_name, (
+                    "KV cache compaction is incompatible with LMCache KV "
+                    "transfer: the LMCache V1 adapter uses "
+                    "request._output_token_ids[0] as a fingerprint, which "
+                    "compaction invalidates. Disable compaction "
+                    "(--compaction-window-size 0) or use a different "
+                    f"KV connector. Got kv_connector="
+                    f"{self.vllm_config.kv_transfer_config.kv_connector!r}."
+                )
             assert not self.is_encoder_decoder, (
                 "Encoder-decoder models are not currently supported with KV connectors"
             )
@@ -258,6 +277,8 @@ class Scheduler(SchedulerInterface):
                 "run degenerates to full context. Pass async_scheduling=False "
                 "to LLM() (or --async-scheduling false) when enabling compaction."
             )
+            # LMCache incompatibility is checked above, before connector
+            # construction, to avoid loading the lmcache package at all.
             logger.warning(
                 "[COMPACT] enabled window=%d stride=%d",
                 self.cache_config.compaction_window_size,
@@ -1030,6 +1051,7 @@ class Scheduler(SchedulerInterface):
         After this, the request looks like a shorter sequence to all consumers.
         """
         total_evicted = 0
+        compaction_mgr: "CompactingKVCacheManager | None" = None
         for mgr in self.kv_cache_manager.coordinator.single_type_managers:
             if not isinstance(mgr, CompactingKVCacheManager):
                 continue
@@ -1038,30 +1060,66 @@ class Scheduler(SchedulerInterface):
             )
             if tokens_evicted > 0:
                 total_evicted = tokens_evicted
+                compaction_mgr = mgr
                 break  # Only one KV group for standard models
 
         if total_evicted == 0:
             return 0
 
+        # Use the same block_size the compaction manager used to free physical
+        # blocks. Under hybrid / multi-group KV caches, self.block_size (which
+        # comes from a potentially different group) could diverge from the
+        # compaction group's block_size, silently mis-aligning the trim.
+        assert compaction_mgr is not None
+        block_size = compaction_mgr.block_size
+
         # Record event BEFORE mutating state.
         event = CompactionEvent(
             num_output_tokens_at_compaction=request.num_total_generated,
             tokens_evicted=total_evicted,
-            blocks_evicted=total_evicted // self.block_size,
+            blocks_evicted=total_evicted // block_size,
             position_offset_after=request.position_offset + total_evicted,
         )
         request.compaction_events.append(event)
 
         # --- Mutate request to look like a shorter sequence ---
+        # Physical block-level eviction in CompactingKVCacheManager drops blocks
+        # starting at index prompt_blocks = ceil(prompt_len / block_size). That
+        # block's first slot is at physical position prompt_aligned_len =
+        # prompt_blocks * block_size, NOT at prompt_len. When prompt_len is not a
+        # multiple of block_size, the last prompt block is partially filled with
+        # prompt tokens; generation then fills the remainder of that same block
+        # (vLLM allocates blocks via cdiv(num_tokens, block_size) and reuses the
+        # last partial block for the first `block_size - (prompt_len % block_size)`
+        # generated tokens). Those tokens share a block with the prompt tail and
+        # are therefore NEVER evicted. Trimming the logical token lists from
+        # prompt_len would delete those retained-forever tokens AND fail to
+        # delete the actually-evicted ones; the lists would still match in count
+        # but not in identity, leaving the logical view out of sync with the
+        # physical KV cache (breaking GPU sample kernels that index all_token_ids
+        # positionally: penalties, bad_words, prompt_logprob).
         prompt_len = request.num_prompt_tokens
-        evict_end = prompt_len + total_evicted
+        prompt_aligned_len = (
+            (prompt_len + block_size - 1) // block_size
+        ) * block_size
+        # How many generated tokens live in the tail of the last prompt block.
+        # These are never evicted and must be preserved across the trim.
+        gen_tail_in_prompt_block = prompt_aligned_len - prompt_len
 
-        # 1. Trim all_token_ids: remove evicted tokens (oldest post-prompt)
-        del request._all_token_ids[prompt_len:evict_end]
+        # 1. Trim all_token_ids at the block-aligned boundary so the removed
+        # identities match the physically evicted block range.
+        del request._all_token_ids[
+            prompt_aligned_len : prompt_aligned_len + total_evicted
+        ]
         request.all_token_ids = ConstantList(request._all_token_ids)
 
-        # 2. Trim output_token_ids: remove first total_evicted entries
-        del request._output_token_ids[:total_evicted]
+        # 2. Trim output_token_ids at the same range, expressed in output
+        # (post-prompt) coordinates. The first gen_tail_in_prompt_block entries
+        # of _output_token_ids correspond to generated tokens living in the last
+        # prompt block and are retained.
+        del request._output_token_ids[
+            gen_tail_in_prompt_block : gen_tail_in_prompt_block + total_evicted
+        ]
         request.output_token_ids = ConstantList(request._output_token_ids)
 
         # 3. Reduce num_computed_tokens (guard against underflow)

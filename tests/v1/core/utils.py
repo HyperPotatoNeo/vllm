@@ -57,6 +57,8 @@ def create_scheduler(
     pipeline_parallel_size: int = 1,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
+    compaction_window_size: int = 0,
+    compaction_stride: int = 0,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -96,6 +98,8 @@ def create_scheduler(
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
         enable_prefix_caching=enable_prefix_caching,
+        compaction_window_size=compaction_window_size,
+        compaction_stride=compaction_stride,
     )
     kv_transfer_config = None
     if isinstance(use_kv_connector, MockKVConfig):
