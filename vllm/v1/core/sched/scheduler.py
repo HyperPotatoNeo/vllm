@@ -250,6 +250,19 @@ class Scheduler(SchedulerInterface):
             isinstance(mgr, CompactingKVCacheManager)
             for mgr in self.kv_cache_manager.coordinator.single_type_managers
         )
+        if self._compaction_enabled:
+            assert not self.scheduler_config.async_scheduling, (
+                "KV cache compaction is incompatible with async scheduling: "
+                "num_output_placeholders is nonzero whenever update_from_output "
+                "runs, so the compaction trigger is never satisfied and the "
+                "run degenerates to full context. Pass async_scheduling=False "
+                "to LLM() (or --async-scheduling false) when enabling compaction."
+            )
+            logger.warning(
+                "[COMPACT] enabled window=%d stride=%d",
+                self.cache_config.compaction_window_size,
+                self.cache_config.compaction_stride,
+            )
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
