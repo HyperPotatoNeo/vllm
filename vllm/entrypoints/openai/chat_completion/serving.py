@@ -34,6 +34,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse,
     ChatMessage,
+    CompactionEventPayload,
 )
 from vllm.entrypoints.openai.chat_completion.stream_harmony import (
     TokenState,
@@ -1605,6 +1606,22 @@ class OpenAIServingChat(OpenAIServing):
 
         request_metadata.final_usage_info = usage
 
+        # KV cache compaction events (vLLM compaction extension). The output
+        # processor attached these to final_res; convert from the internal
+        # msgspec struct to the pydantic response model. None when compaction
+        # is disabled or no events fired for this request.
+        compaction_events_payload = None
+        compaction_events = getattr(final_res, "compaction_events", None)
+        if compaction_events:
+            compaction_events_payload = [
+                CompactionEventPayload(
+                    num_output_tokens_at_compaction=e.num_output_tokens_at_compaction,
+                    tokens_evicted=e.tokens_evicted,
+                    position_offset_after=e.position_offset_after,
+                )
+                for e in compaction_events
+            ]
+
         response = ChatCompletionResponse(
             id=request_id,
             created=created_time,
@@ -1616,6 +1633,7 @@ class OpenAIServingChat(OpenAIServing):
                 final_res.prompt_token_ids if request.return_token_ids else None
             ),
             kv_transfer_params=final_res.kv_transfer_params,
+            compaction_events=compaction_events_payload,
         )
 
         # Log complete response if output logging is enabled

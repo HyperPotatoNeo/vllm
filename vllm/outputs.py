@@ -121,6 +121,7 @@ class RequestOutput:
         num_cached_tokens: int | None = None,
         *,
         kv_transfer_params: dict[str, Any] | None = None,
+        compaction_events: list[Any] | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -141,12 +142,25 @@ class RequestOutput:
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.kv_transfer_params = kv_transfer_params
+        # KV cache compaction events from the scheduler, forwarded through the
+        # output processor. None when compaction is disabled or no events have
+        # fired for this request. Typed as list[Any] here to avoid importing
+        # the msgspec struct and creating a dependency cycle; callers cast to
+        # list[CompactionEvent] when needed.
+        self.compaction_events = compaction_events
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
 
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
+        # Overwrite compaction_events: the scheduler sends the full cumulative
+        # list each step, so the newest output always has the most complete
+        # view. Only overwrite when the incoming has a value; otherwise keep
+        # whatever we already accumulated (avoids dropping events on a later
+        # delta that doesn't include them).
+        if next_output.compaction_events is not None:
+            self.compaction_events = next_output.compaction_events
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):

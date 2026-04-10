@@ -94,6 +94,18 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     token_ids: list[int] | None = None
 
 
+class CompactionEventPayload(OpenAIBaseModel):
+    """JSON-serializable view of a vLLM KV cache compaction event.
+
+    Mirrors vllm.v1.core.compaction.types.CompactionEvent. Defined here as a
+    Pydantic model so the OpenAI HTTP response remains a pure pydantic tree.
+    """
+
+    num_output_tokens_at_compaction: int
+    tokens_evicted: int
+    position_offset_after: int
+
+
 class ChatCompletionResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
     object: Literal["chat.completion"] = "chat.completion"
@@ -109,6 +121,14 @@ class ChatCompletionResponse(OpenAIBaseModel):
     prompt_token_ids: list[int] | None = None
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
+    )
+    # KV cache compaction events (vLLM extension). Populated only when the
+    # scheduler is running with --compaction-window-size > 0 and at least one
+    # eviction fired for this request. Consumed by the kv-eviction trainer
+    # to compute segment boundaries for segmented_forward.
+    compaction_events: list[CompactionEventPayload] | None = Field(
+        default=None,
+        description="KV cache compaction events (vLLM compaction extension).",
     )
 
 

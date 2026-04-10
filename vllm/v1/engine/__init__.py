@@ -14,6 +14,7 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.compaction.types import CompactionEvent
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 from vllm.v1.serial_utils import UtilityResult
@@ -165,6 +166,12 @@ class EngineCoreOutput(
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
+    # KV cache compaction events that have fired for this request so far.
+    # The scheduler sends the full cumulative list on every output; the client
+    # overwrites its accumulated copy. Compaction events are append-only, so
+    # overwrite semantics are safe. None when compaction is disabled or when
+    # the request has had no compaction events yet.
+    compaction_events: list[CompactionEvent] | None = None
 
     @property
     def finished(self) -> bool:

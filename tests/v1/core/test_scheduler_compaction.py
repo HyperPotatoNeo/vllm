@@ -6,9 +6,12 @@ These tests exercise the interaction between CompactingKVCacheManager
 (logical token-list trim), focusing on correctness edge cases.
 """
 
+import msgspec
 import pytest
 
 from vllm.v1.core.compaction.manager import CompactingKVCacheManager
+from vllm.v1.core.compaction.types import CompactionEvent
+from vllm.v1.engine import EngineCoreOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
 from .utils import create_requests, create_scheduler
@@ -112,7 +115,7 @@ def test_compaction_trim_non_block_aligned_prompt():
 
     event = request.compaction_events[0]
     assert event.tokens_evicted == compaction_stride
-    assert event.blocks_evicted == compaction_stride // block_size == 1
+    assert event.position_offset_after == compaction_stride
     assert request.position_offset == compaction_stride
 
     # ------------------------------------------------------------------
@@ -291,3 +294,144 @@ def test_compaction_trim_block_aligned_prompt():
     assert all_ids[:prompt_len] == [0] * prompt_len
     # First post-prompt token in the retained list should be gen[compaction_stride].
     assert all_ids[prompt_len] == 10_000 + compaction_stride
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.1: compaction_events transport tests
+# ---------------------------------------------------------------------------
+
+
+def test_compaction_event_msgspec_roundtrip():
+    """CompactionEvent is a msgspec.Struct and roundtrips cleanly."""
+    ev = CompactionEvent(
+        num_output_tokens_at_compaction=2097,
+        tokens_evicted=512,
+        position_offset_after=512,
+    )
+    encoded = msgspec.msgpack.encode(ev)
+    decoded = msgspec.msgpack.decode(encoded, type=CompactionEvent)
+    assert decoded.num_output_tokens_at_compaction == 2097
+    assert decoded.tokens_evicted == 512
+    assert decoded.position_offset_after == 512
+
+
+def test_engine_core_output_carries_compaction_events():
+    """EngineCoreOutput round-trips a list of compaction events, and
+    omits the field entirely when None (default).
+    """
+    e1 = CompactionEvent(100, 16, 16)
+    e2 = CompactionEvent(200, 16, 32)
+
+    with_events = EngineCoreOutput(
+        request_id="req-0",
+        new_token_ids=[1, 2, 3],
+        compaction_events=[e1, e2],
+    )
+    enc = msgspec.msgpack.encode(with_events)
+    dec = msgspec.msgpack.decode(enc, type=EngineCoreOutput)
+    assert dec.compaction_events is not None
+    assert len(dec.compaction_events) == 2
+    assert dec.compaction_events[0].num_output_tokens_at_compaction == 100
+    assert dec.compaction_events[1].position_offset_after == 32
+
+    without = EngineCoreOutput(request_id="req-1", new_token_ids=[4])
+    assert without.compaction_events is None
+    enc2 = msgspec.msgpack.encode(without)
+    dec2 = msgspec.msgpack.decode(enc2, type=EngineCoreOutput)
+    assert dec2.compaction_events is None
+    # omit_defaults: no-event case should be strictly shorter on the wire.
+    assert len(enc2) < len(enc)
+
+
+def test_scheduler_attaches_compaction_events_to_engine_core_output():
+    """End-to-end against a live scheduler: drive compaction, capture the
+    EngineCoreOutput stream, assert at least one output carries the cumulative
+    compaction_events list and that it matches request.compaction_events
+    position by position.
+    """
+    block_size = 16
+    prompt_len = 50
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        block_size=block_size,
+        num_blocks=64,
+        max_model_len=2048,
+        compaction_window_size=80,
+        compaction_stride=16,
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=prompt_len,
+        max_tokens=256,
+        ignore_eos=True,
+        block_size=block_size,
+    )
+    scheduler.add_request(request)
+
+    captured: list[EngineCoreOutput] = []
+    next_sampled = 10_000
+    for _ in range(64):
+        output = scheduler.schedule()
+        if request.request_id not in output.num_scheduled_tokens:
+            break
+        eco_dict = scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[[next_sampled]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        if 0 in eco_dict:
+            for eco in eco_dict[0].outputs:
+                if eco.request_id == request.request_id:
+                    captured.append(eco)
+        if request.num_total_generated > (next_sampled - 10_000):
+            next_sampled += 1
+        if len(request.compaction_events) >= 1:
+            # One more step so we see the post-compaction output too.
+            one_more = scheduler.schedule()
+            if request.request_id in one_more.num_scheduled_tokens:
+                eco_dict2 = scheduler.update_from_output(
+                    one_more,
+                    ModelRunnerOutput(
+                        req_ids=[request.request_id],
+                        req_id_to_index={request.request_id: 0},
+                        sampled_token_ids=[[next_sampled]],
+                        logprobs=None,
+                        prompt_logprobs_dict={},
+                        pooler_output=[],
+                    ),
+                )
+                if 0 in eco_dict2:
+                    for eco in eco_dict2[0].outputs:
+                        if eco.request_id == request.request_id:
+                            captured.append(eco)
+            break
+
+    assert len(request.compaction_events) == 1
+    with_events = [e for e in captured if e.compaction_events]
+    assert len(with_events) >= 1, (
+        "No EngineCoreOutput carried compaction_events despite the scheduler "
+        "having fired a compaction event."
+    )
+
+    # The last captured ECO should carry the full cumulative list identical
+    # to request.compaction_events.
+    eco = with_events[-1]
+    assert len(eco.compaction_events) == len(request.compaction_events)
+    for got, want in zip(eco.compaction_events, request.compaction_events):
+        assert got.num_output_tokens_at_compaction == want.num_output_tokens_at_compaction
+        assert got.tokens_evicted == want.tokens_evicted
+        assert got.position_offset_after == want.position_offset_after
+
+    # Outputs emitted BEFORE the compaction fire should have no events.
+    pre = captured[: len(captured) - len(with_events)]
+    for eco in pre:
+        assert eco.compaction_events is None

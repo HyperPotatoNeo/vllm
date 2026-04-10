@@ -27,19 +27,11 @@ KNOWN INCOMPATIBILITIES:
 """
 
 from collections.abc import Callable
-from dataclasses import dataclass
 
+# Re-export CompactionEvent from the dependency-free types module so
+# existing callers (scheduler.py, package __init__, tests) keep working.
+from vllm.v1.core.compaction.types import CompactionEvent  # noqa: F401
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
-
-
-@dataclass(frozen=True)
-class CompactionEvent:
-    """Record of a single compaction event. Stored on Request."""
-
-    num_output_tokens_at_compaction: int  # total generated when this fired
-    tokens_evicted: int
-    blocks_evicted: int
-    position_offset_after: int  # cumulative offset after this event
 
 
 class CompactingKVCacheManager(FullAttentionManager):

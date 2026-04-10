@@ -56,7 +56,8 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
-from vllm.v1.core.compaction.manager import CompactingKVCacheManager, CompactionEvent
+from vllm.v1.core.compaction.manager import CompactingKVCacheManager
+from vllm.v1.core.compaction.types import CompactionEvent
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.utils import ConstantList
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -1077,7 +1078,6 @@ class Scheduler(SchedulerInterface):
         event = CompactionEvent(
             num_output_tokens_at_compaction=request.num_total_generated,
             tokens_evicted=total_evicted,
-            blocks_evicted=total_evicted // block_size,
             position_offset_after=request.position_offset + total_evicted,
         )
         request.compaction_events.append(event)
@@ -1658,6 +1658,16 @@ class Scheduler(SchedulerInterface):
                 or stopped
             ):
                 # Add EngineCoreOutput for this Request.
+                # Send the full cumulative compaction_events list (overwrite
+                # semantics at the client). Events are append-only and the
+                # list is short (one per stride's worth of generation), so
+                # the per-step overhead is negligible. Only included when
+                # non-empty to keep non-compaction outputs unchanged.
+                compaction_events = (
+                    list(request.compaction_events)
+                    if request.compaction_events
+                    else None
+                )
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,
@@ -1674,6 +1684,7 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens=request.num_external_computed_tokens,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        compaction_events=compaction_events,
                     )
                 )
             else:

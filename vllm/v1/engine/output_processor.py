@@ -27,6 +27,7 @@ from vllm.tracing import (
     instrument_manual,
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.v1.core.compaction.types import CompactionEvent
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
@@ -175,6 +176,11 @@ class RequestState:
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
+        # KV cache compaction events accumulated across streaming deltas.
+        # The scheduler sends the full cumulative list on each EngineCoreOutput,
+        # so we use overwrite-on-update semantics (see process_outputs).
+        self.compaction_events: list[CompactionEvent] | None = None
+
         # Stream Interval
         self.stream_interval = stream_interval
         self.sent_tokens_offset = 0  # Offset of sent tokens
@@ -274,6 +280,7 @@ class RequestState:
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
         routed_experts: np.ndarray | None = None,
+        compaction_events: list[CompactionEvent] | None = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
@@ -327,7 +334,8 @@ class RequestState:
             external_req_id = self.parent_req.external_req_id
 
         return self._new_request_output(
-            external_req_id, outputs, finished, kv_transfer_params
+            external_req_id, outputs, finished, kv_transfer_params,
+            compaction_events,
         )
 
     def _new_request_output(
@@ -336,6 +344,7 @@ class RequestState:
         outputs: list[CompletionOutput] | list[PoolingOutput],
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
+        compaction_events: list[CompactionEvent] | None = None,
     ) -> RequestOutput | PoolingRequestOutput:
         # If prompt embeds were used, put placeholder prompt token ids
         prompt_token_ids = self.prompt_token_ids
@@ -371,6 +380,7 @@ class RequestState:
             kv_transfer_params=kv_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
             metrics=self.stats,
+            compaction_events=compaction_events,
         )
 
     def _new_completion_output(
@@ -619,6 +629,13 @@ class OutputProcessor:
             routed_experts = engine_core_output.routed_experts
             req_state.num_cached_tokens = engine_core_output.num_cached_tokens
             req_state.is_prefilling = False
+            # KV cache compaction: the scheduler sends the full cumulative
+            # list each step, so overwrite whenever a non-None value arrives.
+            # Don't clobber to None if a later step omits the field (e.g.
+            # because omit_defaults dropped it on serialization or the field
+            # is unset for a request that had events in a prior step).
+            if engine_core_output.compaction_events is not None:
+                req_state.compaction_events = engine_core_output.compaction_events
 
             if pooling_output is None:
                 assert req_state.detokenizer is not None
@@ -643,6 +660,7 @@ class OutputProcessor:
                 stop_reason,
                 kv_transfer_params,
                 routed_experts,
+                req_state.compaction_events,
             ):
                 if req_state.streaming_input:
                     request_output.finished = False
