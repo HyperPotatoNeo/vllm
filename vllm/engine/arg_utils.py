@@ -633,6 +633,9 @@ class EngineArgs:
     compaction_max_turns: int = CacheConfig.compaction_max_turns
     compaction_eviction_turn_stride: int = CacheConfig.compaction_eviction_turn_stride
     compaction_turn_end_token_id: int | None = CacheConfig.compaction_turn_end_token_id
+    compaction_assume_aligned_turn_boundaries: bool = (
+        CacheConfig.compaction_assume_aligned_turn_boundaries
+    )
     tokens_only: bool = False
 
     shutdown_timeout: int = 0
@@ -1059,6 +1062,10 @@ class EngineArgs:
         cache_group.add_argument(
             "--compaction-turn-end-token-id",
             **cache_kwargs["compaction_turn_end_token_id"],
+        )
+        cache_group.add_argument(
+            "--compaction-assume-aligned-turn-boundaries",
+            **cache_kwargs["compaction_assume_aligned_turn_boundaries"],
         )
 
         # Model weight offload related configs
@@ -1628,6 +1635,9 @@ class EngineArgs:
             compaction_max_turns=self.compaction_max_turns,
             compaction_eviction_turn_stride=self.compaction_eviction_turn_stride,
             compaction_turn_end_token_id=self.compaction_turn_end_token_id,
+            compaction_assume_aligned_turn_boundaries=(
+                self.compaction_assume_aligned_turn_boundaries
+            ),
         )
 
         # Compaction incompatibility guards.

@@ -184,6 +184,17 @@ class CacheConfig:
     (e.g. <|im_end|> = 151645 for Qwen3). None = auto-detect at Scheduler
     init from the request's eos_token_id at first use. Only consulted when
     compaction_max_turns > 0."""
+    compaction_assume_aligned_turn_boundaries: bool = False
+    """KV cache compaction (turn mode): when True, assume the client has
+    padded each <|im_end|> such that the FIRST token of the NEXT message
+    lands on a block boundary (i.e. `pos_after_im_end + n_pads` is a
+    multiple of block_size). Under that invariant, the eviction end is
+    snapped UP (align_up) to include the padding of the last evicted turn,
+    so no tail of that turn is orphaned in the kept KV region. When False
+    (default), evict_end is snapped inward (align_down), which is safe
+    without padding but leaves up to block_size-1 orphan tokens from the
+    tail of the last evicted turn. Only consulted when
+    compaction_max_turns > 0."""
 
     def compute_hash(self) -> str:
         """
@@ -220,6 +231,7 @@ class CacheConfig:
             "compaction_max_turns",
             "compaction_eviction_turn_stride",
             "compaction_turn_end_token_id",
+            "compaction_assume_aligned_turn_boundaries",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors

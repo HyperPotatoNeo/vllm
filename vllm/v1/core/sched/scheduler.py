@@ -284,6 +284,9 @@ class Scheduler(SchedulerInterface):
         self._compaction_turn_end_token_id: int | None = (
             self.cache_config.compaction_turn_end_token_id
         )
+        self._compaction_assume_aligned_turn_boundaries = (
+            self.cache_config.compaction_assume_aligned_turn_boundaries
+        )
         if self._compaction_enabled:
             assert not self.scheduler_config.async_scheduling, (
                 "KV cache compaction is incompatible with async scheduling: "
@@ -296,13 +299,14 @@ class Scheduler(SchedulerInterface):
             # construction, to avoid loading the lmcache package at all.
             logger.warning(
                 "[COMPACT] enabled window=%d stride=%d protected_prefix=%d "
-                "max_turns=%d turn_stride=%d turn_end_id=%s",
+                "max_turns=%d turn_stride=%d turn_end_id=%s aligned_turns=%s",
                 self.cache_config.compaction_window_size,
                 self.cache_config.compaction_stride,
                 self._compaction_protected_prefix,
                 self._compaction_max_turns,
                 self._compaction_eviction_turn_stride,
                 self._compaction_turn_end_token_id,
+                self._compaction_assume_aligned_turn_boundaries,
             )
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -1293,66 +1297,17 @@ class Scheduler(SchedulerInterface):
         )
 
         # --- Mutate request to look like a shorter sequence ---
-        #
-        # Generalized trim formula (works for block-FIFO, protected-prefix,
-        # and turn modes). The eviction range [evict_start, evict_end) is
-        # already block-aligned and may overlap the prompt region. Split it
-        # into prompt_tokens_evicted and output_tokens_evicted, then trim
-        # each list independently.
-        prompt_len = request.num_prompt_tokens
-        prompt_tokens_evicted = max(
-            0, min(prompt_len, evict_end) - evict_start
+        # Delegates to the shared _apply_trim helper (also used by
+        # admission-time prefill compaction).
+        prompt_tokens_evicted, output_tokens_evicted = self._apply_trim(
+            request,
+            evict_start=evict_start,
+            evict_end=evict_end,
+            total_evicted=total_evicted,
+            stride_used=stride_used,
+            num_turns_evicted_after=num_turns_evicted_after,
+            trim_prompt_token_ids=False,
         )
-        output_tokens_evicted = total_evicted - prompt_tokens_evicted
-
-        # 1. Trim all_token_ids at the eviction boundary.
-        del request._all_token_ids[evict_start:evict_end]
-        request.all_token_ids = ConstantList(request._all_token_ids)
-
-        # 2. Trim output_token_ids for any evicted output tokens.
-        if output_tokens_evicted > 0:
-            out_start = max(0, evict_start - prompt_len)
-            del request._output_token_ids[
-                out_start : out_start + output_tokens_evicted
-            ]
-        request.output_token_ids = ConstantList(request._output_token_ids)
-
-        # 3. Adjust num_prompt_tokens if prompt tokens were evicted.
-        if prompt_tokens_evicted > 0:
-            request.num_prompt_tokens -= prompt_tokens_evicted
-
-        # 4. Reduce num_computed_tokens (guard against underflow)
-        assert request.num_computed_tokens >= total_evicted, (
-            f"Compaction underflow: num_computed={request.num_computed_tokens}, "
-            f"evicting={total_evicted}"
-        )
-        request.num_computed_tokens -= total_evicted
-
-        # 5. Update position offset
-        request.position_offset += total_evicted
-
-        # 6. Turn mode: drop the markers for the evicted turns and shift
-        # the rest left by total_evicted. Index-based — robust against
-        # inward-snap edge cases where a turn-end marker happens to land
-        # exactly on the snapped boundary.
-        #
-        # Original positions layout (e=num_turns_evicted_before_this_event):
-        #   [0]      end of system prompt (KEEP)
-        #   [1]      end of U_{e+1}                  ──┐
-        #   [2]      end of A_{e+1} = end of turn e+1   │ DROP these
-        #   ...                                          │ (2*stride entries
-        #   [2*s-1]  end of U_{e+s}                      │  total)
-        #   [2*s]    end of A_{e+s} = end of turn e+s  ──┘
-        #   [2*s+1]  end of U_{e+s+1} (SHIFT by -total_evicted)
-        #   ...
-        # Invariant: positions[0] (end of system prompt) is preserved
-        # bit-for-bit — system prompt is never evicted.
-        if self._compaction_max_turns > 0:
-            old = request.turn_end_positions
-            kept_tail = [p - total_evicted for p in old[2 * stride_used + 1:]]
-            request.turn_end_positions = [old[0]] + kept_tail
-            request.last_turn_scan_pos = len(request._all_token_ids)
-            request.num_turns_evicted = num_turns_evicted_after
 
         if prompt_tokens_evicted > 0:
             logger.warning(
@@ -1408,7 +1363,22 @@ class Scheduler(SchedulerInterface):
         evict_start = (
             (turn_first_start_pos + block_size - 1) // block_size
         ) * block_size
-        evict_end = (turn_last_end_pos // block_size) * block_size
+        if self._compaction_assume_aligned_turn_boundaries:
+            # Client has padded each <|im_end|> so the next message's first
+            # token lands on a block boundary. align_up(positions[2*stride])
+            # == start of the next kept turn, so we can safely include the
+            # padding of the last evicted turn in the evict range, avoiding
+            # orphan tail tokens. The num_computed_tokens clamp below is
+            # still load-bearing: if the model hasn't generated past the
+            # snapped-up boundary yet, we cannot evict blocks without KV.
+            evict_end = (
+                (turn_last_end_pos + block_size - 1) // block_size
+            ) * block_size
+        else:
+            # Default: inward snap. Safe without padding but leaves up to
+            # block_size-1 orphan tokens from the tail of the last evicted
+            # turn in the kept KV region.
+            evict_end = (turn_last_end_pos // block_size) * block_size
 
         if evict_end <= evict_start:
             # Turns too short for this block size — bail out without
@@ -1431,6 +1401,225 @@ class Scheduler(SchedulerInterface):
 
         last_turn_evicted = request.num_turns_evicted + stride - 1
         return (evict_start, evict_end, last_turn_evicted, stride)
+
+    def _apply_trim(
+        self,
+        request: Request,
+        *,
+        evict_start: int,
+        evict_end: int,
+        total_evicted: int,
+        stride_used: int,
+        num_turns_evicted_after: int,
+        trim_prompt_token_ids: bool,
+    ) -> tuple[int, int]:
+        """Mutate request state to reflect eviction of [evict_start, evict_end).
+
+        Shared between mid-generation compaction (_compact_request, where
+        KV blocks have already been physically evicted via the manager)
+        and admission-time prefill compaction (_maybe_compact_prompt,
+        where no blocks exist yet and the prompt itself is trimmed).
+
+        When trim_prompt_token_ids=True, the raw prompt_token_ids list is
+        also trimmed — required at admission time so that prefill sees
+        the shortened prompt. Mid-generation callers pass False because
+        prompt_token_ids is a historical artifact at that point and
+        mutating it would confuse downstream consumers (segmented_forward
+        reconstructs pre-eviction prompt from the original list).
+
+        Returns (prompt_tokens_evicted, output_tokens_evicted).
+        """
+        prompt_len = request.num_prompt_tokens
+        prompt_tokens_evicted = max(
+            0, min(prompt_len, evict_end) - evict_start
+        )
+        output_tokens_evicted = total_evicted - prompt_tokens_evicted
+
+        # 1. Trim all_token_ids at the eviction boundary.
+        del request._all_token_ids[evict_start:evict_end]
+        request.all_token_ids = ConstantList(request._all_token_ids)
+
+        # 1b. Admission-time: also trim the raw prompt_token_ids list so
+        # prefill runs on the shortened prompt.
+        if trim_prompt_token_ids:
+            assert request.prompt_token_ids is not None, (
+                "admission-time compaction requires prompt_token_ids"
+            )
+            del request.prompt_token_ids[evict_start:evict_end]
+
+        # 2. Trim output_token_ids for any evicted output tokens.
+        if output_tokens_evicted > 0:
+            out_start = max(0, evict_start - prompt_len)
+            del request._output_token_ids[
+                out_start : out_start + output_tokens_evicted
+            ]
+        request.output_token_ids = ConstantList(request._output_token_ids)
+
+        # 3. Adjust num_prompt_tokens if prompt tokens were evicted.
+        if prompt_tokens_evicted > 0:
+            request.num_prompt_tokens -= prompt_tokens_evicted
+
+        # 4. Reduce num_computed_tokens. At admission time this is 0 and
+        # no KV has been computed, so skip the decrement path entirely.
+        if not trim_prompt_token_ids:
+            assert request.num_computed_tokens >= total_evicted, (
+                f"Compaction underflow: num_computed="
+                f"{request.num_computed_tokens}, evicting={total_evicted}"
+            )
+            request.num_computed_tokens -= total_evicted
+        else:
+            assert request.num_computed_tokens == 0, (
+                "admission-time compaction must run before any forward "
+                f"(num_computed_tokens={request.num_computed_tokens})"
+            )
+
+        # 5. Update position offset.
+        request.position_offset += total_evicted
+
+        # 6. Turn mode: drop the markers for the evicted turns and shift
+        # the rest left by total_evicted. Index-based — robust against
+        # inward-snap edge cases where a turn-end marker happens to land
+        # exactly on the snapped boundary.
+        #
+        # Original positions layout (e=num_turns_evicted_before_this_event):
+        #   [0]      end of system prompt (KEEP)
+        #   [1]      end of U_{e+1}                  ──┐
+        #   [2]      end of A_{e+1} = end of turn e+1   │ DROP these
+        #   ...                                          │ (2*stride entries
+        #   [2*s-1]  end of U_{e+s}                      │  total)
+        #   [2*s]    end of A_{e+s} = end of turn e+s  ──┘
+        #   [2*s+1]  end of U_{e+s+1} (SHIFT by -total_evicted)
+        #   ...
+        # Invariant: positions[0] (end of system prompt) is preserved
+        # bit-for-bit — system prompt is never evicted.
+        if self._compaction_max_turns > 0:
+            old = request.turn_end_positions
+            kept_tail = [p - total_evicted for p in old[2 * stride_used + 1:]]
+            request.turn_end_positions = [old[0]] + kept_tail
+            request.last_turn_scan_pos = len(request._all_token_ids)
+            request.num_turns_evicted = num_turns_evicted_after
+
+        return prompt_tokens_evicted, output_tokens_evicted
+
+    def _maybe_compact_prompt(self, request: Request) -> None:
+        """Prefill-time turn compaction.
+
+        Runs at request admission, BEFORE the request is enqueued for
+        prefill. If the prompt already contains more completed turns
+        than compaction_max_turns, trims the oldest turns from the
+        prompt in place and records a CompactionEvent with
+        num_output_tokens_at_compaction=0 so the trainer can replay the
+        eviction.
+
+        Fixes the first-token distribution drift that occurs when
+        compaction fires AFTER the initial prefill: the first decoded
+        token would be sampled under the full (pre-eviction) KV while
+        every subsequent token sees the post-eviction KV.
+
+        No-op if turn mode is disabled, prompt does not exceed
+        max_turns, or no compaction-capable KV manager is present.
+        """
+        if self._compaction_max_turns <= 0:
+            return
+        if request.prompt_token_ids is None:
+            return
+
+        # Locate block_size via the compaction manager.
+        compaction_mgr: "CompactingKVCacheManager | None" = None
+        for mgr in self.kv_cache_manager.coordinator.single_type_managers:
+            if isinstance(mgr, CompactingKVCacheManager):
+                compaction_mgr = mgr
+                break
+        if compaction_mgr is None:
+            return
+        block_size = compaction_mgr.block_size
+
+        # Scan the prompt for <|im_end|> boundaries.
+        self._scan_new_turn_boundaries(request)
+        if (
+            self._num_live_completed_turns(request)
+            < self._compaction_max_turns
+        ):
+            return
+
+        # _plan_turn_evict_range's final clamp pins evict_end to
+        # (num_computed_tokens // block_size) * block_size, which is 0
+        # at admission — that would produce an empty range. Plan the
+        # range manually here, skipping that clamp (no KV exists yet, so
+        # the "don't evict past computed KV" safeguard is vacuous).
+        positions = request.turn_end_positions
+        live_turns = self._num_live_completed_turns(request)
+        stride = min(self._compaction_eviction_turn_stride, live_turns)
+        if stride <= 0:
+            return
+        turn_first_start_pos = positions[0]
+        turn_last_end_pos = positions[2 * stride]
+
+        evict_start = (
+            (turn_first_start_pos + block_size - 1) // block_size
+        ) * block_size
+        if self._compaction_assume_aligned_turn_boundaries:
+            evict_end = (
+                (turn_last_end_pos + block_size - 1) // block_size
+            ) * block_size
+        else:
+            evict_end = (turn_last_end_pos // block_size) * block_size
+
+        if evict_end <= evict_start:
+            logger.warning(
+                "[COMPACT] admission-time bail: req=%s turn_first_start=%d "
+                "turn_last_end=%d block_size=%d -> empty range",
+                request.request_id[:8],
+                turn_first_start_pos, turn_last_end_pos, block_size,
+            )
+            return
+
+        total_evicted = evict_end - evict_start
+        last_turn_evicted = request.num_turns_evicted + stride - 1
+        num_turns_evicted_after = request.num_turns_evicted + stride
+
+        # Snapshot evicted tokens before mutation (debug only).
+        evicted_token_ids: list[int] = []
+        if os.environ.get("VLLM_COMPACTION_DEBUG_TOKENS"):
+            evicted_token_ids = list(
+                request._all_token_ids[evict_start:evict_end]
+            )
+
+        # Record event BEFORE mutating state. num_output_tokens=0 marks
+        # this as an admission-time event for the trainer.
+        event = CompactionEvent(
+            num_output_tokens_at_compaction=0,
+            tokens_evicted=total_evicted,
+            position_offset_after=request.position_offset + total_evicted,
+            num_prompt_tokens=request.num_prompt_tokens,
+            evicted_token_ids=evicted_token_ids,
+            last_turn_evicted=last_turn_evicted,
+            num_turns_evicted_after=num_turns_evicted_after,
+        )
+        request.compaction_events.append(event)
+
+        logger.warning(
+            "[COMPACT] admission req=%s prompt_len=%d evict=[%d,%d) "
+            "total=%d live_turns=%d stride=%d last_turn=%d",
+            request.request_id[:8],
+            request.num_prompt_tokens,
+            evict_start, evict_end,
+            total_evicted,
+            live_turns, stride, last_turn_evicted,
+        )
+
+        # Trim both _all_token_ids AND prompt_token_ids (admission mode).
+        # No block-manager call: no blocks are allocated yet at admission,
+        # so the shorter prompt will simply be prefilled normally.
+        self._apply_trim(
+            request,
+            evict_start=evict_start,
+            evict_end=evict_end,
+            total_evicted=total_evicted,
+            stride_used=stride,
+            num_turns_evicted_after=num_turns_evicted_after,
+            trim_prompt_token_ids=True,
+        )
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -2262,6 +2451,12 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            # Prefill-time turn compaction: if the prompt already has
+            # more completed turns than max_turns, trim the oldest
+            # turns NOW so prefill runs on the shortened prompt and the
+            # first decoded token is sampled from the post-compaction
+            # KV (eliminating first-token distribution drift).
+            self._maybe_compact_prompt(request)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.log_stats:
