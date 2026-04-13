@@ -701,3 +701,333 @@ def test_compaction_event_carries_num_prompt_tokens():
     assert dec_default.num_prompt_tokens == 0
     # With omit_defaults, the default-valued encoding should be shorter.
     assert len(enc_default) < len(encoded)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Turn-mode compaction tests
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Test setup: instead of relying on real ChatML tokenization, we use an
+# arbitrary "im_end" token id (= 99) and inject it into the request's
+# _all_token_ids at known positions. The system prompt is prompt_token_ids
+# ending with the im_end marker; subsequent turn boundaries are produced by
+# scripted sampling.
+
+IM_END = 99
+GEN_BASE = 10_000  # generated tokens are GEN_BASE..GEN_BASE+N (excluding 99)
+
+
+def _make_system_prompt(sys_len: int) -> list[int]:
+    """sys_len total tokens, last token is the im_end marker."""
+    assert sys_len >= 2
+    return [1] * (sys_len - 1) + [IM_END]
+
+
+def _drive_scheduler(
+    scheduler,
+    request,
+    script: list[int],
+    max_steps: int = 1024,
+):
+    """Run prefill + decode, sampling tokens from `script` in order.
+
+    Stops when the script is exhausted or max_steps is reached. The sentinel
+    GEN_BASE is reserved for "any non-special token".
+    """
+    pending_idx = 0
+    steps = 0
+    while pending_idx < len(script) and steps < max_steps:
+        output = scheduler.schedule()
+        if request.request_id not in output.num_scheduled_tokens:
+            break
+        next_tok = script[pending_idx]
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[[next_tok]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        # Only consume the script entry if a token was actually appended.
+        # During pure prefill the request advances num_computed_tokens but
+        # doesn't sample; check num_total_generated to know.
+        if request.num_total_generated > pending_idx:
+            pending_idx += 1
+        steps += 1
+    return steps
+
+
+def _turn_script(num_turns: int, turn_token_count: int = 60) -> list[int]:
+    """Build a sampled-token script that emits num_turns user+assistant
+    pairs, each turn ending with a single IM_END.
+
+    For test purposes we model both the user msg and the assistant msg as a
+    single contiguous run of generated tokens followed by an IM_END. So one
+    "turn" in the script is: turn_token_count generated tokens + 1 IM_END
+    (representing end of user msg) + turn_token_count generated tokens +
+    1 IM_END (representing end of assistant msg).
+    """
+    script = []
+    counter = 0
+    for _ in range(num_turns):
+        # User msg body + im_end
+        for _ in range(turn_token_count):
+            script.append(GEN_BASE + counter)
+            counter += 1
+        script.append(IM_END)
+        # Assistant msg body + im_end
+        for _ in range(turn_token_count):
+            script.append(GEN_BASE + counter)
+            counter += 1
+        script.append(IM_END)
+    return script
+
+
+def _make_turn_scheduler(
+    *,
+    sys_len: int,
+    block_size: int = 16,
+    compaction_window_size: int = 256,
+    compaction_stride: int = 16,
+    max_turns: int = 2,
+    turn_stride: int = 1,
+):
+    return create_scheduler(
+        max_num_batched_tokens=2048,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        block_size=block_size,
+        num_blocks=512,
+        max_model_len=4096,
+        compaction_window_size=compaction_window_size,
+        compaction_stride=compaction_stride,
+        compaction_max_turns=max_turns,
+        compaction_eviction_turn_stride=turn_stride,
+        compaction_turn_end_token_id=IM_END,
+    )
+
+
+def test_turn_mode_boundary_scanning():
+    """turn_end_positions is populated correctly as IM_END tokens appear."""
+    sys_len = 32
+    scheduler = _make_turn_scheduler(sys_len=sys_len, max_turns=10)
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=sys_len,
+        max_tokens=2048,
+        ignore_eos=True,
+        block_size=16,
+    )
+    # Override the prompt to include the im_end marker at the end.
+    request.prompt_token_ids[:] = _make_system_prompt(sys_len)
+    request._all_token_ids[:] = list(request.prompt_token_ids)
+    scheduler.add_request(request)
+
+    # Drive 3 turns.
+    script = _turn_script(num_turns=3, turn_token_count=20)
+    _drive_scheduler(scheduler, request, script)
+
+    # Expect 7 boundary markers: end_sys + 3 turns * 2 im_ends each.
+    assert len(request.turn_end_positions) == 7
+    assert request.turn_end_positions[0] == sys_len  # right after im_end
+    # All recorded positions must be one PAST an im_end token.
+    for p in request.turn_end_positions:
+        assert request._all_token_ids[p - 1] == IM_END
+
+
+def test_turn_mode_trigger_at_max_turns():
+    """No compaction at turns < max; fires once live_turns == max."""
+    sys_len = 32
+    scheduler = _make_turn_scheduler(
+        sys_len=sys_len, max_turns=3, turn_stride=1,
+        compaction_stride=16, compaction_window_size=64,
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=sys_len, max_tokens=2048,
+        ignore_eos=True, block_size=16,
+    )
+    request.prompt_token_ids[:] = _make_system_prompt(sys_len)
+    request._all_token_ids[:] = list(request.prompt_token_ids)
+    scheduler.add_request(request)
+
+    # Run 2 turns: must NOT compact yet.
+    _drive_scheduler(scheduler, request, _turn_script(2, turn_token_count=30))
+    assert len(request.compaction_events) == 0
+
+    # Run 1 more turn (now 3 live): must compact.
+    _drive_scheduler(scheduler, request, _turn_script(1, turn_token_count=30))
+    assert len(request.compaction_events) >= 1
+
+
+def test_turn_mode_evicts_one_turn():
+    """stride=1: after first compaction, num_turns_evicted=1, the system
+    prompt prefix is preserved bit-for-bit, and turn_end_positions shrinks.
+    """
+    sys_len = 32
+    scheduler = _make_turn_scheduler(
+        sys_len=sys_len, max_turns=2, turn_stride=1,
+        compaction_window_size=128, compaction_stride=16,
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=sys_len, max_tokens=2048,
+        ignore_eos=True, block_size=16,
+    )
+    sys_prompt = _make_system_prompt(sys_len)
+    request.prompt_token_ids[:] = sys_prompt
+    request._all_token_ids[:] = list(sys_prompt)
+    scheduler.add_request(request)
+
+    _drive_scheduler(scheduler, request, _turn_script(3, turn_token_count=50))
+
+    assert len(request.compaction_events) >= 1
+    ev = request.compaction_events[0]
+    assert ev.last_turn_evicted == 0
+    assert ev.num_turns_evicted_after == 1
+    assert request.num_turns_evicted >= 1
+
+    # Hard invariant: system prompt prefix bit-for-bit identical.
+    assert list(request._all_token_ids[:sys_len]) == sys_prompt
+
+
+def test_turn_mode_stride_two_evicts_two_turns():
+    """stride=2: a single compaction event accounts for two turns."""
+    sys_len = 32
+    scheduler = _make_turn_scheduler(
+        sys_len=sys_len, max_turns=4, turn_stride=2,
+        compaction_window_size=128, compaction_stride=16,
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=sys_len, max_tokens=2048,
+        ignore_eos=True, block_size=16,
+    )
+    sys_prompt = _make_system_prompt(sys_len)
+    request.prompt_token_ids[:] = sys_prompt
+    request._all_token_ids[:] = list(sys_prompt)
+    scheduler.add_request(request)
+
+    _drive_scheduler(scheduler, request, _turn_script(5, turn_token_count=50))
+
+    assert len(request.compaction_events) >= 1
+    ev = request.compaction_events[0]
+    assert ev.last_turn_evicted == 1, (
+        f"Expected last_turn_evicted=1 (turns 0,1 evicted), got "
+        f"{ev.last_turn_evicted}"
+    )
+    assert ev.num_turns_evicted_after == 2
+
+
+def test_turn_mode_block_alignment_too_short():
+    """A turn smaller than block_size should make the inward-snap range
+    collapse to empty, so _plan_turn_evict_range bails out without state
+    corruption.
+    """
+    sys_len = 16  # exactly one block, ends on boundary
+    scheduler = _make_turn_scheduler(
+        sys_len=sys_len, max_turns=2, turn_stride=1,
+        compaction_window_size=64, compaction_stride=16,
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=sys_len, max_tokens=2048,
+        ignore_eos=True, block_size=16,
+    )
+    sys_prompt = _make_system_prompt(sys_len)
+    request.prompt_token_ids[:] = sys_prompt
+    request._all_token_ids[:] = list(sys_prompt)
+    scheduler.add_request(request)
+
+    # Tiny turns: 4 tokens of body + 1 im_end + 4 tokens + 1 im_end = 10
+    # tokens per turn. With sys ending on a block boundary, end of turn 1
+    # lands at position 16 + 10 = 26. Inward snap: evict_start =
+    # align_up(16) = 16, evict_end = align_down(26) = 16 -> empty.
+    _drive_scheduler(scheduler, request, _turn_script(3, turn_token_count=4))
+
+    # Either no compaction fired (bail-out) or, if a later turn made the
+    # range non-empty, system prompt is still preserved.
+    assert list(request._all_token_ids[:sys_len]) == sys_prompt
+
+
+def test_turn_mode_backward_compat_block_fifo():
+    """compaction_max_turns == 0 is bit-identical to existing block-FIFO."""
+    block_size = 16
+    prompt_len = 50
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024, max_num_seqs=1,
+        enable_chunked_prefill=True, enable_prefix_caching=False,
+        block_size=block_size, num_blocks=64, max_model_len=2048,
+        compaction_window_size=80, compaction_stride=16,
+        compaction_max_turns=0,  # explicit
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=prompt_len, max_tokens=256,
+        ignore_eos=True, block_size=block_size,
+    )
+    scheduler.add_request(request)
+    _run_decode_until_compacted(scheduler, request)
+    assert len(request.compaction_events) == 1
+    ev = request.compaction_events[0]
+    # Default-sentinel values for the new turn fields.
+    assert ev.last_turn_evicted == -1
+    assert ev.num_turns_evicted_after == 0
+    # Existing fields still correct.
+    assert ev.tokens_evicted == 16
+
+
+def test_turn_mode_compaction_event_fields_roundtrip():
+    """new fields survive msgspec roundtrip."""
+    ev = CompactionEvent(
+        num_output_tokens_at_compaction=100,
+        tokens_evicted=32,
+        position_offset_after=32,
+        num_prompt_tokens=200,
+        last_turn_evicted=1,
+        num_turns_evicted_after=2,
+    )
+    encoded = msgspec.msgpack.encode(ev)
+    decoded = msgspec.msgpack.decode(encoded, type=CompactionEvent)
+    assert decoded.last_turn_evicted == 1
+    assert decoded.num_turns_evicted_after == 2
+
+    # Defaults omitted on wire.
+    ev_default = CompactionEvent(
+        num_output_tokens_at_compaction=100,
+        tokens_evicted=32,
+        position_offset_after=32,
+    )
+    enc_default = msgspec.msgpack.encode(ev_default)
+    assert len(enc_default) < len(encoded)
+
+
+def test_turn_mode_system_prompt_never_evicted():
+    """Hard invariant: across many compaction rounds, the leading system
+    prompt is byte-for-byte identical to the original.
+    """
+    sys_len = 48  # not block-aligned; sys_aligned = 64
+    scheduler = _make_turn_scheduler(
+        sys_len=sys_len, max_turns=2, turn_stride=1,
+        compaction_window_size=128, compaction_stride=16,
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=sys_len, max_tokens=4096,
+        ignore_eos=True, block_size=16,
+    )
+    sys_prompt = _make_system_prompt(sys_len)
+    request.prompt_token_ids[:] = sys_prompt
+    request._all_token_ids[:] = list(sys_prompt)
+    scheduler.add_request(request)
+
+    # Many turns -> many compaction rounds.
+    _drive_scheduler(scheduler, request, _turn_script(10, turn_token_count=40))
+
+    assert len(request.compaction_events) >= 2, (
+        "Test should produce multiple compaction rounds; got "
+        f"{len(request.compaction_events)}"
+    )
+    # System prompt prefix must be preserved across every event.
+    assert list(request._all_token_ids[:sys_len]) == sys_prompt
+    # And turn_end_positions[0] must always equal the original sys_len.
+    assert request.turn_end_positions[0] == sys_len

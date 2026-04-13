@@ -147,6 +147,20 @@ class Request:
         # Flag: request was compacted and needs model runner rebuild.
         self.needs_rebuild: bool = False
 
+        # Turn tracking (only populated when compaction_max_turns > 0).
+        # Absolute positions (in the CURRENT post-eviction _all_token_ids)
+        # of the first token AFTER each <|im_end|> seen so far. Monotonic.
+        # turn_end_positions[0] is the end of the system prompt;
+        # turn_end_positions[2*k] (for k >= 1) is the end of turn k.
+        self.turn_end_positions: list[int] = []
+        # Cursor: tokens in _all_token_ids[:last_turn_scan_pos] have already
+        # been scanned for <|im_end|>. Lazy, extended on demand by the
+        # scheduler. Reset/adjusted on eviction so positions stay valid.
+        self.last_turn_scan_pos: int = 0
+        # Count of whole turns (user+assistant pairs) physically evicted by
+        # prior compactions on this request. Monotonic.
+        self.num_turns_evicted: int = 0
+
         # Multi-modal related
         self.mm_features = mm_features or []
 

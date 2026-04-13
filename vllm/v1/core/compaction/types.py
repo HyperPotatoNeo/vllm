@@ -52,3 +52,13 @@ class CompactionEvent(
     # Empty by default so omit_defaults drops it on the wire for production
     # runs. Lets consumers detokenize and inspect exactly what was removed.
     evicted_token_ids: list[int] = msgspec.field(default_factory=list)
+
+    # Turn mode: index of the last turn that was evicted by this event
+    # (0-indexed, inclusive — turn 0 is the first user+assistant pair after
+    # the system prompt). Defaults to -1 in block-FIFO mode (no turn
+    # tracking).
+    last_turn_evicted: int = -1
+
+    # Turn mode: cumulative number of turns physically evicted on the
+    # request after this event. Defaults to 0 in block-FIFO mode.
+    num_turns_evicted_after: int = 0

@@ -169,6 +169,21 @@ class CacheConfig:
     multi-turn envs where the system prompt should be preserved but old
     conversation turns
     can be reclaimed."""
+    compaction_max_turns: int = 0
+    """KV cache compaction: max number of live (user+assistant) turns to
+    keep in context. 0 = disable turn mode (use block-FIFO compaction).
+    The system prompt is NOT a turn and is always protected. When set,
+    eviction fires once num_live_turns >= compaction_max_turns and removes
+    the oldest compaction_eviction_turn_stride turns at once."""
+    compaction_eviction_turn_stride: int = 1
+    """KV cache compaction: how many oldest turns to evict at once when
+    compaction_max_turns is exceeded. Must be >= 1. Larger = fewer but
+    bigger compaction events."""
+    compaction_turn_end_token_id: int | None = None
+    """KV cache compaction: token id marking the end of a chat message
+    (e.g. <|im_end|> = 151645 for Qwen3). None = auto-detect at Scheduler
+    init from the request's eos_token_id at first use. Only consulted when
+    compaction_max_turns > 0."""
 
     def compute_hash(self) -> str:
         """
@@ -202,6 +217,9 @@ class CacheConfig:
             "compaction_window_size",
             "compaction_stride",
             "compaction_protected_prefix_tokens",
+            "compaction_max_turns",
+            "compaction_eviction_turn_stride",
+            "compaction_turn_end_token_id",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors

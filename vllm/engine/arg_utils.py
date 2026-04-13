@@ -630,6 +630,9 @@ class EngineArgs:
     compaction_window_size: int = CacheConfig.compaction_window_size
     compaction_stride: int = CacheConfig.compaction_stride
     compaction_protected_prefix_tokens: int = CacheConfig.compaction_protected_prefix_tokens
+    compaction_max_turns: int = CacheConfig.compaction_max_turns
+    compaction_eviction_turn_stride: int = CacheConfig.compaction_eviction_turn_stride
+    compaction_turn_end_token_id: int | None = CacheConfig.compaction_turn_end_token_id
     tokens_only: bool = False
 
     shutdown_timeout: int = 0
@@ -1044,6 +1047,18 @@ class EngineArgs:
         cache_group.add_argument(
             "--compaction-protected-prefix-tokens",
             **cache_kwargs["compaction_protected_prefix_tokens"],
+        )
+        cache_group.add_argument(
+            "--compaction-max-turns",
+            **cache_kwargs["compaction_max_turns"],
+        )
+        cache_group.add_argument(
+            "--compaction-eviction-turn-stride",
+            **cache_kwargs["compaction_eviction_turn_stride"],
+        )
+        cache_group.add_argument(
+            "--compaction-turn-end-token-id",
+            **cache_kwargs["compaction_turn_end_token_id"],
         )
 
         # Model weight offload related configs
@@ -1610,6 +1625,9 @@ class EngineArgs:
             compaction_window_size=self.compaction_window_size,
             compaction_stride=self.compaction_stride,
             compaction_protected_prefix_tokens=self.compaction_protected_prefix_tokens,
+            compaction_max_turns=self.compaction_max_turns,
+            compaction_eviction_turn_stride=self.compaction_eviction_turn_stride,
+            compaction_turn_end_token_id=self.compaction_turn_end_token_id,
         )
 
         # Compaction incompatibility guards.
@@ -1629,6 +1647,19 @@ class EngineArgs:
             assert self.compaction_protected_prefix_tokens >= -1, (
                 "compaction_protected_prefix_tokens must be >= -1 "
                 "(-1 = auto-detect from system message)"
+            )
+        # Turn-mode guards (require window-size set as a safety fallback).
+        if self.compaction_max_turns > 0:
+            assert self.compaction_window_size > 0, (
+                "compaction_max_turns requires compaction_window_size > 0 "
+                "as a safety fallback"
+            )
+            assert self.compaction_eviction_turn_stride >= 1, (
+                "compaction_eviction_turn_stride must be >= 1"
+            )
+            assert self.compaction_protected_prefix_tokens in (0, -1), (
+                "compaction_max_turns implies system-prompt protection; "
+                "set compaction_protected_prefix_tokens to 0 or -1"
             )
 
         ray_runtime_env = None
