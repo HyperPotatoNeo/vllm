@@ -1618,6 +1618,7 @@ class OpenAIServingChat(OpenAIServing):
                     num_output_tokens_at_compaction=e.num_output_tokens_at_compaction,
                     tokens_evicted=e.tokens_evicted,
                     position_offset_after=e.position_offset_after,
+                    num_prompt_tokens=e.num_prompt_tokens,
                 )
                 for e in compaction_events
             ]

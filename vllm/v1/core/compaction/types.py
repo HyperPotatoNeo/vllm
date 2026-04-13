@@ -39,3 +39,16 @@ class CompactionEvent(
     # physical position P = P + position_offset, recovering the absolute
     # logical position from before eviction.
     position_offset_after: int
+
+    # Prompt length of the request when this event fired. For standard
+    # (full-prompt-protected) compaction this equals the original prompt.
+    # For protected-prefix eviction this shrinks as prompt tokens get
+    # evicted. Needed by the trainer to compute per-event eviction
+    # boundaries during replay. Default 0 for wire compat (omit_defaults).
+    num_prompt_tokens: int = 0
+
+    # Debug-only: the actual token IDs that were evicted, in order. Populated
+    # only when VLLM_COMPACTION_DEBUG_TOKENS=1 is set in the scheduler's env.
+    # Empty by default so omit_defaults drops it on the wire for production
+    # runs. Lets consumers detokenize and inspect exactly what was removed.
+    evicted_token_ids: list[int] = msgspec.field(default_factory=list)

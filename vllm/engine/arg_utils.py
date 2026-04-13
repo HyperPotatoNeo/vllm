@@ -629,6 +629,7 @@ class EngineArgs:
     # KV cache compaction
     compaction_window_size: int = CacheConfig.compaction_window_size
     compaction_stride: int = CacheConfig.compaction_stride
+    compaction_protected_prefix_tokens: int = CacheConfig.compaction_protected_prefix_tokens
     tokens_only: bool = False
 
     shutdown_timeout: int = 0
@@ -1033,6 +1034,16 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
+        )
+        cache_group.add_argument(
+            "--compaction-window-size", **cache_kwargs["compaction_window_size"]
+        )
+        cache_group.add_argument(
+            "--compaction-stride", **cache_kwargs["compaction_stride"]
+        )
+        cache_group.add_argument(
+            "--compaction-protected-prefix-tokens",
+            **cache_kwargs["compaction_protected_prefix_tokens"],
         )
 
         # Model weight offload related configs
@@ -1598,6 +1609,7 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
             compaction_window_size=self.compaction_window_size,
             compaction_stride=self.compaction_stride,
+            compaction_protected_prefix_tokens=self.compaction_protected_prefix_tokens,
         )
 
         # Compaction incompatibility guards.
@@ -1613,6 +1625,10 @@ class EngineArgs:
             )
             assert self.compaction_window_size > self.compaction_stride, (
                 "compaction_window_size must exceed compaction_stride"
+            )
+            assert self.compaction_protected_prefix_tokens >= -1, (
+                "compaction_protected_prefix_tokens must be >= -1 "
+                "(-1 = auto-detect from system message)"
             )
 
         ray_runtime_env = None

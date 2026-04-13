@@ -435,3 +435,269 @@ def test_scheduler_attaches_compaction_events_to_engine_core_output():
     pre = captured[: len(captured) - len(with_events)]
     for eco in pre:
         assert eco.compaction_events is None
+
+
+# ---------------------------------------------------------------------------
+# Protected prefix eviction tests
+# ---------------------------------------------------------------------------
+
+
+def test_compaction_protected_prefix_evicts_prompt_tokens():
+    """When protected_prefix < prompt_len, eviction removes prompt tokens
+    (old conversation history) rather than output tokens.
+
+    Setup: prompt=300, protected_prefix=50, stride=16, window=320.
+    Eviction boundary = ceil(50/16)*16 = 64. Evicted tokens at
+    all_token_ids[64:80] are all prompt tokens (well within 300).
+    output_token_ids should be unchanged.
+    """
+    block_size = 16
+    prompt_len = 300
+    protected_prefix = 50
+    compaction_window_size = 320
+    compaction_stride = 16
+
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        block_size=block_size,
+        num_blocks=128,
+        max_model_len=2048,
+        compaction_window_size=compaction_window_size,
+        compaction_stride=compaction_stride,
+        compaction_protected_prefix_tokens=protected_prefix,
+    )
+
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=prompt_len,
+        max_tokens=256,
+        ignore_eos=True,
+        block_size=block_size,
+    )
+    # Distinguish prompt tokens (value=0) from generated (>=10000).
+    for tok in request.prompt_token_ids:
+        assert tok == 0
+    scheduler.add_request(request)
+
+    steps, total_generated = _run_decode_until_compacted(scheduler, request)
+    assert len(request.compaction_events) >= 1
+
+    event = request.compaction_events[0]
+    assert event.tokens_evicted == compaction_stride
+    assert event.num_prompt_tokens == prompt_len  # recorded before decrement
+
+    # After compaction: prompt_len should have decreased.
+    assert request.num_prompt_tokens == prompt_len - compaction_stride
+
+    all_ids = list(request._all_token_ids)
+    out_ids = list(request._output_token_ids)
+
+    # Protected prefix (first 50 tokens) must be preserved.
+    assert all_ids[:protected_prefix] == [0] * protected_prefix
+
+    # Output tokens should all still be present (none evicted).
+    assert len(out_ids) == total_generated
+
+    # All output tokens are generated tokens (>= 10000).
+    assert all(t >= 10_000 for t in out_ids)
+
+    # Total length: original prompt + generated - evicted prompt tokens.
+    expected_len = prompt_len + total_generated - compaction_stride
+    assert len(all_ids) == expected_len
+
+
+def test_compaction_protected_prefix_mixed_eviction():
+    """When the prompt beyond the protected prefix is shorter than stride,
+    eviction spans the prompt/output boundary.
+
+    Setup: prompt=60, protected_prefix=50, stride=32, window=80.
+    Eviction boundary = ceil(50/16)*16 = 64. But prompt only extends to 60,
+    and the eviction boundary (64) already exceeds the prompt. So
+    all evicted tokens are output tokens — same as standard behavior.
+
+    For a true mixed case: prompt=80, protected_prefix=50, stride=32.
+    Eviction boundary = 64. prompt goes to 80. Evicted range: [64, 96).
+    Prompt tokens evicted: min(80, 96) - 64 = 16.
+    Output tokens evicted: 32 - 16 = 16.
+    """
+    block_size = 16
+    prompt_len = 80
+    protected_prefix = 50
+    compaction_stride = 32
+    compaction_window_size = 96
+
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        block_size=block_size,
+        num_blocks=128,
+        max_model_len=2048,
+        compaction_window_size=compaction_window_size,
+        compaction_stride=compaction_stride,
+        compaction_protected_prefix_tokens=protected_prefix,
+    )
+
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=prompt_len,
+        max_tokens=256,
+        ignore_eos=True,
+        block_size=block_size,
+    )
+    scheduler.add_request(request)
+
+    steps, total_generated = _run_decode_until_compacted(scheduler, request)
+    assert len(request.compaction_events) >= 1
+
+    event = request.compaction_events[0]
+    assert event.tokens_evicted == compaction_stride
+
+    # Eviction boundary = ceil(50/16)*16 = 64, prompt_len=80.
+    # Prompt tokens evicted: min(80, 64+32) - 64 = min(80,96) - 64 = 16.
+    # Output tokens evicted: 32 - 16 = 16.
+    prompt_tokens_evicted = min(prompt_len, 64 + compaction_stride) - 64
+    output_tokens_evicted = compaction_stride - prompt_tokens_evicted
+    assert prompt_tokens_evicted == 16
+    assert output_tokens_evicted == 16
+
+    assert request.num_prompt_tokens == prompt_len - prompt_tokens_evicted
+
+    all_ids = list(request._all_token_ids)
+    out_ids = list(request._output_token_ids)
+
+    # Output tokens lost: the oldest 16 output tokens that were past the
+    # prompt boundary (but within eviction range). The remaining output
+    # tokens should be total_generated - output_tokens_evicted.
+    assert len(out_ids) == total_generated - output_tokens_evicted
+
+    # Protected prefix preserved.
+    assert all_ids[:protected_prefix] == [0] * protected_prefix
+
+
+def test_compaction_protected_prefix_backward_compat():
+    """With protected_prefix=0 (default), behavior must be identical to
+    the original tests: only output tokens evicted, prompt unchanged.
+    """
+    block_size = 16
+    prompt_len = 50
+    compaction_window_size = 80
+    compaction_stride = 16
+
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        block_size=block_size,
+        num_blocks=64,
+        max_model_len=2048,
+        compaction_window_size=compaction_window_size,
+        compaction_stride=compaction_stride,
+        compaction_protected_prefix_tokens=0,  # explicit default
+    )
+
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=prompt_len,
+        max_tokens=256,
+        ignore_eos=True,
+        block_size=block_size,
+    )
+    scheduler.add_request(request)
+
+    steps, total_generated = _run_decode_until_compacted(scheduler, request)
+    assert len(request.compaction_events) == 1
+
+    # num_prompt_tokens unchanged (no prompt tokens evicted).
+    assert request.num_prompt_tokens == prompt_len
+
+    event = request.compaction_events[0]
+    assert event.tokens_evicted == compaction_stride
+    assert event.position_offset_after == compaction_stride
+
+    all_ids = list(request._all_token_ids)
+    out_ids = list(request._output_token_ids)
+
+    # Prompt fully preserved.
+    assert all_ids[:prompt_len] == [0] * prompt_len
+    assert len(all_ids) == prompt_len + total_generated - compaction_stride
+    assert len(out_ids) == total_generated - compaction_stride
+
+    # Identity check: gen_tail tokens preserved, evicted tokens skipped.
+    prompt_aligned_len = ((prompt_len + block_size - 1) // block_size) * block_size
+    gen_tail = prompt_aligned_len - prompt_len
+    assert out_ids[:gen_tail] == [10_000 + i for i in range(gen_tail)]
+    assert out_ids[gen_tail] == 10_000 + gen_tail + compaction_stride
+
+
+def test_compaction_protected_prefix_larger_than_prompt():
+    """When protected_prefix > prompt_len, falls back to full-prompt
+    protection (min clamp). No prompt tokens evicted.
+    """
+    block_size = 16
+    prompt_len = 50
+    compaction_window_size = 80
+    compaction_stride = 16
+
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        block_size=block_size,
+        num_blocks=64,
+        max_model_len=2048,
+        compaction_window_size=compaction_window_size,
+        compaction_stride=compaction_stride,
+        compaction_protected_prefix_tokens=1000,  # much larger than prompt
+    )
+
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=prompt_len,
+        max_tokens=256,
+        ignore_eos=True,
+        block_size=block_size,
+    )
+    scheduler.add_request(request)
+
+    steps, total_generated = _run_decode_until_compacted(scheduler, request)
+    assert len(request.compaction_events) == 1
+
+    # Behaves same as no protected prefix: full prompt protected.
+    assert request.num_prompt_tokens == prompt_len
+    all_ids = list(request._all_token_ids)
+    assert all_ids[:prompt_len] == [0] * prompt_len
+    assert len(all_ids) == prompt_len + total_generated - compaction_stride
+
+
+def test_compaction_event_carries_num_prompt_tokens():
+    """CompactionEvent.num_prompt_tokens is populated and survives
+    msgspec roundtrip."""
+    ev = CompactionEvent(
+        num_output_tokens_at_compaction=100,
+        tokens_evicted=16,
+        position_offset_after=16,
+        num_prompt_tokens=300,
+    )
+    encoded = msgspec.msgpack.encode(ev)
+    decoded = msgspec.msgpack.decode(encoded, type=CompactionEvent)
+    assert decoded.num_prompt_tokens == 300
+
+    # Default (0) should be omitted on wire (omit_defaults).
+    ev_default = CompactionEvent(
+        num_output_tokens_at_compaction=100,
+        tokens_evicted=16,
+        position_offset_after=16,
+    )
+    assert ev_default.num_prompt_tokens == 0
+    enc_default = msgspec.msgpack.encode(ev_default)
+    dec_default = msgspec.msgpack.decode(enc_default, type=CompactionEvent)
+    assert dec_default.num_prompt_tokens == 0
+    # With omit_defaults, the default-valued encoding should be shorter.
+    assert len(enc_default) < len(encoded)

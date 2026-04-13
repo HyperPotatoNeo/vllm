@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -270,6 +271,9 @@ class Scheduler(SchedulerInterface):
             isinstance(mgr, CompactingKVCacheManager)
             for mgr in self.kv_cache_manager.coordinator.single_type_managers
         )
+        self._compaction_protected_prefix = (
+            self.cache_config.compaction_protected_prefix_tokens
+        )
         if self._compaction_enabled:
             assert not self.scheduler_config.async_scheduling, (
                 "KV cache compaction is incompatible with async scheduling: "
@@ -281,9 +285,10 @@ class Scheduler(SchedulerInterface):
             # LMCache incompatibility is checked above, before connector
             # construction, to avoid loading the lmcache package at all.
             logger.warning(
-                "[COMPACT] enabled window=%d stride=%d",
+                "[COMPACT] enabled window=%d stride=%d protected_prefix=%d",
                 self.cache_config.compaction_window_size,
                 self.cache_config.compaction_stride,
+                self._compaction_protected_prefix,
             )
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -1035,13 +1040,46 @@ class Scheduler(SchedulerInterface):
 
     # --- Compaction helpers ---
 
+    def _effective_prompt_tokens(self, request: Request) -> int:
+        """Eviction boundary: protected prefix if set, else full prompt.
+
+        When compaction_protected_prefix_tokens is -1 (auto), detect the
+        system prompt boundary by finding the first eos_token in
+        prompt_token_ids (marks the end of the system message in chat
+        templates like ChatML). The result is cached on the request.
+        """
+        if self._compaction_protected_prefix > 0:
+            return min(self._compaction_protected_prefix,
+                       request.num_prompt_tokens)
+        if self._compaction_protected_prefix == -1:
+            cached = getattr(request, "_auto_protected_prefix", None)
+            if cached is not None:
+                return min(cached, request.num_prompt_tokens)
+            # Scan for the first eos token in the prompt.
+            eos_id = request.sampling_params.eos_token_id
+            boundary = request.num_prompt_tokens  # fallback: full prompt
+            if eos_id is not None and request.prompt_token_ids is not None:
+                for i, tok_id in enumerate(request.prompt_token_ids):
+                    if tok_id == eos_id:
+                        boundary = i + 1  # protect up to and including eos
+                        break
+            request._auto_protected_prefix = boundary  # type: ignore[attr-defined]
+            logger.warning(
+                "[COMPACT] auto-detected system prompt boundary: "
+                "%d tokens (prompt_len=%d)",
+                boundary, request.num_prompt_tokens,
+            )
+            return min(boundary, request.num_prompt_tokens)
+        return request.num_prompt_tokens
+
     def _should_compact(self, request: Request) -> bool:
         """Check if any KV cache group needs compaction for this request."""
+        effective_prompt = self._effective_prompt_tokens(request)
         for mgr in self.kv_cache_manager.coordinator.single_type_managers:
             if isinstance(mgr, CompactingKVCacheManager) and mgr.needs_compaction(
                 request.request_id,
                 request.num_computed_tokens,
-                request.num_prompt_tokens,
+                effective_prompt,
             ):
                 return True
         return False
@@ -1051,13 +1089,14 @@ class Scheduler(SchedulerInterface):
 
         After this, the request looks like a shorter sequence to all consumers.
         """
+        effective_prompt = self._effective_prompt_tokens(request)
         total_evicted = 0
         compaction_mgr: "CompactingKVCacheManager | None" = None
         for mgr in self.kv_cache_manager.coordinator.single_type_managers:
             if not isinstance(mgr, CompactingKVCacheManager):
                 continue
             tokens_evicted = mgr.compact_request(
-                request.request_id, request.num_prompt_tokens
+                request.request_id, effective_prompt
             )
             if tokens_evicted > 0:
                 total_evicted = tokens_evicted
@@ -1074,63 +1113,111 @@ class Scheduler(SchedulerInterface):
         assert compaction_mgr is not None
         block_size = compaction_mgr.block_size
 
+        # Compute the trim range now so debug capture can grab the slice
+        # before it's deleted below.
+        evict_start = (
+            (effective_prompt + block_size - 1) // block_size
+        ) * block_size
+        evict_end = evict_start + total_evicted
+
+        # Debug-only: snapshot the actual evicted token ids for inspection.
+        # Gated on an env var so we don't pay the serialization cost in
+        # production runs. Consumer can detokenize via `tokenizer.decode`.
+        evicted_token_ids: list[int] = []
+        if os.environ.get("VLLM_COMPACTION_DEBUG_TOKENS"):
+            evicted_token_ids = list(
+                request._all_token_ids[evict_start:evict_end]
+            )
+
         # Record event BEFORE mutating state.
         event = CompactionEvent(
             num_output_tokens_at_compaction=request.num_total_generated,
             tokens_evicted=total_evicted,
             position_offset_after=request.position_offset + total_evicted,
+            num_prompt_tokens=request.num_prompt_tokens,
+            evicted_token_ids=evicted_token_ids,
         )
         request.compaction_events.append(event)
 
-        # --- Mutate request to look like a shorter sequence ---
-        # Physical block-level eviction in CompactingKVCacheManager drops blocks
-        # starting at index prompt_blocks = ceil(prompt_len / block_size). That
-        # block's first slot is at physical position prompt_aligned_len =
-        # prompt_blocks * block_size, NOT at prompt_len. When prompt_len is not a
-        # multiple of block_size, the last prompt block is partially filled with
-        # prompt tokens; generation then fills the remainder of that same block
-        # (vLLM allocates blocks via cdiv(num_tokens, block_size) and reuses the
-        # last partial block for the first `block_size - (prompt_len % block_size)`
-        # generated tokens). Those tokens share a block with the prompt tail and
-        # are therefore NEVER evicted. Trimming the logical token lists from
-        # prompt_len would delete those retained-forever tokens AND fail to
-        # delete the actually-evicted ones; the lists would still match in count
-        # but not in identity, leaving the logical view out of sync with the
-        # physical KV cache (breaking GPU sample kernels that index all_token_ids
-        # positionally: penalties, bad_words, prompt_logprob).
-        prompt_len = request.num_prompt_tokens
-        prompt_aligned_len = (
-            (prompt_len + block_size - 1) // block_size
-        ) * block_size
-        # How many generated tokens live in the tail of the last prompt block.
-        # These are never evicted and must be preserved across the trim.
-        gen_tail_in_prompt_block = prompt_aligned_len - prompt_len
+        logger.warning(
+            "[COMPACT] req=%s effective_prompt=%d num_prompt=%d "
+            "evict_start=%d evicted=%d generated=%d events=%d",
+            request.request_id[:8],
+            effective_prompt,
+            request.num_prompt_tokens,
+            ((effective_prompt + block_size - 1) // block_size) * block_size,
+            total_evicted,
+            request.num_total_generated,
+            len(request.compaction_events),
+        )
 
-        # 1. Trim all_token_ids at the block-aligned boundary so the removed
-        # identities match the physically evicted block range.
-        del request._all_token_ids[
-            prompt_aligned_len : prompt_aligned_len + total_evicted
-        ]
+        # --- Mutate request to look like a shorter sequence ---
+        #
+        # The eviction boundary is block-aligned from effective_prompt (which
+        # is either the full prompt or the protected prefix). Physical block
+        # eviction in CompactingKVCacheManager drops blocks starting at
+        # prompt_blocks = ceil(effective_prompt / block_size).
+        #
+        # When effective_prompt < num_prompt_tokens (protected prefix mode),
+        # some evicted tokens are prompt tokens (old conversation history)
+        # rather than output tokens. The trim logic handles both cases:
+        #   - prompt_tokens_evicted: removed from all_token_ids, and
+        #     num_prompt_tokens is decremented
+        #   - output_tokens_evicted: removed from both all_token_ids and
+        #     output_token_ids
+        #
+        # Backward compat: when effective_prompt == num_prompt_tokens (default),
+        # prompt_tokens_evicted == 0 and the formula reduces to the original
+        # gen_tail-based trim.
+        # evict_start / evict_end were computed above for debug capture.
+        prompt_len = request.num_prompt_tokens
+
+        # How many evicted tokens are prompt vs output?
+        prompt_tokens_evicted = max(
+            0, min(prompt_len, evict_end) - evict_start
+        )
+        output_tokens_evicted = total_evicted - prompt_tokens_evicted
+
+        # 1. Trim all_token_ids at the block-aligned eviction boundary.
+        del request._all_token_ids[evict_start:evict_end]
         request.all_token_ids = ConstantList(request._all_token_ids)
 
-        # 2. Trim output_token_ids at the same range, expressed in output
-        # (post-prompt) coordinates. The first gen_tail_in_prompt_block entries
-        # of _output_token_ids correspond to generated tokens living in the last
-        # prompt block and are retained.
-        del request._output_token_ids[
-            gen_tail_in_prompt_block : gen_tail_in_prompt_block + total_evicted
-        ]
+        # 2. Trim output_token_ids for any evicted output tokens.
+        if output_tokens_evicted > 0:
+            # In output coordinates: output_token_ids[i] corresponds to
+            # all_token_ids[prompt_len + i]. The first evicted output token
+            # is at all_token_ids[max(evict_start, prompt_len)], which maps
+            # to output index max(0, evict_start - prompt_len).
+            out_start = max(0, evict_start - prompt_len)
+            del request._output_token_ids[
+                out_start : out_start + output_tokens_evicted
+            ]
         request.output_token_ids = ConstantList(request._output_token_ids)
 
-        # 3. Reduce num_computed_tokens (guard against underflow)
+        # 3. Adjust num_prompt_tokens if prompt tokens were evicted.
+        if prompt_tokens_evicted > 0:
+            request.num_prompt_tokens -= prompt_tokens_evicted
+
+        # 4. Reduce num_computed_tokens (guard against underflow)
         assert request.num_computed_tokens >= total_evicted, (
             f"Compaction underflow: num_computed={request.num_computed_tokens}, "
             f"evicting={total_evicted}"
         )
         request.num_computed_tokens -= total_evicted
 
-        # 4. Update position offset
+        # 5. Update position offset
         request.position_offset += total_evicted
+
+        if prompt_tokens_evicted > 0:
+            logger.warning(
+                "[COMPACT] req=%s prompt_evicted=%d output_evicted=%d "
+                "new_prompt_len=%d pos_offset=%d",
+                request.request_id[:8],
+                prompt_tokens_evicted,
+                output_tokens_evicted,
+                request.num_prompt_tokens,
+                request.position_offset,
+            )
 
         return total_evicted
 
@@ -1228,6 +1315,7 @@ class Scheduler(SchedulerInterface):
         resumed_req_ids = set()
         rebuild_req_ids: set[str] = set()
         position_offsets: dict[str, int] = {}
+        prompt_lengths: dict[str, int] = {}
 
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
@@ -1255,6 +1343,7 @@ class Scheduler(SchedulerInterface):
             if req.needs_rebuild:
                 rebuild_req_ids.add(req_id)
                 position_offsets[req_id] = req.position_offset
+                prompt_lengths[req_id] = req.num_prompt_tokens
                 all_token_ids[req_id] = req.all_token_ids.copy()
                 # Send full block_ids (not just new) for rebuild.
                 full_block_ids = tuple(
@@ -1293,6 +1382,7 @@ class Scheduler(SchedulerInterface):
             num_output_tokens=num_output_tokens,
             rebuild_req_ids=rebuild_req_ids,
             position_offsets=position_offsets,
+            prompt_lengths=prompt_lengths,
         )
 
     def _try_schedule_encoder_inputs(

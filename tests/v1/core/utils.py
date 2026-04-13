@@ -59,6 +59,7 @@ def create_scheduler(
     ec_role: str | None = None,
     compaction_window_size: int = 0,
     compaction_stride: int = 0,
+    compaction_protected_prefix_tokens: int = 0,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -100,6 +101,7 @@ def create_scheduler(
         enable_prefix_caching=enable_prefix_caching,
         compaction_window_size=compaction_window_size,
         compaction_stride=compaction_stride,
+        compaction_protected_prefix_tokens=compaction_protected_prefix_tokens,
     )
     kv_transfer_config = None
     if isinstance(use_kv_connector, MockKVConfig):

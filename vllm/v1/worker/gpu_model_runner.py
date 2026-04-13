@@ -1270,6 +1270,12 @@ class GPUModelRunner(
                 req_state.position_offset = req_data.position_offsets.get(
                     req_id, 0
                 )
+                # Update prompt length if prompt tokens were evicted
+                # (turn-based eviction with protected prefix).
+                if req_id in req_data.prompt_lengths:
+                    req_state.num_prompt_tokens = (
+                        req_data.prompt_lengths[req_id]
+                    )
                 if req_id in req_data.all_token_ids:
                     all_tids = req_data.all_token_ids[req_id]
                     prompt_len = req_state.num_prompt_tokens

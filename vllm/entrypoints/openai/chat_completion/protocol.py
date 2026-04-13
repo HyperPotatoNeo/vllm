@@ -104,6 +104,7 @@ class CompactionEventPayload(OpenAIBaseModel):
     num_output_tokens_at_compaction: int
     tokens_evicted: int
     position_offset_after: int
+    num_prompt_tokens: int = 0
 
 
 class ChatCompletionResponse(OpenAIBaseModel):

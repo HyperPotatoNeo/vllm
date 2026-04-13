@@ -159,6 +159,16 @@ class CacheConfig:
     compaction_stride: int = 0
     """KV cache compaction: number of tokens to evict per compaction event.
     Must be a multiple of block_size."""
+    compaction_protected_prefix_tokens: int = 0
+    """KV cache compaction: number of prefix tokens to protect from eviction.
+    0 = protect full prompt (default, backward compat). -1 = auto-detect
+    from the first system message (scan prompt_token_ids for the first
+    eos_token, protecting everything up to and including it). When > 0,
+    only the first N tokens of each request's prompt are protected; tokens
+    between N and the full prompt length become evictable. Useful for
+    multi-turn envs where the system prompt should be preserved but old
+    conversation turns
+    can be reclaimed."""
 
     def compute_hash(self) -> str:
         """
@@ -191,6 +201,7 @@ class CacheConfig:
             # Compaction is a runtime scheduler feature
             "compaction_window_size",
             "compaction_stride",
+            "compaction_protected_prefix_tokens",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors

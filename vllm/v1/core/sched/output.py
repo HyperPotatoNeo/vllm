@@ -127,6 +127,9 @@ class CachedRequestData:
     rebuild_req_ids: set[str] = field(default_factory=set)
     # Position offsets for compacted requests (req_id -> cumulative offset).
     position_offsets: dict[str, int] = field(default_factory=dict)
+    # Updated prompt lengths for compacted requests whose prompt tokens
+    # were evicted (turn-based eviction with protected prefix).
+    prompt_lengths: dict[str, int] = field(default_factory=dict)
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
