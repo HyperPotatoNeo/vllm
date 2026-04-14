@@ -105,6 +105,7 @@ class CompactionEventPayload(OpenAIBaseModel):
     tokens_evicted: int
     position_offset_after: int
     num_prompt_tokens: int = 0
+    evict_start: int = 0
 
 
 class ChatCompletionResponse(OpenAIBaseModel):

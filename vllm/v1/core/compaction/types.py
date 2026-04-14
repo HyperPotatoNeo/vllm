@@ -47,6 +47,13 @@ class CompactionEvent(
     # boundaries during replay. Default 0 for wire compat (omit_defaults).
     num_prompt_tokens: int = 0
 
+    # Start position of the eviction range in the CURRENT (possibly
+    # already-partially-trimmed) token sequence. For admission-time events
+    # (num_output_tokens_at_compaction == 0) this is the position in the
+    # prompt; for mid-gen events it's in _all_token_ids. The orchestrator
+    # uses this to replay the exact same token deletion before training.
+    evict_start: int = 0
+
     # Debug-only: the actual token IDs that were evicted, in order. Populated
     # only when VLLM_COMPACTION_DEBUG_TOKENS=1 is set in the scheduler's env.
     # Empty by default so omit_defaults drops it on the wire for production

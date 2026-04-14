@@ -1275,6 +1275,7 @@ class Scheduler(SchedulerInterface):
             tokens_evicted=total_evicted,
             position_offset_after=request.position_offset + total_evicted,
             num_prompt_tokens=request.num_prompt_tokens,
+            evict_start=evict_start,
             evicted_token_ids=evicted_token_ids,
             last_turn_evicted=last_turn_evicted,
             num_turns_evicted_after=num_turns_evicted_after,
@@ -1474,7 +1475,16 @@ class Scheduler(SchedulerInterface):
             )
 
         # 5. Update position offset.
-        request.position_offset += total_evicted
+        # For mid-gen eviction (trim_prompt_token_ids=False), KV blocks are
+        # already allocated and the next decode token must keep its absolute
+        # RoPE position, so we shift the offset by the number of evicted tokens.
+        # For admission-time eviction (trim_prompt_token_ids=True), no KV
+        # exists yet — the shorter prompt is prefilled as a fresh sequence with
+        # position_ids = [0, 1, ..., len-1].  Incrementing the offset here
+        # would shift those positions in the model runner, creating a mismatch
+        # with the trainer (which always uses arange(0, seq_len)).  Skip it.
+        if not trim_prompt_token_ids:
+            request.position_offset += total_evicted
 
         # 6. Turn mode: drop the markers for the evicted turns and shift
         # the rest left by total_evicted. Index-based — robust against
@@ -1597,6 +1607,7 @@ class Scheduler(SchedulerInterface):
                 tokens_evicted=total_evicted,
                 position_offset_after=request.position_offset + total_evicted,
                 num_prompt_tokens=request.num_prompt_tokens,
+                evict_start=evict_start,
                 evicted_token_ids=evicted_token_ids,
                 last_turn_evicted=last_turn_evicted,
                 num_turns_evicted_after=num_turns_evicted_after,

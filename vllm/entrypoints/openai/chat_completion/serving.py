@@ -1619,6 +1619,7 @@ class OpenAIServingChat(OpenAIServing):
                     tokens_evicted=e.tokens_evicted,
                     position_offset_after=e.position_offset_after,
                     num_prompt_tokens=e.num_prompt_tokens,
+                    evict_start=e.evict_start,
                 )
                 for e in compaction_events
             ]
