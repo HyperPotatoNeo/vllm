@@ -6,13 +6,21 @@ These tests exercise the interaction between CompactingKVCacheManager
 (logical token-list trim), focusing on correctness edge cases.
 """
 
+import time
+
 import msgspec
 import pytest
+import torch
 
+from vllm.v1.core.compaction.am_manager import AttentionMatchingKVCacheManager
+from vllm.v1.core.compaction.am_runtime import OMPCompaction, build_attention_matching_plan
 from vllm.v1.core.compaction.manager import CompactingKVCacheManager
+from vllm.v1.core.sched.utils import check_stop
 from vllm.v1.core.compaction.types import CompactionEvent
 from vllm.v1.engine import EngineCoreOutput
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import AttentionMatchingCompactionResult, ModelRunnerOutput
+from vllm.v1.request import RequestStatus
+from vllm.v1.utils import ConstantList
 
 from .utils import create_requests, create_scheduler
 
@@ -49,6 +57,448 @@ def _run_decode_until_compacted(scheduler, request, max_steps: int = 2048):
             next_sampled += 1
         steps += 1
     return steps, request.num_total_generated
+
+
+def test_compaction_strategy_defaults_to_fifo_manager():
+    """FIFO remains the default manager when compaction is enabled."""
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        block_size=16,
+        num_blocks=64,
+        max_model_len=2048,
+        compaction_window_size=80,
+        compaction_stride=16,
+    )
+
+    managers = scheduler.kv_cache_manager.coordinator.single_type_managers
+    assert any(type(mgr) is CompactingKVCacheManager for mgr in managers)
+    assert all(not isinstance(mgr, AttentionMatchingKVCacheManager) for mgr in managers)
+
+
+def test_attention_matching_strategy_requires_compaction_to_activate():
+    """Selecting AM alone must not change the non-compaction path."""
+    scheduler = create_scheduler(compaction_strategy="attention_matching")
+
+    managers = scheduler.kv_cache_manager.coordinator.single_type_managers
+    assert all(not isinstance(mgr, CompactingKVCacheManager) for mgr in managers)
+    assert all(not isinstance(mgr, AttentionMatchingKVCacheManager) for mgr in managers)
+
+
+def test_attention_matching_strategy_is_opt_in():
+    """AM manager is only instantiated when the AM strategy is selected."""
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        block_size=16,
+        num_blocks=64,
+        max_model_len=2048,
+        compaction_window_size=80,
+        compaction_stride=16,
+        compaction_strategy="attention_matching",
+    )
+
+    managers = scheduler.kv_cache_manager.coordinator.single_type_managers
+    assert all(type(mgr) is AttentionMatchingKVCacheManager for mgr in managers)
+
+
+def test_attention_matching_nnls_handles_rank_deficient_matrix():
+    """AM NNLS should stay finite on degenerate solves seen under batching."""
+    compactor = OMPCompaction()
+    M = torch.tensor(
+        [
+            [1.0, 1.0, 2.0],
+            [2.0, 2.0, 4.0],
+            [3.0, 3.0, 6.0],
+        ],
+        dtype=torch.float32,
+    )
+    y = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+
+    B = compactor._nnls_pg(M, y)
+
+    assert torch.isfinite(B).all()
+    assert torch.all(B >= 0)
+
+
+def test_attention_matching_c2_handles_rank_deficient_system():
+    """AM C2 reconstruction should not crash on ill-conditioned systems."""
+    compactor = OMPCompaction()
+    C1 = torch.tensor([[1.0, 0.0], [1.0, 0.0]], dtype=torch.float32)
+    beta = torch.zeros(2, dtype=torch.float32)
+    K = torch.tensor([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+    V = torch.tensor([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+    queries = torch.tensor([[1.0, 0.0], [2.0, 0.0]], dtype=torch.float32)
+
+    C2 = compactor._compute_C2(C1, beta, K, V, queries)
+
+    assert torch.isfinite(C2).all()
+
+
+def test_attention_matching_c2_raises_on_nonfinite_scores():
+    """AM should fail loudly when non-finite intermediates appear."""
+    compactor = OMPCompaction()
+    C1 = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+    beta = torch.tensor([float("nan"), 0.0], dtype=torch.float32)
+    K = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+    V = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
+    queries = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match="non-finite"):
+        compactor._compute_C2(C1, beta, K, V, queries)
+
+
+def test_attention_matching_normalizes_large_nnls_log_weights():
+    """AM beta computation should stay finite for very large positive weights."""
+    compactor = OMPCompaction()
+    B = torch.tensor([1e100, 1e80, 1e60], dtype=torch.float64)
+
+    beta = compactor._stable_log_weights(B)
+
+    assert torch.isfinite(beta).all()
+    assert beta.max().item() == 0.0
+
+
+def test_attention_matching_strategy_does_not_use_scheduler_compaction_path():
+    """AM compaction must be worker-driven, not the FIFO scheduler path."""
+    block_size = 16
+    prompt_len = 50
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        block_size=block_size,
+        num_blocks=64,
+        max_model_len=2048,
+        compaction_window_size=80,
+        compaction_stride=16,
+        compaction_strategy="attention_matching",
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=prompt_len,
+        max_tokens=256,
+        ignore_eos=True,
+        block_size=block_size,
+    )
+    scheduler.add_request(request)
+
+    next_sampled = 10_000
+    for _ in range(96):
+        output = scheduler.schedule()
+        assert request.request_id in output.num_scheduled_tokens
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[[next_sampled]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        if request.num_total_generated > (next_sampled - 10_000):
+            next_sampled += 1
+
+    assert request.num_computed_tokens > scheduler.cache_config.compaction_window_size
+    assert request.compaction_events == []
+    assert not request.needs_rebuild
+
+
+def test_attention_matching_compaction_result_rewrites_request_state():
+    """Scheduler should consume worker-side AM compaction results."""
+    block_size = 16
+    prompt_len = 32
+    window = 48
+    stride = 16
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        block_size=block_size,
+        num_blocks=64,
+        max_model_len=2048,
+        compaction_window_size=window,
+        compaction_stride=stride,
+        compaction_strategy="attention_matching",
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=prompt_len,
+        max_tokens=256,
+        ignore_eos=True,
+        block_size=block_size,
+    )
+    scheduler.add_request(request)
+
+    next_sampled = 10_000
+    source_len = 0
+    for _ in range(64):
+        output = scheduler.schedule()
+        assert request.request_id in output.num_scheduled_tokens
+        source_len = request.num_computed_tokens
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[[next_sampled]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        if request.num_computed_tokens > window:
+            break
+        if request.num_total_generated > (next_sampled - 10_000):
+            next_sampled += 1
+
+    source_len = request.num_computed_tokens
+    plan = build_attention_matching_plan(
+        num_computed_tokens=source_len,
+        window_size=window,
+        stride=stride,
+        num_prompt_tokens=request.num_prompt_tokens,
+    )
+    assert plan is not None
+
+    output = scheduler.schedule()
+    assert request.request_id in output.num_scheduled_tokens
+    sampled = next_sampled + 1
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[sampled]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            attention_matching_compactions={
+                request.request_id: AttentionMatchingCompactionResult(
+                    request_id=request.request_id,
+                    protected_prefix_len=plan.protected_prefix_len,
+                    synthetic_prefix_len=plan.synthetic_prefix_len,
+                    exact_kept_tokens=plan.exact_kept_tokens,
+                    position_offset_delta=plan.offset_delta,
+                )
+            },
+        ),
+    )
+
+    assert request.num_prompt_tokens == stride
+    assert request.logical_prompt_len == prompt_len
+    assert request.num_computed_tokens == plan.target_len
+    assert request.position_offset == plan.offset_delta
+    assert request.needs_rebuild
+    assert len(request.compaction_events) == 1
+    assert request.compaction_events[0].tokens_evicted == plan.offset_delta
+    assert request.all_token_ids[:stride] == [0] * stride
+
+
+def test_attention_matching_plan_can_protect_prompt_prefix():
+    """AM should compact only after the protected prompt prefix."""
+    plan = build_attention_matching_plan(
+        num_computed_tokens=100,
+        window_size=48,
+        stride=16,
+        num_prompt_tokens=32,
+        protected_prefix_len=32,
+    )
+
+    assert plan is not None
+    assert plan.protected_prefix_len == 32
+    assert plan.synthetic_prefix_len == 16
+    assert plan.exact_kept_tokens == 16
+    assert plan.compact_region_len == 52
+    assert plan.target_len == 64
+    assert plan.offset_delta == 36
+
+
+def test_attention_matching_stop_uses_logical_prompt_len():
+    """AM prompt rewrites must not weaken max_model_len stop checks."""
+    prompt_len = 32
+    synthetic_prompt_len = 16
+    max_model_len = 40
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=prompt_len,
+        max_tokens=64,
+        ignore_eos=True,
+    )
+    request.num_prompt_tokens = synthetic_prompt_len
+
+    for token_id in range(max_model_len - prompt_len - 1):
+        request.append_output_token_ids(10_000 + token_id)
+        assert not check_stop(request, max_model_len)
+
+    request.append_output_token_ids(20_000)
+    assert check_stop(request, max_model_len)
+
+
+def test_attention_matching_rejects_resumable_requests():
+    """Streaming session updates are not supported by the AM baseline."""
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        block_size=16,
+        num_blocks=64,
+        max_model_len=2048,
+        compaction_window_size=80,
+        compaction_stride=16,
+        compaction_strategy="attention_matching",
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        max_tokens=64,
+        ignore_eos=True,
+    )
+    request.resumable = True
+
+    with pytest.raises(
+        AssertionError,
+        match="attention_matching baseline does not support resumable streaming",
+    ):
+        scheduler.add_request(request)
+
+
+def test_attention_matching_preemption_keeps_request_resumable():
+    """AM-compacted requests should be preempted, not aborted."""
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        block_size=16,
+        num_blocks=64,
+        max_model_len=2048,
+        compaction_window_size=80,
+        compaction_stride=16,
+        compaction_strategy="attention_matching",
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        max_tokens=128,
+        ignore_eos=True,
+        block_size=16,
+    )
+    scheduler.add_request(request)
+    scheduler.schedule()
+    assert request in scheduler.running
+
+    request.prompt_token_ids = [0] * 16
+    request.num_prompt_tokens = 16
+    request._output_token_ids = [10_000 + i for i in range(32)]
+    request.output_token_ids = ConstantList(request._output_token_ids)
+    request._all_token_ids = request.prompt_token_ids + request._output_token_ids
+    request.all_token_ids = ConstantList(request._all_token_ids)
+    request.num_computed_tokens = 48
+    request.position_offset = 16
+    request.attention_matching_active = True
+    request.attention_matching_snapshot_version = 3
+    request.attention_matching_target_len = 48
+
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, time.time())
+
+    assert request.status == RequestStatus.PREEMPTED
+    assert request.num_computed_tokens == 48
+    assert request.attention_matching_restore_pending
+    assert request.request_id not in scheduler.finished_req_ids
+
+
+def test_attention_matching_resumed_request_requests_restore():
+    """Resumed AM requests should carry restore metadata to the worker."""
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        block_size=16,
+        num_blocks=64,
+        max_model_len=2048,
+        compaction_window_size=80,
+        compaction_stride=16,
+        compaction_strategy="attention_matching",
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        max_tokens=128,
+        ignore_eos=True,
+        block_size=16,
+    )
+    scheduler.add_request(request)
+    first = scheduler.schedule()
+    assert request.request_id in first.num_scheduled_tokens
+
+    request.prompt_token_ids = [0] * 16
+    request.num_prompt_tokens = 16
+    request._output_token_ids = [10_000 + i for i in range(32)]
+    request.output_token_ids = ConstantList(request._output_token_ids)
+    request._all_token_ids = request.prompt_token_ids + request._output_token_ids
+    request.all_token_ids = ConstantList(request._all_token_ids)
+    request.num_computed_tokens = 48
+    request.position_offset = 16
+    request.attention_matching_active = True
+    request.attention_matching_snapshot_version = 7
+    request.attention_matching_target_len = 48
+
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, time.time())
+
+    resumed = scheduler.schedule()
+    cached = resumed.scheduled_cached_reqs
+
+    assert request.request_id in cached.resumed_req_ids
+    assert request.request_id in cached.attention_matching_restore_req_ids
+    assert cached.attention_matching_snapshot_versions[request.request_id] == 7
+    assert cached.position_offsets[request.request_id] == 16
+    assert cached.prompt_lengths[request.request_id] == 16
+    assert not request.attention_matching_restore_pending
+
+
+def test_fifo_compacted_request_still_aborts_on_preemption():
+    """The new AM resume path must not change FIFO compaction behavior."""
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        block_size=16,
+        num_blocks=64,
+        max_model_len=2048,
+        compaction_window_size=80,
+        compaction_stride=16,
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        max_tokens=128,
+        ignore_eos=True,
+        block_size=16,
+    )
+    scheduler.add_request(request)
+    scheduler.schedule()
+    assert request in scheduler.running
+
+    request.position_offset = 16
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, time.time())
+
+    assert request.status == RequestStatus.FINISHED_ABORTED
+    assert request.request_id in scheduler.finished_req_ids
 
 
 def test_compaction_trim_non_block_aligned_prompt():
@@ -435,599 +885,3 @@ def test_scheduler_attaches_compaction_events_to_engine_core_output():
     pre = captured[: len(captured) - len(with_events)]
     for eco in pre:
         assert eco.compaction_events is None
-
-
-# ---------------------------------------------------------------------------
-# Protected prefix eviction tests
-# ---------------------------------------------------------------------------
-
-
-def test_compaction_protected_prefix_evicts_prompt_tokens():
-    """When protected_prefix < prompt_len, eviction removes prompt tokens
-    (old conversation history) rather than output tokens.
-
-    Setup: prompt=300, protected_prefix=50, stride=16, window=320.
-    Eviction boundary = ceil(50/16)*16 = 64. Evicted tokens at
-    all_token_ids[64:80] are all prompt tokens (well within 300).
-    output_token_ids should be unchanged.
-    """
-    block_size = 16
-    prompt_len = 300
-    protected_prefix = 50
-    compaction_window_size = 320
-    compaction_stride = 16
-
-    scheduler = create_scheduler(
-        max_num_batched_tokens=1024,
-        max_num_seqs=1,
-        enable_chunked_prefill=True,
-        enable_prefix_caching=False,
-        block_size=block_size,
-        num_blocks=128,
-        max_model_len=2048,
-        compaction_window_size=compaction_window_size,
-        compaction_stride=compaction_stride,
-        compaction_protected_prefix_tokens=protected_prefix,
-    )
-
-    (request,) = create_requests(
-        num_requests=1,
-        num_tokens=prompt_len,
-        max_tokens=256,
-        ignore_eos=True,
-        block_size=block_size,
-    )
-    # Distinguish prompt tokens (value=0) from generated (>=10000).
-    for tok in request.prompt_token_ids:
-        assert tok == 0
-    scheduler.add_request(request)
-
-    steps, total_generated = _run_decode_until_compacted(scheduler, request)
-    assert len(request.compaction_events) >= 1
-
-    event = request.compaction_events[0]
-    assert event.tokens_evicted == compaction_stride
-    assert event.num_prompt_tokens == prompt_len  # recorded before decrement
-
-    # After compaction: prompt_len should have decreased.
-    assert request.num_prompt_tokens == prompt_len - compaction_stride
-
-    all_ids = list(request._all_token_ids)
-    out_ids = list(request._output_token_ids)
-
-    # Protected prefix (first 50 tokens) must be preserved.
-    assert all_ids[:protected_prefix] == [0] * protected_prefix
-
-    # Output tokens should all still be present (none evicted).
-    assert len(out_ids) == total_generated
-
-    # All output tokens are generated tokens (>= 10000).
-    assert all(t >= 10_000 for t in out_ids)
-
-    # Total length: original prompt + generated - evicted prompt tokens.
-    expected_len = prompt_len + total_generated - compaction_stride
-    assert len(all_ids) == expected_len
-
-
-def test_compaction_protected_prefix_mixed_eviction():
-    """When the prompt beyond the protected prefix is shorter than stride,
-    eviction spans the prompt/output boundary.
-
-    Setup: prompt=60, protected_prefix=50, stride=32, window=80.
-    Eviction boundary = ceil(50/16)*16 = 64. But prompt only extends to 60,
-    and the eviction boundary (64) already exceeds the prompt. So
-    all evicted tokens are output tokens — same as standard behavior.
-
-    For a true mixed case: prompt=80, protected_prefix=50, stride=32.
-    Eviction boundary = 64. prompt goes to 80. Evicted range: [64, 96).
-    Prompt tokens evicted: min(80, 96) - 64 = 16.
-    Output tokens evicted: 32 - 16 = 16.
-    """
-    block_size = 16
-    prompt_len = 80
-    protected_prefix = 50
-    compaction_stride = 32
-    compaction_window_size = 96
-
-    scheduler = create_scheduler(
-        max_num_batched_tokens=1024,
-        max_num_seqs=1,
-        enable_chunked_prefill=True,
-        enable_prefix_caching=False,
-        block_size=block_size,
-        num_blocks=128,
-        max_model_len=2048,
-        compaction_window_size=compaction_window_size,
-        compaction_stride=compaction_stride,
-        compaction_protected_prefix_tokens=protected_prefix,
-    )
-
-    (request,) = create_requests(
-        num_requests=1,
-        num_tokens=prompt_len,
-        max_tokens=256,
-        ignore_eos=True,
-        block_size=block_size,
-    )
-    scheduler.add_request(request)
-
-    steps, total_generated = _run_decode_until_compacted(scheduler, request)
-    assert len(request.compaction_events) >= 1
-
-    event = request.compaction_events[0]
-    assert event.tokens_evicted == compaction_stride
-
-    # Eviction boundary = ceil(50/16)*16 = 64, prompt_len=80.
-    # Prompt tokens evicted: min(80, 64+32) - 64 = min(80,96) - 64 = 16.
-    # Output tokens evicted: 32 - 16 = 16.
-    prompt_tokens_evicted = min(prompt_len, 64 + compaction_stride) - 64
-    output_tokens_evicted = compaction_stride - prompt_tokens_evicted
-    assert prompt_tokens_evicted == 16
-    assert output_tokens_evicted == 16
-
-    assert request.num_prompt_tokens == prompt_len - prompt_tokens_evicted
-
-    all_ids = list(request._all_token_ids)
-    out_ids = list(request._output_token_ids)
-
-    # Output tokens lost: the oldest 16 output tokens that were past the
-    # prompt boundary (but within eviction range). The remaining output
-    # tokens should be total_generated - output_tokens_evicted.
-    assert len(out_ids) == total_generated - output_tokens_evicted
-
-    # Protected prefix preserved.
-    assert all_ids[:protected_prefix] == [0] * protected_prefix
-
-
-def test_compaction_protected_prefix_backward_compat():
-    """With protected_prefix=0 (default), behavior must be identical to
-    the original tests: only output tokens evicted, prompt unchanged.
-    """
-    block_size = 16
-    prompt_len = 50
-    compaction_window_size = 80
-    compaction_stride = 16
-
-    scheduler = create_scheduler(
-        max_num_batched_tokens=1024,
-        max_num_seqs=1,
-        enable_chunked_prefill=True,
-        enable_prefix_caching=False,
-        block_size=block_size,
-        num_blocks=64,
-        max_model_len=2048,
-        compaction_window_size=compaction_window_size,
-        compaction_stride=compaction_stride,
-        compaction_protected_prefix_tokens=0,  # explicit default
-    )
-
-    (request,) = create_requests(
-        num_requests=1,
-        num_tokens=prompt_len,
-        max_tokens=256,
-        ignore_eos=True,
-        block_size=block_size,
-    )
-    scheduler.add_request(request)
-
-    steps, total_generated = _run_decode_until_compacted(scheduler, request)
-    assert len(request.compaction_events) == 1
-
-    # num_prompt_tokens unchanged (no prompt tokens evicted).
-    assert request.num_prompt_tokens == prompt_len
-
-    event = request.compaction_events[0]
-    assert event.tokens_evicted == compaction_stride
-    assert event.position_offset_after == compaction_stride
-
-    all_ids = list(request._all_token_ids)
-    out_ids = list(request._output_token_ids)
-
-    # Prompt fully preserved.
-    assert all_ids[:prompt_len] == [0] * prompt_len
-    assert len(all_ids) == prompt_len + total_generated - compaction_stride
-    assert len(out_ids) == total_generated - compaction_stride
-
-    # Identity check: gen_tail tokens preserved, evicted tokens skipped.
-    prompt_aligned_len = ((prompt_len + block_size - 1) // block_size) * block_size
-    gen_tail = prompt_aligned_len - prompt_len
-    assert out_ids[:gen_tail] == [10_000 + i for i in range(gen_tail)]
-    assert out_ids[gen_tail] == 10_000 + gen_tail + compaction_stride
-
-
-def test_compaction_protected_prefix_larger_than_prompt():
-    """When protected_prefix > prompt_len, falls back to full-prompt
-    protection (min clamp). No prompt tokens evicted.
-    """
-    block_size = 16
-    prompt_len = 50
-    compaction_window_size = 80
-    compaction_stride = 16
-
-    scheduler = create_scheduler(
-        max_num_batched_tokens=1024,
-        max_num_seqs=1,
-        enable_chunked_prefill=True,
-        enable_prefix_caching=False,
-        block_size=block_size,
-        num_blocks=64,
-        max_model_len=2048,
-        compaction_window_size=compaction_window_size,
-        compaction_stride=compaction_stride,
-        compaction_protected_prefix_tokens=1000,  # much larger than prompt
-    )
-
-    (request,) = create_requests(
-        num_requests=1,
-        num_tokens=prompt_len,
-        max_tokens=256,
-        ignore_eos=True,
-        block_size=block_size,
-    )
-    scheduler.add_request(request)
-
-    steps, total_generated = _run_decode_until_compacted(scheduler, request)
-    assert len(request.compaction_events) == 1
-
-    # Behaves same as no protected prefix: full prompt protected.
-    assert request.num_prompt_tokens == prompt_len
-    all_ids = list(request._all_token_ids)
-    assert all_ids[:prompt_len] == [0] * prompt_len
-    assert len(all_ids) == prompt_len + total_generated - compaction_stride
-
-
-def test_compaction_event_carries_num_prompt_tokens():
-    """CompactionEvent.num_prompt_tokens is populated and survives
-    msgspec roundtrip."""
-    ev = CompactionEvent(
-        num_output_tokens_at_compaction=100,
-        tokens_evicted=16,
-        position_offset_after=16,
-        num_prompt_tokens=300,
-    )
-    encoded = msgspec.msgpack.encode(ev)
-    decoded = msgspec.msgpack.decode(encoded, type=CompactionEvent)
-    assert decoded.num_prompt_tokens == 300
-
-    # Default (0) should be omitted on wire (omit_defaults).
-    ev_default = CompactionEvent(
-        num_output_tokens_at_compaction=100,
-        tokens_evicted=16,
-        position_offset_after=16,
-    )
-    assert ev_default.num_prompt_tokens == 0
-    enc_default = msgspec.msgpack.encode(ev_default)
-    dec_default = msgspec.msgpack.decode(enc_default, type=CompactionEvent)
-    assert dec_default.num_prompt_tokens == 0
-    # With omit_defaults, the default-valued encoding should be shorter.
-    assert len(enc_default) < len(encoded)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Turn-mode compaction tests
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# Test setup: instead of relying on real ChatML tokenization, we use an
-# arbitrary "im_end" token id (= 99) and inject it into the request's
-# _all_token_ids at known positions. The system prompt is prompt_token_ids
-# ending with the im_end marker; subsequent turn boundaries are produced by
-# scripted sampling.
-
-IM_END = 99
-GEN_BASE = 10_000  # generated tokens are GEN_BASE..GEN_BASE+N (excluding 99)
-
-
-def _make_system_prompt(sys_len: int) -> list[int]:
-    """sys_len total tokens, last token is the im_end marker."""
-    assert sys_len >= 2
-    return [1] * (sys_len - 1) + [IM_END]
-
-
-def _drive_scheduler(
-    scheduler,
-    request,
-    script: list[int],
-    max_steps: int = 1024,
-):
-    """Run prefill + decode, sampling tokens from `script` in order.
-
-    Stops when the script is exhausted or max_steps is reached. The sentinel
-    GEN_BASE is reserved for "any non-special token".
-    """
-    pending_idx = 0
-    steps = 0
-    while pending_idx < len(script) and steps < max_steps:
-        output = scheduler.schedule()
-        if request.request_id not in output.num_scheduled_tokens:
-            break
-        next_tok = script[pending_idx]
-        scheduler.update_from_output(
-            output,
-            ModelRunnerOutput(
-                req_ids=[request.request_id],
-                req_id_to_index={request.request_id: 0},
-                sampled_token_ids=[[next_tok]],
-                logprobs=None,
-                prompt_logprobs_dict={},
-                pooler_output=[],
-            ),
-        )
-        # Only consume the script entry if a token was actually appended.
-        # During pure prefill the request advances num_computed_tokens but
-        # doesn't sample; check num_total_generated to know.
-        if request.num_total_generated > pending_idx:
-            pending_idx += 1
-        steps += 1
-    return steps
-
-
-def _turn_script(num_turns: int, turn_token_count: int = 60) -> list[int]:
-    """Build a sampled-token script that emits num_turns user+assistant
-    pairs, each turn ending with a single IM_END.
-
-    For test purposes we model both the user msg and the assistant msg as a
-    single contiguous run of generated tokens followed by an IM_END. So one
-    "turn" in the script is: turn_token_count generated tokens + 1 IM_END
-    (representing end of user msg) + turn_token_count generated tokens +
-    1 IM_END (representing end of assistant msg).
-    """
-    script = []
-    counter = 0
-    for _ in range(num_turns):
-        # User msg body + im_end
-        for _ in range(turn_token_count):
-            script.append(GEN_BASE + counter)
-            counter += 1
-        script.append(IM_END)
-        # Assistant msg body + im_end
-        for _ in range(turn_token_count):
-            script.append(GEN_BASE + counter)
-            counter += 1
-        script.append(IM_END)
-    return script
-
-
-def _make_turn_scheduler(
-    *,
-    sys_len: int,
-    block_size: int = 16,
-    compaction_window_size: int = 256,
-    compaction_stride: int = 16,
-    max_turns: int = 2,
-    turn_stride: int = 1,
-):
-    return create_scheduler(
-        max_num_batched_tokens=2048,
-        max_num_seqs=1,
-        enable_chunked_prefill=True,
-        enable_prefix_caching=False,
-        block_size=block_size,
-        num_blocks=512,
-        max_model_len=4096,
-        compaction_window_size=compaction_window_size,
-        compaction_stride=compaction_stride,
-        compaction_max_turns=max_turns,
-        compaction_eviction_turn_stride=turn_stride,
-        compaction_turn_end_token_id=IM_END,
-    )
-
-
-def test_turn_mode_boundary_scanning():
-    """turn_end_positions is populated correctly as IM_END tokens appear."""
-    sys_len = 32
-    scheduler = _make_turn_scheduler(sys_len=sys_len, max_turns=10)
-    (request,) = create_requests(
-        num_requests=1,
-        num_tokens=sys_len,
-        max_tokens=2048,
-        ignore_eos=True,
-        block_size=16,
-    )
-    # Override the prompt to include the im_end marker at the end.
-    request.prompt_token_ids[:] = _make_system_prompt(sys_len)
-    request._all_token_ids[:] = list(request.prompt_token_ids)
-    scheduler.add_request(request)
-
-    # Drive 3 turns.
-    script = _turn_script(num_turns=3, turn_token_count=20)
-    _drive_scheduler(scheduler, request, script)
-
-    # Expect 7 boundary markers: end_sys + 3 turns * 2 im_ends each.
-    assert len(request.turn_end_positions) == 7
-    assert request.turn_end_positions[0] == sys_len  # right after im_end
-    # All recorded positions must be one PAST an im_end token.
-    for p in request.turn_end_positions:
-        assert request._all_token_ids[p - 1] == IM_END
-
-
-def test_turn_mode_trigger_at_max_turns():
-    """No compaction at turns < max; fires once live_turns == max."""
-    sys_len = 32
-    scheduler = _make_turn_scheduler(
-        sys_len=sys_len, max_turns=3, turn_stride=1,
-        compaction_stride=16, compaction_window_size=64,
-    )
-    (request,) = create_requests(
-        num_requests=1, num_tokens=sys_len, max_tokens=2048,
-        ignore_eos=True, block_size=16,
-    )
-    request.prompt_token_ids[:] = _make_system_prompt(sys_len)
-    request._all_token_ids[:] = list(request.prompt_token_ids)
-    scheduler.add_request(request)
-
-    # Run 2 turns: must NOT compact yet.
-    _drive_scheduler(scheduler, request, _turn_script(2, turn_token_count=30))
-    assert len(request.compaction_events) == 0
-
-    # Run 1 more turn (now 3 live): must compact.
-    _drive_scheduler(scheduler, request, _turn_script(1, turn_token_count=30))
-    assert len(request.compaction_events) >= 1
-
-
-def test_turn_mode_evicts_one_turn():
-    """stride=1: after first compaction, num_turns_evicted=1, the system
-    prompt prefix is preserved bit-for-bit, and turn_end_positions shrinks.
-    """
-    sys_len = 32
-    scheduler = _make_turn_scheduler(
-        sys_len=sys_len, max_turns=2, turn_stride=1,
-        compaction_window_size=128, compaction_stride=16,
-    )
-    (request,) = create_requests(
-        num_requests=1, num_tokens=sys_len, max_tokens=2048,
-        ignore_eos=True, block_size=16,
-    )
-    sys_prompt = _make_system_prompt(sys_len)
-    request.prompt_token_ids[:] = sys_prompt
-    request._all_token_ids[:] = list(sys_prompt)
-    scheduler.add_request(request)
-
-    _drive_scheduler(scheduler, request, _turn_script(3, turn_token_count=50))
-
-    assert len(request.compaction_events) >= 1
-    ev = request.compaction_events[0]
-    assert ev.last_turn_evicted == 0
-    assert ev.num_turns_evicted_after == 1
-    assert request.num_turns_evicted >= 1
-
-    # Hard invariant: system prompt prefix bit-for-bit identical.
-    assert list(request._all_token_ids[:sys_len]) == sys_prompt
-
-
-def test_turn_mode_stride_two_evicts_two_turns():
-    """stride=2: a single compaction event accounts for two turns."""
-    sys_len = 32
-    scheduler = _make_turn_scheduler(
-        sys_len=sys_len, max_turns=4, turn_stride=2,
-        compaction_window_size=128, compaction_stride=16,
-    )
-    (request,) = create_requests(
-        num_requests=1, num_tokens=sys_len, max_tokens=2048,
-        ignore_eos=True, block_size=16,
-    )
-    sys_prompt = _make_system_prompt(sys_len)
-    request.prompt_token_ids[:] = sys_prompt
-    request._all_token_ids[:] = list(sys_prompt)
-    scheduler.add_request(request)
-
-    _drive_scheduler(scheduler, request, _turn_script(5, turn_token_count=50))
-
-    assert len(request.compaction_events) >= 1
-    ev = request.compaction_events[0]
-    assert ev.last_turn_evicted == 1, (
-        f"Expected last_turn_evicted=1 (turns 0,1 evicted), got "
-        f"{ev.last_turn_evicted}"
-    )
-    assert ev.num_turns_evicted_after == 2
-
-
-def test_turn_mode_block_alignment_too_short():
-    """A turn smaller than block_size should make the inward-snap range
-    collapse to empty, so _plan_turn_evict_range bails out without state
-    corruption.
-    """
-    sys_len = 16  # exactly one block, ends on boundary
-    scheduler = _make_turn_scheduler(
-        sys_len=sys_len, max_turns=2, turn_stride=1,
-        compaction_window_size=64, compaction_stride=16,
-    )
-    (request,) = create_requests(
-        num_requests=1, num_tokens=sys_len, max_tokens=2048,
-        ignore_eos=True, block_size=16,
-    )
-    sys_prompt = _make_system_prompt(sys_len)
-    request.prompt_token_ids[:] = sys_prompt
-    request._all_token_ids[:] = list(sys_prompt)
-    scheduler.add_request(request)
-
-    # Tiny turns: 4 tokens of body + 1 im_end + 4 tokens + 1 im_end = 10
-    # tokens per turn. With sys ending on a block boundary, end of turn 1
-    # lands at position 16 + 10 = 26. Inward snap: evict_start =
-    # align_up(16) = 16, evict_end = align_down(26) = 16 -> empty.
-    _drive_scheduler(scheduler, request, _turn_script(3, turn_token_count=4))
-
-    # Either no compaction fired (bail-out) or, if a later turn made the
-    # range non-empty, system prompt is still preserved.
-    assert list(request._all_token_ids[:sys_len]) == sys_prompt
-
-
-def test_turn_mode_backward_compat_block_fifo():
-    """compaction_max_turns == 0 is bit-identical to existing block-FIFO."""
-    block_size = 16
-    prompt_len = 50
-    scheduler = create_scheduler(
-        max_num_batched_tokens=1024, max_num_seqs=1,
-        enable_chunked_prefill=True, enable_prefix_caching=False,
-        block_size=block_size, num_blocks=64, max_model_len=2048,
-        compaction_window_size=80, compaction_stride=16,
-        compaction_max_turns=0,  # explicit
-    )
-    (request,) = create_requests(
-        num_requests=1, num_tokens=prompt_len, max_tokens=256,
-        ignore_eos=True, block_size=block_size,
-    )
-    scheduler.add_request(request)
-    _run_decode_until_compacted(scheduler, request)
-    assert len(request.compaction_events) == 1
-    ev = request.compaction_events[0]
-    # Default-sentinel values for the new turn fields.
-    assert ev.last_turn_evicted == -1
-    assert ev.num_turns_evicted_after == 0
-    # Existing fields still correct.
-    assert ev.tokens_evicted == 16
-
-
-def test_turn_mode_compaction_event_fields_roundtrip():
-    """new fields survive msgspec roundtrip."""
-    ev = CompactionEvent(
-        num_output_tokens_at_compaction=100,
-        tokens_evicted=32,
-        position_offset_after=32,
-        num_prompt_tokens=200,
-        last_turn_evicted=1,
-        num_turns_evicted_after=2,
-    )
-    encoded = msgspec.msgpack.encode(ev)
-    decoded = msgspec.msgpack.decode(encoded, type=CompactionEvent)
-    assert decoded.last_turn_evicted == 1
-    assert decoded.num_turns_evicted_after == 2
-
-    # Defaults omitted on wire.
-    ev_default = CompactionEvent(
-        num_output_tokens_at_compaction=100,
-        tokens_evicted=32,
-        position_offset_after=32,
-    )
-    enc_default = msgspec.msgpack.encode(ev_default)
-    assert len(enc_default) < len(encoded)
-
-
-def test_turn_mode_system_prompt_never_evicted():
-    """Hard invariant: across many compaction rounds, the leading system
-    prompt is byte-for-byte identical to the original.
-    """
-    sys_len = 48  # not block-aligned; sys_aligned = 64
-    scheduler = _make_turn_scheduler(
-        sys_len=sys_len, max_turns=2, turn_stride=1,
-        compaction_window_size=128, compaction_stride=16,
-    )
-    (request,) = create_requests(
-        num_requests=1, num_tokens=sys_len, max_tokens=4096,
-        ignore_eos=True, block_size=16,
-    )
-    sys_prompt = _make_system_prompt(sys_len)
-    request.prompt_token_ids[:] = sys_prompt
-    request._all_token_ids[:] = list(sys_prompt)
-    scheduler.add_request(request)
-
-    # Many turns -> many compaction rounds.
-    _drive_scheduler(scheduler, request, _turn_script(10, turn_token_count=40))
-
-    assert len(request.compaction_events) >= 2, (
-        "Test should produce multiple compaction rounds; got "
-        f"{len(request.compaction_events)}"
-    )
-    # System prompt prefix must be preserved across every event.
-    assert list(request._all_token_ids[:sys_len]) == sys_prompt
-    # And turn_end_positions[0] must always equal the original sys_len.
-    assert request.turn_end_positions[0] == sys_len

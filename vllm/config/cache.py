@@ -25,6 +25,16 @@ MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
+CompactionStrategy = Literal["fifo", "attention_matching"]
+AttentionMatchingQuerySource = Literal[
+    "random_queries",
+    "recent_cache_keys",
+    "prefix_cache_keys",
+]
+AttentionMatchingPromptProtection = Literal["none", "first_user", "all_user"]
+NoiseControlTarget = Literal["keys", "values", "both"]
+NoiseControlRegion = Literal["all", "old_context_only"]
+NoiseControlMode = Literal["gaussian", "zero"]
 
 
 @config
@@ -159,42 +169,77 @@ class CacheConfig:
     compaction_stride: int = 0
     """KV cache compaction: number of tokens to evict per compaction event.
     Must be a multiple of block_size."""
-    compaction_protected_prefix_tokens: int = 0
-    """KV cache compaction: number of prefix tokens to protect from eviction.
-    0 = protect full prompt (default, backward compat). -1 = auto-detect
-    from the first system message (scan prompt_token_ids for the first
-    eos_token, protecting everything up to and including it). When > 0,
-    only the first N tokens of each request's prompt are protected; tokens
-    between N and the full prompt length become evictable. Useful for
-    multi-turn envs where the system prompt should be preserved but old
-    conversation turns
-    can be reclaimed."""
-    compaction_max_turns: int = 0
-    """KV cache compaction: max number of live (user+assistant) turns to
-    keep in context. 0 = disable turn mode (use block-FIFO compaction).
-    The system prompt is NOT a turn and is always protected. When set,
-    eviction fires once num_live_turns >= compaction_max_turns and removes
-    the oldest compaction_eviction_turn_stride turns at once."""
-    compaction_eviction_turn_stride: int = 1
-    """KV cache compaction: how many oldest turns to evict at once when
-    compaction_max_turns is exceeded. Must be >= 1. Larger = fewer but
-    bigger compaction events."""
-    compaction_turn_end_token_id: int | None = None
-    """KV cache compaction: token id marking the end of a chat message
-    (e.g. <|im_end|> = 151645 for Qwen3). None = auto-detect at Scheduler
-    init from the request's eos_token_id at first use. Only consulted when
-    compaction_max_turns > 0."""
-    compaction_assume_aligned_turn_boundaries: bool = False
-    """KV cache compaction (turn mode): when True, assume the client has
-    padded each <|im_end|> such that the FIRST token of the NEXT message
-    lands on a block boundary (i.e. `pos_after_im_end + n_pads` is a
-    multiple of block_size). Under that invariant, the eviction end is
-    snapped UP (align_up) to include the padding of the last evicted turn,
-    so no tail of that turn is orphaned in the kept KV region. When False
-    (default), evict_end is snapped inward (align_down), which is safe
-    without padding but leaves up to block_size-1 orphan tokens from the
-    tail of the last evicted turn. Only consulted when
-    compaction_max_turns > 0."""
+    compaction_strategy: CompactionStrategy = "fifo"
+    """KV cache compaction strategy.
+
+    - "fifo" keeps the current scheduler-integrated oldest-block eviction path.
+    - "attention_matching" is a separate opt-in codepath reserved for the
+      attention-matching baseline.
+    """
+    attention_matching_max_queries_per_kv_head: int = Field(default=128, gt=0)
+    """Maximum cache-key probe queries per KV head for attention matching."""
+    attention_matching_query_source: AttentionMatchingQuerySource = "random_queries"
+    """Probe query source used by AM.
+
+    - "random_queries": use random normal vectors in query/key head space.
+    - "recent_cache_keys": use the exact kept suffix after compaction.
+    - "prefix_cache_keys": use the compacted prefix region itself.
+    """
+    attention_matching_protect_user_prompts: AttentionMatchingPromptProtection = (
+        "first_user"
+    )
+    """Which rendered user prompt prefix AM should keep exact.
+
+    The current V1 worker receives rendered prompt tokens, not chat-message
+    spans. "first_user" protects the initial rendered prompt prefix. "all_user"
+    also extends that protected prefix when streaming/multi-turn prompt updates
+    add more prompt tokens. "none" restores the older behavior.
+    """
+    shuffle_control_chunk_size: int = 0
+    """Chunk size for the online shuffle-control robustness experiment.
+
+    0 disables the perturbation. When positive, every fully completed chunk
+    after the protected prompt prefix is visited exactly once.
+    """
+    shuffle_control_probability: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Probability of permuting any visited shuffle-control chunk."""
+    shuffle_control_seed: int = 0
+    """Seed used to deterministically decide and realize chunk shuffles."""
+    shuffle_control_region: NoiseControlRegion = "all"
+    """Which KV/text tokens are eligible for shuffle-control corruption."""
+    shuffle_control_keep_recent_tokens: int = Field(default=0, ge=0)
+    """Recent physical suffix to protect when shuffle_control_region is old_context_only."""
+    shuffle_control_protect_synthetic: bool = False
+    """Do not shuffle AM synthetic-prefix KV chunks."""
+    shuffle_control_kv_only: bool = False
+    """Shuffle KV cache chunks without also shuffling the corresponding token ids."""
+    noise_control_chunk_size: int = 0
+    """Chunk size for Gaussian KV-noise robustness experiments.
+
+    0 disables the perturbation. When positive, every fully completed chunk
+    after the protected prompt prefix is visited exactly once.
+    """
+    noise_control_probability: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Probability of adding Gaussian KV noise to any visited chunk."""
+    noise_control_std: float = Field(default=0.0, ge=0.0)
+    """Standard deviation for additive Gaussian noise in KV-cache dtype scale."""
+    noise_control_seed: int = 0
+    """Seed used to deterministically decide and realize Gaussian KV noise."""
+    noise_control_target: NoiseControlTarget = "both"
+    """Which KV tensor(s) receive Gaussian noise: keys, values, or both."""
+    noise_control_mode: NoiseControlMode = "gaussian"
+    """Corruption mode: additive Gaussian noise or zero/dropout."""
+    noise_control_region: NoiseControlRegion = "all"
+    """Which KV tokens are eligible for Gaussian noise.
+
+    - "all": visit completed chunks after the protected prompt prefix.
+    - "old_context_only": visit only chunks older than
+      noise_control_keep_recent_tokens.
+    """
+    noise_control_keep_recent_tokens: int = Field(default=0, ge=0)
+    """Recent physical KV suffix to protect when noise_control_region is old_context_only."""
+    noise_control_protect_synthetic: bool = False
+    """Do not apply Gaussian noise to AM synthetic-prefix KV chunks."""
 
     def compute_hash(self) -> str:
         """
@@ -227,11 +272,26 @@ class CacheConfig:
             # Compaction is a runtime scheduler feature
             "compaction_window_size",
             "compaction_stride",
-            "compaction_protected_prefix_tokens",
-            "compaction_max_turns",
-            "compaction_eviction_turn_stride",
-            "compaction_turn_end_token_id",
-            "compaction_assume_aligned_turn_boundaries",
+            "compaction_strategy",
+            "attention_matching_max_queries_per_kv_head",
+            "attention_matching_query_source",
+            "attention_matching_protect_user_prompts",
+            "shuffle_control_chunk_size",
+            "shuffle_control_probability",
+            "shuffle_control_seed",
+            "shuffle_control_region",
+            "shuffle_control_keep_recent_tokens",
+            "shuffle_control_protect_synthetic",
+            "shuffle_control_kv_only",
+            "noise_control_chunk_size",
+            "noise_control_probability",
+            "noise_control_std",
+            "noise_control_seed",
+            "noise_control_target",
+            "noise_control_mode",
+            "noise_control_region",
+            "noise_control_keep_recent_tokens",
+            "noise_control_protect_synthetic",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors

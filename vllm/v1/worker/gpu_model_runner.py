@@ -4,6 +4,8 @@
 import functools
 import gc
 import itertools
+import logging
+import math
 import threading
 import time
 from collections import defaultdict
@@ -142,6 +144,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
+    AttentionMatchingCompactionResult,
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     DraftTokenIds,
@@ -204,6 +207,22 @@ from .utils import (
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
 )
+from vllm.v1.core.compaction.am_runtime import (
+    DEFAULT_PROGRESSIVE_SCHEDULE,
+    OMPCompaction,
+    AttentionMatchingSnapshot,
+    AttentionMatchingRequestState,
+    build_attention_matching_plan,
+    select_query_indices,
+)
+from vllm.v1.core.compaction.shuffle_control import (
+    ShuffleEvent,
+    chunk_permutation,
+    noise_seed,
+    should_shuffle_chunk,
+    should_noise_chunk,
+)
+from vllm.v1.outputs import NoiseControlResult, ShuffleControlResult
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -215,6 +234,65 @@ logger = init_logger(__name__)
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+
+
+class AttentionMatchingScoreMod:
+    """Reusable score_mod callable so layer.score_mod identity stays stable."""
+
+    def __init__(self, num_queries_per_kv: int) -> None:
+        self.num_queries_per_kv = num_queries_per_kv
+        self.query_doc_ids: torch.Tensor | None = None
+        self.protected_prefix_lens: torch.Tensor | None = None
+        self.synthetic_prefix_lens: torch.Tensor | None = None
+        self.beta_padded: torch.Tensor | None = None
+        self.max_synthetic_len = 0
+
+    def update(
+        self,
+        *,
+        query_doc_ids: torch.Tensor,
+        protected_prefix_lens: torch.Tensor,
+        synthetic_prefix_lens: torch.Tensor,
+        beta_padded: torch.Tensor,
+        max_synthetic_len: int,
+    ) -> None:
+        self.query_doc_ids = query_doc_ids
+        self.protected_prefix_lens = protected_prefix_lens
+        self.synthetic_prefix_lens = synthetic_prefix_lens
+        self.beta_padded = beta_padded
+        self.max_synthetic_len = max_synthetic_len
+
+    def __call__(
+        self,
+        score: torch.Tensor,
+        b: torch.Tensor,
+        h: torch.Tensor,
+        logical_q_idx: torch.Tensor,
+        logical_kv_idx: torch.Tensor,
+        physical_q: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert physical_q is not None
+        assert self.query_doc_ids is not None
+        assert self.protected_prefix_lens is not None
+        assert self.synthetic_prefix_lens is not None
+        assert self.beta_padded is not None
+        req_idx = self.query_doc_ids[physical_q]
+        kv_head = torch.div(
+            h.to(torch.long),
+            self.num_queries_per_kv,
+            rounding_mode="floor",
+        )
+        protected_len = self.protected_prefix_lens[req_idx]
+        synthetic_len = self.synthetic_prefix_lens[req_idx]
+        beta_idx = logical_kv_idx.to(torch.long) - protected_len
+        safe_kv_idx = torch.clamp(
+            beta_idx,
+            min=0,
+            max=self.max_synthetic_len - 1,
+        )
+        within_synth_prefix = (beta_idx >= 0) & (beta_idx < synthetic_len)
+        beta = self.beta_padded[req_idx, kv_head, safe_kv_idx]
+        return torch.where(within_synth_prefix, score + beta, score)
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -861,9 +939,63 @@ class GPUModelRunner(
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
         self.layerwise_nvtx_hooks_registered = False
+        self._attention_matching_enabled = (
+            self.cache_config.compaction_strategy == "attention_matching"
+            and self.cache_config.compaction_window_size > 0
+        )
+        self._shuffle_control_enabled = (
+            self.cache_config.shuffle_control_chunk_size > 0
+            and self.cache_config.shuffle_control_probability > 0
+        )
+        self._noise_control_enabled = (
+            self.cache_config.noise_control_chunk_size > 0
+            and self.cache_config.noise_control_probability > 0
+            and (
+                self.cache_config.noise_control_std > 0
+                or self.cache_config.noise_control_mode == "zero"
+            )
+        )
+        self._attention_matching_layer_names: list[str] = []
+        self._attention_matching_omp = OMPCompaction(
+            progressive_schedule=DEFAULT_PROGRESSIVE_SCHEDULE,
+            nnls_upper_bound=1e3,
+            c2_ridge_lambda=1e-3,
+        )
+        self._attention_matching_random_generator = torch.Generator(
+            device=self.device
+        )
+        self._attention_matching_random_generator.manual_seed(
+            int(getattr(self.model_config, "seed", 0) or 0)
+        )
+        self._attention_matching_positions = torch.arange(
+            self.max_model_len,
+            device=self.device,
+            dtype=torch.long,
+        )
+        self._attention_matching_query_index_cache: dict[tuple[int, int], torch.Tensor] = {}
+        self._attention_matching_scratch: dict[
+            tuple[str, tuple[int, ...], torch.dtype],
+            torch.Tensor,
+        ] = {}
+        self._attention_matching_score_mod_signature: tuple[object, ...] | None = None
+        self._attention_matching_score_mod_prompt_lens: tuple[
+            torch.Tensor, torch.Tensor
+        ] | None = None
+        self._attention_matching_score_mod_beta_padded: dict[str, torch.Tensor] = {}
+        self._attention_matching_score_mod_objects: dict[str, AttentionMatchingScoreMod] = {}
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
+        self._attention_matching_positions = torch.arange(
+            self.max_model_len,
+            device=self.device,
+            dtype=torch.long,
+        )
+        self._attention_matching_query_index_cache.clear()
+        self._attention_matching_scratch.clear()
+        self._attention_matching_score_mod_signature = None
+        self._attention_matching_score_mod_prompt_lens = None
+        self._attention_matching_score_mod_beta_padded.clear()
         if self.speculative_config:
             draft_config = self.speculative_config.draft_model_config
             if draft_config is None or draft_config.max_model_len is None:
@@ -1045,6 +1177,920 @@ class GPUModelRunner(
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
 
+    def _validate_attention_matching_support(self) -> None:
+        if not (
+            self._attention_matching_enabled
+            or self._shuffle_control_enabled
+            or self._noise_control_enabled
+        ):
+            return
+        assert self.speculative_config is None, (
+            "long-context controls do not support speculative decoding"
+        )
+        assert not self.cache_config.cache_dtype.startswith("fp8"), (
+            "long-context controls do not support fp8 KV cache storage"
+        )
+        assert not self.uses_mrope, (
+            "long-context controls do not support M-RoPE models"
+        )
+        assert self.uses_xdrope_dim == 0, (
+            "long-context controls do not support XD-RoPE models"
+        )
+        assert len(self.kv_cache_config.kv_cache_groups) == 1, (
+            "long-context controls currently support a single decoder "
+            "KV cache group"
+        )
+        kv_cache_group = self.kv_cache_config.kv_cache_groups[0]
+        assert isinstance(kv_cache_group.kv_cache_spec, FullAttentionSpec), (
+            "long-context controls require a full-attention KV cache"
+        )
+        self._attention_matching_layer_names = []
+        for attn_group in self.attn_groups[0]:
+            assert attn_group.backend.get_name() == "FLEX_ATTENTION", (
+                "long-context controls require --attention-backend flex_attention"
+            )
+            assert isinstance(attn_group.kv_cache_spec, FullAttentionSpec), (
+                "long-context controls only support decoder FullAttentionSpec layers"
+            )
+            assert attn_group.kv_cache_spec.sliding_window is None, (
+                "long-context controls do not support sliding-window layers"
+            )
+            assert attn_group.kv_cache_spec.attention_chunk_size is None, (
+                "long-context controls do not support local-attention layers"
+            )
+            self._attention_matching_layer_names.extend(attn_group.layer_names)
+
+    def _shuffle_request_token_ids_locally(
+        self,
+        req_id: str,
+        req_state: CachedRequestState,
+        chunk_start: int,
+        chunk_end: int,
+        permutation: list[int],
+    ) -> None:
+        prompt_len = req_state.num_prompt_tokens
+        if req_state.prompt_token_ids is None:
+            raise RuntimeError(
+                "shuffle_control does not support prompt_embeds requests"
+            )
+        all_token_ids = list(req_state.prompt_token_ids) + list(req_state.output_token_ids)
+        if chunk_end > req_state.num_computed_tokens:
+            raise RuntimeError(
+                f"shuffle_control chunk exceeds computed tokens for request {req_id}: "
+                f"chunk_end={chunk_end}, num_computed={req_state.num_computed_tokens}"
+            )
+        chunk_tokens = all_token_ids[chunk_start:chunk_end]
+        all_token_ids[chunk_start:chunk_end] = [chunk_tokens[i] for i in permutation]
+        req_state.prompt_token_ids = list(all_token_ids[:prompt_len])
+        req_state.output_token_ids = list(
+            all_token_ids[prompt_len:req_state.num_computed_tokens]
+        )
+        req_index = self.input_batch.req_id_to_index.get(req_id)
+        if req_index is not None:
+            self.input_batch.req_output_token_ids[req_index] = req_state.output_token_ids
+            self.input_batch.token_ids_cpu[
+                req_index, : req_state.num_computed_tokens
+            ] = all_token_ids[: req_state.num_computed_tokens]
+            self.input_batch.is_token_ids[
+                req_index, : req_state.num_computed_tokens
+            ] = True
+
+    def _maybe_run_shuffle_control_for_request(
+        self,
+        req_id: str,
+        req_state: CachedRequestState,
+    ) -> list[ShuffleControlResult]:
+        if not self._shuffle_control_enabled:
+            return []
+        if req_state.num_computed_tokens <= 0:
+            return []
+        protected_prefix_len = (
+            0
+            if self.cache_config.attention_matching_protect_user_prompts == "none"
+            else req_state.attention_matching_protected_prompt_len
+        )
+        chunk_size = self.cache_config.shuffle_control_chunk_size
+        if self.cache_config.shuffle_control_region == "all":
+            eligible_end = req_state.num_computed_tokens
+        elif self.cache_config.shuffle_control_region == "old_context_only":
+            eligible_end = max(
+                protected_prefix_len,
+                req_state.num_computed_tokens
+                - self.cache_config.shuffle_control_keep_recent_tokens,
+            )
+        else:
+            raise RuntimeError(
+                f"Unsupported shuffle_control_region: "
+                f"{self.cache_config.shuffle_control_region}"
+            )
+        available = eligible_end - protected_prefix_len
+        if available < chunk_size:
+            return []
+        full_chunks = available // chunk_size
+        if req_state.shuffle_control_next_chunk_index >= full_chunks:
+            return []
+
+        slot_mapping: torch.Tensor | None = None
+        results: list[ShuffleControlResult] = []
+        for chunk_index in range(req_state.shuffle_control_next_chunk_index, full_chunks):
+            chunk_start = protected_prefix_len + chunk_index * chunk_size
+            chunk_end = chunk_start + chunk_size
+            if (
+                self.cache_config.shuffle_control_protect_synthetic
+                and req_state.attention_matching_state is not None
+                and req_state.attention_matching_state.synthetic_prefix_len > 0
+            ):
+                synthetic_start = req_state.attention_matching_state.protected_prefix_len
+                synthetic_end = (
+                    synthetic_start
+                    + req_state.attention_matching_state.synthetic_prefix_len
+                )
+                if chunk_start < synthetic_end and chunk_end > synthetic_start:
+                    req_state.shuffle_control_next_chunk_index = chunk_index + 1
+                    continue
+            if should_shuffle_chunk(
+                base_seed=self.cache_config.shuffle_control_seed,
+                request_id=req_id,
+                chunk_index=chunk_index,
+                probability=self.cache_config.shuffle_control_probability,
+            ):
+                permutation = chunk_permutation(
+                    base_seed=self.cache_config.shuffle_control_seed,
+                    request_id=req_id,
+                    chunk_index=chunk_index,
+                    chunk_len=chunk_size,
+                )
+                if slot_mapping is None:
+                    assert req_state.block_ids, "shuffle_control requires block ids"
+                    slot_mapping = self._build_attention_matching_slot_mapping(
+                        req_state, req_state.num_computed_tokens
+                    )
+                chunk_slots = slot_mapping[chunk_start:chunk_end]
+                perm_tensor = torch.tensor(
+                    permutation,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                for layer_name in self._attention_matching_layer_names:
+                    layer = self.compilation_config.static_forward_context[layer_name]
+                    token_kv_cache = layer.kv_cache.view(
+                        2,
+                        -1,
+                        layer.impl.num_kv_heads,
+                        layer.impl.head_size,
+                    )
+                    chunk_kv = self._get_attention_matching_scratch(
+                        "shuffle_chunk_kv",
+                        (
+                            2,
+                            chunk_size,
+                            layer.impl.num_kv_heads,
+                            layer.impl.head_size,
+                        ),
+                        token_kv_cache.dtype,
+                    )
+                    torch.index_select(token_kv_cache, 1, chunk_slots, out=chunk_kv)
+                    shuffled_kv = chunk_kv.index_select(1, perm_tensor)
+                    token_kv_cache.index_copy_(1, chunk_slots, shuffled_kv)
+                if not self.cache_config.shuffle_control_kv_only:
+                    self._shuffle_request_token_ids_locally(
+                        req_id,
+                        req_state,
+                        chunk_start,
+                        chunk_end,
+                        permutation,
+                    )
+                logger.warning(
+                    "[SHUFFLE] shuffled request %s chunk=%d range=[%d,%d) "
+                    "prob=%.3f region=%s keep_recent=%d kv_only=%s",
+                    req_id,
+                    chunk_index,
+                    chunk_start,
+                    chunk_end,
+                    self.cache_config.shuffle_control_probability,
+                    self.cache_config.shuffle_control_region,
+                    self.cache_config.shuffle_control_keep_recent_tokens,
+                    self.cache_config.shuffle_control_kv_only,
+                )
+                results.append(
+                    ShuffleControlResult(
+                        request_id=req_id,
+                        chunk_index=chunk_index,
+                        chunk_start=chunk_start,
+                        chunk_end=chunk_end,
+                        kv_only=self.cache_config.shuffle_control_kv_only,
+                    )
+                )
+            req_state.shuffle_control_next_chunk_index = chunk_index + 1
+        return results
+
+    def _maybe_run_noise_control_for_request(
+        self,
+        req_id: str,
+        req_state: CachedRequestState,
+    ) -> list[NoiseControlResult]:
+        if not self._noise_control_enabled:
+            return []
+        if req_state.num_computed_tokens <= 0:
+            return []
+        protected_prefix_len = (
+            0
+            if self.cache_config.attention_matching_protect_user_prompts == "none"
+            else req_state.attention_matching_protected_prompt_len
+        )
+        chunk_size = self.cache_config.noise_control_chunk_size
+        if self.cache_config.noise_control_region == "all":
+            eligible_end = req_state.num_computed_tokens
+        elif self.cache_config.noise_control_region == "old_context_only":
+            eligible_end = max(
+                protected_prefix_len,
+                req_state.num_computed_tokens
+                - self.cache_config.noise_control_keep_recent_tokens,
+            )
+        else:
+            raise RuntimeError(
+                f"Unsupported noise_control_region: "
+                f"{self.cache_config.noise_control_region}"
+            )
+        available = eligible_end - protected_prefix_len
+        if available < chunk_size:
+            return []
+        full_chunks = available // chunk_size
+        if req_state.noise_control_next_chunk_index >= full_chunks:
+            return []
+
+        target = self.cache_config.noise_control_target
+        if target not in ("keys", "values", "both"):
+            raise RuntimeError(f"Unsupported noise_control_target: {target}")
+        kv_planes = (0, 1) if target == "both" else (0,) if target == "keys" else (1,)
+        mode = self.cache_config.noise_control_mode
+        if mode not in ("gaussian", "zero"):
+            raise RuntimeError(f"Unsupported noise_control_mode: {mode}")
+        std = float(self.cache_config.noise_control_std)
+        if mode == "gaussian" and (not math.isfinite(std) or std <= 0):
+            raise RuntimeError(f"Invalid noise_control_std: {std}")
+
+        slot_mapping: torch.Tensor | None = None
+        results: list[NoiseControlResult] = []
+        for chunk_index in range(req_state.noise_control_next_chunk_index, full_chunks):
+            chunk_start = protected_prefix_len + chunk_index * chunk_size
+            chunk_end = chunk_start + chunk_size
+            if (
+                self.cache_config.noise_control_protect_synthetic
+                and req_state.attention_matching_state is not None
+                and req_state.attention_matching_state.synthetic_prefix_len > 0
+            ):
+                synthetic_start = req_state.attention_matching_state.protected_prefix_len
+                synthetic_end = (
+                    synthetic_start
+                    + req_state.attention_matching_state.synthetic_prefix_len
+                )
+                if chunk_start < synthetic_end and chunk_end > synthetic_start:
+                    req_state.noise_control_next_chunk_index = chunk_index + 1
+                    continue
+            if should_noise_chunk(
+                base_seed=self.cache_config.noise_control_seed,
+                request_id=req_id,
+                chunk_index=chunk_index,
+                probability=self.cache_config.noise_control_probability,
+            ):
+                if slot_mapping is None:
+                    assert req_state.block_ids, "noise_control requires block ids"
+                    slot_mapping = self._build_attention_matching_slot_mapping(
+                        req_state, req_state.num_computed_tokens
+                    )
+                chunk_slots = slot_mapping[chunk_start:chunk_end]
+                generator = torch.Generator(device=self.device)
+                generator.manual_seed(
+                    noise_seed(
+                        base_seed=self.cache_config.noise_control_seed,
+                        request_id=req_id,
+                        chunk_index=chunk_index,
+                    )
+                )
+                for layer_name in self._attention_matching_layer_names:
+                    layer = self.compilation_config.static_forward_context[layer_name]
+                    token_kv_cache = layer.kv_cache.view(
+                        2,
+                        -1,
+                        layer.impl.num_kv_heads,
+                        layer.impl.head_size,
+                    )
+                    selected = token_kv_cache[list(kv_planes)][:, chunk_slots]
+                    if not torch.isfinite(selected).all():
+                        raise RuntimeError(
+                            f"noise_control saw non-finite KV values before noise "
+                            f"for request {req_id}, layer {layer_name}, chunk {chunk_index}"
+                        )
+                    if mode == "gaussian":
+                        noise = torch.randn(
+                            selected.shape,
+                            device=self.device,
+                            dtype=torch.float32,
+                            generator=generator,
+                        ).to(dtype=selected.dtype)
+                        noised = selected + noise * std
+                    else:
+                        noised = torch.zeros_like(selected)
+                    if not torch.isfinite(noised).all():
+                        raise RuntimeError(
+                            f"{mode} noise_control produced non-finite KV values for request "
+                            f"{req_id}, layer {layer_name}, chunk {chunk_index}"
+                        )
+                    for plane_offset, plane in enumerate(kv_planes):
+                        token_kv_cache[plane].index_copy_(
+                            0, chunk_slots, noised[plane_offset]
+                        )
+                logger.warning(
+                    "[NOISE] noised request %s chunk=%d range=[%d,%d) "
+                    "target=%s mode=%s std=%.6g prob=%.3f region=%s keep_recent=%d",
+                    req_id,
+                    chunk_index,
+                    chunk_start,
+                    chunk_end,
+                    target,
+                    mode,
+                    std,
+                    self.cache_config.noise_control_probability,
+                    self.cache_config.noise_control_region,
+                    self.cache_config.noise_control_keep_recent_tokens,
+                )
+                results.append(
+                    NoiseControlResult(
+                        request_id=req_id,
+                        chunk_index=chunk_index,
+                        chunk_start=chunk_start,
+                        chunk_end=chunk_end,
+                        target=target,
+                        std=std,
+                    )
+                )
+            req_state.noise_control_next_chunk_index = chunk_index + 1
+        return results
+
+    def _build_attention_matching_slot_mapping(
+        self,
+        req_state: CachedRequestState,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        block_size = self.cache_config.block_size
+        block_ids = req_state.block_ids[0]
+        block_ids_tensor = req_state.attention_matching_block_ids_tensor
+        if block_ids_tensor is None or block_ids_tensor.numel() != len(block_ids):
+            block_ids_tensor = torch.tensor(
+                block_ids,
+                device=self.device,
+                dtype=torch.long,
+            )
+            req_state.attention_matching_block_ids_tensor = block_ids_tensor
+        positions = self._attention_matching_positions[:num_tokens]
+        return block_ids_tensor[positions // block_size] * block_size + (
+            positions % block_size
+        )
+
+    def _get_attention_matching_query_indices(
+        self,
+        length: int,
+        max_queries: int,
+    ) -> torch.Tensor:
+        key = (length, max_queries)
+        cached = self._attention_matching_query_index_cache.get(key)
+        if cached is None:
+            cached = select_query_indices(length, max_queries, self.device)
+            self._attention_matching_query_index_cache[key] = cached
+        return cached
+
+    def _get_attention_matching_scratch(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        key = (name, shape, dtype)
+        cached = self._attention_matching_scratch.get(key)
+        if cached is None:
+            cached = torch.empty(shape, device=self.device, dtype=dtype)
+            self._attention_matching_scratch[key] = cached
+        return cached
+
+    def _get_attention_matching_random_queries(
+        self,
+        *,
+        layer_name: str,
+        num_queries: int,
+        num_kv_heads: int,
+        head_size: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Generate random AM probe queries without touching sampler RNG state."""
+        query_keys = self._get_attention_matching_scratch(
+            f"random_query_keys:{layer_name}",
+            (num_queries, num_kv_heads, head_size),
+            dtype,
+        )
+        query_keys.normal_(generator=self._attention_matching_random_generator)
+        return query_keys
+
+    def _snapshot_attention_matching_request(
+        self,
+        req_state: CachedRequestState,
+    ) -> None:
+        state = req_state.attention_matching_state
+        if (
+            not self._attention_matching_enabled
+            or state is None
+            or req_state.num_computed_tokens <= 0
+        ):
+            return
+
+        assert req_state.block_ids, "attention_matching snapshot requires block ids"
+        slot_mapping = self._build_attention_matching_slot_mapping(
+            req_state, req_state.num_computed_tokens
+        )
+        static_forward_context = self.compilation_config.static_forward_context
+
+        layer_keys: dict[str, torch.Tensor] = {}
+        layer_values: dict[str, torch.Tensor] = {}
+        layer_betas: dict[str, torch.Tensor] = {}
+
+        for layer_name in self._attention_matching_layer_names:
+            layer = static_forward_context[layer_name]
+            kv_cache = layer.kv_cache
+            token_kv_cache = kv_cache.view(
+                2,
+                -1,
+                layer.impl.num_kv_heads,
+                layer.impl.head_size,
+            )
+            keys = token_kv_cache[0].index_select(0, slot_mapping).to(
+                device="cpu",
+                non_blocking=False,
+            )
+            values = token_kv_cache[1].index_select(0, slot_mapping).to(
+                device="cpu",
+                non_blocking=False,
+            )
+            if is_pin_memory_available():
+                keys = keys.pin_memory()
+                values = values.pin_memory()
+            layer_keys[layer_name] = keys
+            layer_values[layer_name] = values
+
+            beta = state.layer_betas.get(layer_name)
+            if beta is not None:
+                beta_cpu = beta.detach().to(device="cpu", non_blocking=False)
+                if is_pin_memory_available():
+                    beta_cpu = beta_cpu.pin_memory()
+                layer_betas[layer_name] = beta_cpu
+
+        req_state.attention_matching_snapshot = AttentionMatchingSnapshot(
+            version=state.version,
+            target_len=req_state.num_computed_tokens,
+            synthetic_prefix_len=state.synthetic_prefix_len,
+            protected_prefix_len=state.protected_prefix_len,
+            position_offset=req_state.position_offset,
+            layer_keys=layer_keys,
+            layer_values=layer_values,
+            layer_betas=layer_betas,
+        )
+        logger.warning(
+            "[AM] snapshotted request %s target_len=%d version=%d offset=%d",
+            req_state.req_id,
+            req_state.num_computed_tokens,
+            state.version,
+            req_state.position_offset,
+        )
+        req_state.attention_matching_state = AttentionMatchingRequestState(
+            synthetic_prefix_len=state.synthetic_prefix_len,
+            protected_prefix_len=state.protected_prefix_len,
+            version=state.version,
+            layer_betas=layer_betas,
+        )
+
+    def _restore_attention_matching_snapshot_for_request(
+        self,
+        req_id: str,
+        req_state: CachedRequestState,
+        expected_version: int | None,
+    ) -> None:
+        snapshot = req_state.attention_matching_snapshot
+        assert snapshot is not None, (
+            "attention_matching restore requested without a worker-local snapshot "
+            f"for request {req_id}"
+        )
+        if expected_version is not None:
+            assert snapshot.version == expected_version, (
+                "attention_matching snapshot version mismatch for request "
+                f"{req_id}: worker={snapshot.version}, expected={expected_version}"
+            )
+
+        assert req_state.block_ids, "attention_matching restore requires block ids"
+        slot_mapping = self._build_attention_matching_slot_mapping(
+            req_state, snapshot.target_len
+        )
+        static_forward_context = self.compilation_config.static_forward_context
+
+        for layer_name in self._attention_matching_layer_names:
+            layer = static_forward_context[layer_name]
+            kv_cache = layer.kv_cache
+            token_kv_cache = kv_cache.view(
+                2,
+                -1,
+                layer.impl.num_kv_heads,
+                layer.impl.head_size,
+            )
+            keys = snapshot.layer_keys[layer_name].to(
+                device=self.device,
+                dtype=token_kv_cache.dtype,
+                non_blocking=False,
+            )
+            values = snapshot.layer_values[layer_name].to(
+                device=self.device,
+                dtype=token_kv_cache.dtype,
+                non_blocking=False,
+            )
+            token_kv_cache[0].index_copy_(0, slot_mapping, keys)
+            token_kv_cache[1].index_copy_(0, slot_mapping, values)
+
+        req_state.num_computed_tokens = snapshot.target_len
+        req_state.position_offset = snapshot.position_offset
+        req_state.attention_matching_state = AttentionMatchingRequestState(
+            synthetic_prefix_len=snapshot.synthetic_prefix_len,
+            protected_prefix_len=snapshot.protected_prefix_len,
+            version=snapshot.version,
+            layer_betas={
+                layer_name: beta.to(self.device, non_blocking=False)
+                for layer_name, beta in snapshot.layer_betas.items()
+            },
+        )
+        logger.warning(
+            "[AM] restored request %s target_len=%d version=%d offset=%d",
+            req_id,
+            snapshot.target_len,
+            snapshot.version,
+            snapshot.position_offset,
+        )
+
+    def _update_attention_matching_score_mods(self) -> None:
+        if not self._attention_matching_enabled or not self._attention_matching_layer_names:
+            return
+        num_reqs = self.input_batch.num_reqs
+        if num_reqs == 0:
+            return
+
+        req_ids = self.input_batch.req_ids
+        request_states = [self.requests[req_id].attention_matching_state for req_id in req_ids]
+        max_synthetic_len = max(
+            (state.synthetic_prefix_len for state in request_states if state is not None),
+            default=0,
+        )
+        static_forward_context = self.compilation_config.static_forward_context
+        if max_synthetic_len == 0:
+            for layer_name in self._attention_matching_layer_names:
+                static_forward_context[layer_name].score_mod = None
+            self._attention_matching_score_mod_signature = None
+            self._attention_matching_score_mod_prompt_lens = None
+            self._attention_matching_score_mod_beta_padded.clear()
+            return
+
+        query_counts = self.query_start_loc.gpu[1 : num_reqs + 1] - self.query_start_loc.gpu[:num_reqs]
+        query_doc_ids = torch.repeat_interleave(
+            torch.arange(num_reqs, device=self.device, dtype=torch.long),
+            query_counts,
+        )
+
+        state_signature = (
+            tuple(req_ids),
+            tuple(
+                (0, -1) if state is None else (state.synthetic_prefix_len, state.version)
+                for state in request_states
+            ),
+            tuple(
+                0 if state is None else state.protected_prefix_len
+                for state in request_states
+            ),
+            max_synthetic_len,
+        )
+        if state_signature != self._attention_matching_score_mod_signature:
+            protected_prefix_lens = torch.zeros(
+                num_reqs, device=self.device, dtype=torch.long
+            )
+            synthetic_prefix_lens = torch.zeros(
+                num_reqs, device=self.device, dtype=torch.long
+            )
+            for req_index, state in enumerate(request_states):
+                if state is not None:
+                    protected_prefix_lens[req_index] = state.protected_prefix_len
+                    synthetic_prefix_lens[req_index] = state.synthetic_prefix_len
+            self._attention_matching_score_mod_prompt_lens = (
+                protected_prefix_lens,
+                synthetic_prefix_lens,
+            )
+            self._attention_matching_score_mod_beta_padded.clear()
+            for layer_name in self._attention_matching_layer_names:
+                layer = static_forward_context[layer_name]
+                num_kv_heads = layer.impl.num_kv_heads
+                beta_padded = torch.zeros(
+                    (num_reqs, num_kv_heads, max_synthetic_len),
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                for req_index, state in enumerate(request_states):
+                    if state is None:
+                        continue
+                    beta = state.layer_betas.get(layer_name)
+                    if beta is None:
+                        continue
+                    beta_padded[req_index, :, : beta.shape[1]].copy_(
+                        beta.to(device=self.device, dtype=torch.float32)
+                    )
+                self._attention_matching_score_mod_beta_padded[layer_name] = beta_padded
+            self._attention_matching_score_mod_signature = state_signature
+
+        prompt_lens = self._attention_matching_score_mod_prompt_lens
+        assert prompt_lens is not None
+        protected_prefix_lens, synthetic_prefix_lens = prompt_lens
+
+        for layer_name in self._attention_matching_layer_names:
+            layer = static_forward_context[layer_name]
+            num_kv_heads = layer.impl.num_kv_heads
+            beta_padded = self._attention_matching_score_mod_beta_padded[layer_name]
+            assert beta_padded.shape == (num_reqs, num_kv_heads, max_synthetic_len)
+
+            score_mod = self._attention_matching_score_mod_objects.get(layer_name)
+            if score_mod is None:
+                score_mod = AttentionMatchingScoreMod(layer.impl.num_queries_per_kv)
+                self._attention_matching_score_mod_objects[layer_name] = score_mod
+            score_mod.update(
+                query_doc_ids=query_doc_ids,
+                protected_prefix_lens=protected_prefix_lens,
+                synthetic_prefix_lens=synthetic_prefix_lens,
+                beta_padded=beta_padded,
+                max_synthetic_len=max_synthetic_len,
+            )
+            if layer.score_mod is not score_mod:
+                layer.score_mod = score_mod
+
+    def _run_attention_matching_compaction_for_request(
+        self,
+        req_id: str,
+        req_state: CachedRequestState,
+    ) -> AttentionMatchingCompactionResult | None:
+        plan = build_attention_matching_plan(
+            num_computed_tokens=req_state.num_computed_tokens,
+            window_size=self.cache_config.compaction_window_size,
+            stride=self.cache_config.compaction_stride,
+            num_prompt_tokens=req_state.num_prompt_tokens,
+            protected_prefix_len=(
+                0
+                if self.cache_config.attention_matching_protect_user_prompts == "none"
+                else req_state.attention_matching_protected_prompt_len
+            ),
+        )
+        if plan is None:
+            return None
+
+        compaction_start = time.perf_counter()
+        logger.warning(
+            "[AM] starting compaction request %s source_len=%d target_len=%d "
+            "protected_prefix=%d compact_region=%d query_source=%s query_region=%d",
+            req_id,
+            plan.source_len,
+            plan.target_len,
+            plan.protected_prefix_len,
+            plan.compact_region_len,
+            self.cache_config.attention_matching_query_source,
+            plan.query_region_len,
+        )
+
+        assert req_state.block_ids, "attention_matching requires block ids"
+        slot_mapping = self._build_attention_matching_slot_mapping(
+            req_state, plan.source_len
+        )
+        protected_slots = slot_mapping[: plan.protected_prefix_len]
+        compact_region_start = plan.protected_prefix_len
+        compact_region_end = compact_region_start + plan.compact_region_len
+        compact_slots = slot_mapping[compact_region_start:compact_region_end]
+        exact_slots = slot_mapping[plan.exact_region_start : plan.source_len]
+        use_random_queries = (
+            self.cache_config.attention_matching_query_source == "random_queries"
+        )
+        if use_random_queries:
+            query_slots = slot_mapping[:0]
+        elif self.cache_config.attention_matching_query_source == "recent_cache_keys":
+            query_slots = slot_mapping[
+                plan.query_region_start : plan.query_region_start + plan.query_region_len
+            ]
+        else:
+            query_slots = compact_slots
+        target_slots = slot_mapping[: plan.target_len]
+        protected_target_slots = target_slots[: plan.protected_prefix_len]
+        synth_target_slots = target_slots[
+            plan.protected_prefix_len : plan.protected_prefix_len
+            + plan.synthetic_prefix_len
+        ]
+        exact_target_slots = target_slots[
+            plan.protected_prefix_len + plan.synthetic_prefix_len :
+        ]
+        query_source_len = 0
+        if not use_random_queries:
+            query_source_len = (
+                plan.query_region_len
+                if self.cache_config.attention_matching_query_source == "recent_cache_keys"
+                else plan.compact_region_len
+            )
+        query_indices = self._get_attention_matching_query_indices(
+            query_source_len,
+            self.cache_config.attention_matching_max_queries_per_kv_head,
+        )
+        effective_query_indices = query_indices
+        if effective_query_indices.numel() == 0 or (
+            query_source_len > 0
+            and effective_query_indices[-1] >= query_source_len
+        ):
+            effective_query_indices = self._get_attention_matching_query_indices(
+                query_source_len,
+                self.cache_config.attention_matching_max_queries_per_kv_head,
+            )
+        static_forward_context = self.compilation_config.static_forward_context
+        layer_betas: dict[str, torch.Tensor] = {}
+        emit_layer_diagnostics = logger.isEnabledFor(logging.DEBUG)
+        prev_attention_matching_state = req_state.attention_matching_state
+
+        for layer_name in self._attention_matching_layer_names:
+            layer = static_forward_context[layer_name]
+            kv_cache = layer.kv_cache
+            token_kv_cache = kv_cache.view(
+                2,
+                -1,
+                layer.impl.num_kv_heads,
+                layer.impl.head_size,
+            )
+            kv_dtype = token_kv_cache.dtype
+            kv_shape = (layer.impl.num_kv_heads, layer.impl.head_size)
+
+            compact_kv = self._get_attention_matching_scratch(
+                "compact_kv",
+                (2, compact_slots.numel(), *kv_shape),
+                kv_dtype,
+            )
+            protected_kv = self._get_attention_matching_scratch(
+                "protected_kv",
+                (2, protected_slots.numel(), *kv_shape),
+                kv_dtype,
+            )
+            exact_kv = self._get_attention_matching_scratch(
+                "exact_kv",
+                (2, exact_slots.numel(), *kv_shape),
+                kv_dtype,
+            )
+            query_source_kv = None
+            if not use_random_queries:
+                query_source_kv = self._get_attention_matching_scratch(
+                    "query_source_kv",
+                    (2, query_slots.numel(), *kv_shape),
+                    kv_dtype,
+                )
+
+            torch.index_select(token_kv_cache, 1, protected_slots, out=protected_kv)
+            torch.index_select(token_kv_cache, 1, compact_slots, out=compact_kv)
+            torch.index_select(token_kv_cache, 1, exact_slots, out=exact_kv)
+            if query_source_kv is not None:
+                torch.index_select(token_kv_cache, 1, query_slots, out=query_source_kv)
+            compact_keys = compact_kv[0]
+            compact_values = compact_kv[1]
+            exact_keys = exact_kv[0]
+            exact_values = exact_kv[1]
+            if use_random_queries:
+                query_keys = self._get_attention_matching_random_queries(
+                    layer_name=layer_name,
+                    num_queries=(
+                        self.cache_config.attention_matching_max_queries_per_kv_head
+                    ),
+                    num_kv_heads=layer.impl.num_kv_heads,
+                    head_size=layer.impl.head_size,
+                    dtype=compact_keys.dtype,
+                )
+            else:
+                assert query_source_kv is not None
+                query_source_keys = query_source_kv[0]
+                if query_source_keys.shape[0] == 0:
+                    query_source_keys = compact_keys
+                query_keys = query_source_keys.index_select(0, effective_query_indices)
+            if not torch.isfinite(compact_keys).all():
+                raise RuntimeError(
+                    "attention_matching found non-finite compact keys for "
+                    f"request {req_id} layer {layer_name}"
+                )
+            if not torch.isfinite(query_keys).all():
+                raise RuntimeError(
+                    "attention_matching found non-finite query keys for "
+                    f"request {req_id} layer {layer_name}"
+                )
+
+            synthetic_keys = self._get_attention_matching_scratch(
+                "synthetic_keys",
+                (plan.synthetic_prefix_len, layer.impl.num_kv_heads, layer.impl.head_size),
+                compact_keys.dtype,
+            )
+            synthetic_values = self._get_attention_matching_scratch(
+                "synthetic_values",
+                tuple(synthetic_keys.shape),
+                synthetic_keys.dtype,
+            )
+            beta = torch.empty(
+                (layer.impl.num_kv_heads, plan.synthetic_prefix_len),
+                device=self.device,
+                dtype=compact_keys.dtype,
+            )
+            batched_synth_keys, batched_beta, batched_synth_values, _ = (
+                self._attention_matching_omp.compute_compacted_cache_batched(
+                    compact_keys.transpose(0, 1),
+                    compact_values.transpose(0, 1),
+                    query_keys.transpose(0, 1),
+                    plan.synthetic_prefix_len,
+                )
+            )
+            synthetic_keys.copy_(batched_synth_keys.transpose(0, 1))
+            synthetic_values.copy_(batched_synth_values.transpose(0, 1))
+            beta.copy_(batched_beta)
+
+            if not torch.isfinite(synthetic_keys).all():
+                raise RuntimeError(
+                    "attention_matching produced non-finite synthetic keys for "
+                    f"request {req_id} layer {layer_name}"
+                )
+            if not torch.isfinite(synthetic_values).all():
+                raise RuntimeError(
+                    "attention_matching produced non-finite synthetic values for "
+                    f"request {req_id} layer {layer_name}"
+                )
+            if not torch.isfinite(beta).all():
+                raise RuntimeError(
+                    "attention_matching produced non-finite beta for "
+                    f"request {req_id} layer {layer_name}"
+                )
+
+            token_kv_cache[0].index_copy_(0, synth_target_slots, synthetic_keys)
+            token_kv_cache[1].index_copy_(0, synth_target_slots, synthetic_values)
+            if exact_target_slots.numel() > 0:
+                token_kv_cache[0].index_copy_(0, exact_target_slots, exact_keys)
+                token_kv_cache[1].index_copy_(0, exact_target_slots, exact_values)
+            layer_betas[layer_name] = beta
+            if protected_target_slots.numel() > 0:
+                token_kv_cache.index_copy_(1, protected_target_slots, protected_kv)
+            if emit_layer_diagnostics:
+                logger.debug(
+                    "[AM] request %s layer %s absmax compact_k=%.3e compact_v=%.3e "
+                    "query_k=%.3e synth_k=%.3e synth_v=%.3e beta=%.3e",
+                    req_id,
+                    layer_name,
+                    compact_keys.abs().amax().item(),
+                    compact_values.abs().amax().item(),
+                    query_keys.abs().amax().item(),
+                    synthetic_keys.abs().amax().item(),
+                    synthetic_values.abs().amax().item(),
+                    beta.abs().amax().item(),
+                )
+
+        req_state.attention_matching_state = AttentionMatchingRequestState(
+            synthetic_prefix_len=plan.synthetic_prefix_len,
+            protected_prefix_len=plan.protected_prefix_len,
+            version=(
+                1
+                if prev_attention_matching_state is None
+                else prev_attention_matching_state.version + 1
+            ),
+            layer_betas=layer_betas,
+        )
+        req_state.attention_matching_snapshot = None
+        logger.warning(
+            "[AM] finished compaction request %s target_len=%d elapsed=%.3fs",
+            req_id,
+            plan.target_len,
+            time.perf_counter() - compaction_start,
+        )
+        return AttentionMatchingCompactionResult(
+            request_id=req_id,
+            protected_prefix_len=plan.protected_prefix_len,
+            synthetic_prefix_len=plan.synthetic_prefix_len,
+            exact_kept_tokens=plan.exact_kept_tokens,
+            position_offset_delta=plan.offset_delta,
+        )
+
+    def _maybe_run_attention_matching_compaction(
+        self,
+    ) -> dict[str, AttentionMatchingCompactionResult]:
+        if not self._attention_matching_enabled:
+            return {}
+        compactions: dict[str, AttentionMatchingCompactionResult] = {}
+        for req_id in self.input_batch.req_ids:
+            req_state = self.requests[req_id]
+            result = self._run_attention_matching_compaction_for_request(req_id, req_state)
+            if result is not None:
+                compactions[req_id] = result
+        return compactions
+
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
         """Initialize attributes from torch.cuda.get_device_properties"""
@@ -1065,6 +2111,13 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        preempted_req_ids = scheduler_output.preempted_req_ids or set()
+        for req_id in preempted_req_ids:
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            self._snapshot_attention_matching_request(req_state)
+
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -1164,6 +2217,11 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                attention_matching_protected_prompt_len=(
+                    new_req_data.attention_matching_protected_prompt_len
+                ),
+                shuffle_control_next_chunk_index=0,
+                noise_control_next_chunk_index=0,
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -1216,6 +2274,9 @@ class GPUModelRunner(
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
+            restore_attention_matching = (
+                req_id in req_data.attention_matching_restore_req_ids
+            )
             num_output_tokens = req_data.num_output_tokens[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
 
@@ -1266,19 +2327,19 @@ class GPUModelRunner(
             # and num_computed_tokens in InputBatch from the trimmed data.
             if req_id in req_data.rebuild_req_ids:
                 req_state.num_computed_tokens = num_computed_tokens
-                req_state.block_ids = new_block_ids
+                req_state.replace_block_ids(new_block_ids)
                 req_state.position_offset = req_data.position_offsets.get(
                     req_id, 0
                 )
-                # Update prompt length if prompt tokens were evicted
-                # (turn-based eviction with protected prefix).
-                if req_id in req_data.prompt_lengths:
-                    req_state.num_prompt_tokens = (
-                        req_data.prompt_lengths[req_id]
-                    )
                 if req_id in req_data.all_token_ids:
                     all_tids = req_data.all_token_ids[req_id]
-                    prompt_len = req_state.num_prompt_tokens
+                    prompt_len = req_data.prompt_lengths.get(
+                        req_id, req_state.num_prompt_tokens
+                    )
+                    if req_id in req_data.prompt_lengths:
+                        req_state.prompt_token_ids = list(all_tids[:prompt_len])
+                        req_state.prompt_embeds = None
+                        req_state.num_prompt_tokens = prompt_len
                     req_state.output_token_ids = list(all_tids[prompt_len:])
                 if req_index is not None:
                     self.input_batch.remove_request(req_id)
@@ -1324,15 +2385,22 @@ class GPUModelRunner(
             # Update the block IDs.
             if not resumed_from_preemption:
                 if new_block_ids is not None:
-                    # Append the new blocks to the existing block IDs.
-                    for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
-                        block_ids.extend(new_ids)
+                    req_state.append_block_ids(new_block_ids)
             else:
                 assert req_index is None
                 assert new_block_ids is not None
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
-                req_state.block_ids = new_block_ids
+                req_state.replace_block_ids(new_block_ids)
+                if restore_attention_matching:
+                    req_state.position_offset = req_data.position_offsets.get(
+                        req_id, req_state.position_offset
+                    )
+                    self._restore_attention_matching_snapshot_for_request(
+                        req_id,
+                        req_state,
+                        req_data.attention_matching_snapshot_versions.get(req_id),
+                    )
 
             if req_index is None:
                 # The request is not in the persistent batch.
@@ -1514,7 +2582,7 @@ class GPUModelRunner(
         req_state.sampling_params = new_req_data.sampling_params
         req_state.pooling_params = new_req_data.pooling_params
         self.late_interaction_runner.register_request(req_id, req_state.pooling_params)
-        req_state.block_ids = new_req_data.block_ids
+        req_state.replace_block_ids(new_req_data.block_ids)
         req_state.num_computed_tokens = new_req_data.num_computed_tokens
         req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             req_state.prompt_token_ids, req_state.prompt_embeds
@@ -3401,6 +4469,9 @@ class GPUModelRunner(
         LogprobsLists | None,
         list[list[int]],
         dict[str, LogprobsTensors | None],
+        dict[str, AttentionMatchingCompactionResult],
+        dict[str, list[ShuffleControlResult]],
+        dict[str, list[NoiseControlResult]],
         list[str],
         dict[str, int],
         list[int],
@@ -3499,6 +4570,19 @@ class GPUModelRunner(
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
 
+        shuffle_control_results: dict[str, list[ShuffleControlResult]] = {}
+        noise_control_results: dict[str, list[NoiseControlResult]] = {}
+        for req_id in self.input_batch.req_ids:
+            req_state = self.requests[req_id]
+            events = self._maybe_run_shuffle_control_for_request(req_id, req_state)
+            if events:
+                shuffle_control_results[req_id] = events
+            events = self._maybe_run_noise_control_for_request(req_id, req_state)
+            if events:
+                noise_control_results[req_id] = events
+
+        attention_matching_compactions = self._maybe_run_attention_matching_compaction()
+
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
             hidden_states[:num_scheduled_tokens],
@@ -3510,6 +4594,9 @@ class GPUModelRunner(
             logprobs_lists,
             valid_sampled_token_ids,
             prompt_logprobs_dict,
+            attention_matching_compactions,
+            shuffle_control_results,
+            noise_control_results,
             req_ids_output_copy,
             req_id_to_index_output_copy,
             invalid_req_indices,
@@ -4023,6 +5110,7 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
+            self._update_attention_matching_score_mods()
 
             (
                 input_ids,
@@ -4318,6 +5406,9 @@ class GPUModelRunner(
                 logprobs_lists,
                 valid_sampled_token_ids,
                 prompt_logprobs_dict,
+                attention_matching_compactions,
+                shuffle_control_results,
+                noise_control_results,
                 req_ids_output_copy,
                 req_id_to_index_output_copy,
                 invalid_req_indices,
@@ -4368,6 +5459,9 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                attention_matching_compactions=attention_matching_compactions,
+                shuffle_control_results=shuffle_control_results,
+                noise_control_results=noise_control_results,
             )
 
         if not self.use_async_scheduling:
@@ -6821,6 +7915,7 @@ class GPUModelRunner(
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)
+        self._validate_attention_matching_support()
         # The kernel block size for all KV cache groups. For example, if
         # kv_cache_manager uses block_size 256 for a given group, but the attention
         # backends for that group only supports block_size 64, we will return

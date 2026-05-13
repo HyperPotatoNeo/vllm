@@ -118,6 +118,7 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         compaction_window_size: int = 0,
         compaction_stride: int = 0,
+        compaction_strategy: str = "fifo",
     ) -> None:
         self.max_model_len = max_model_len
 
@@ -142,6 +143,7 @@ class KVCacheManager:
             metrics_collector=self.metrics_collector,
             compaction_window_size=compaction_window_size,
             compaction_stride=compaction_stride,
+            compaction_strategy=compaction_strategy,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool

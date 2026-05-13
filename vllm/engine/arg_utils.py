@@ -629,13 +629,36 @@ class EngineArgs:
     # KV cache compaction
     compaction_window_size: int = CacheConfig.compaction_window_size
     compaction_stride: int = CacheConfig.compaction_stride
-    compaction_protected_prefix_tokens: int = CacheConfig.compaction_protected_prefix_tokens
-    compaction_max_turns: int = CacheConfig.compaction_max_turns
-    compaction_eviction_turn_stride: int = CacheConfig.compaction_eviction_turn_stride
-    compaction_turn_end_token_id: int | None = CacheConfig.compaction_turn_end_token_id
-    compaction_assume_aligned_turn_boundaries: bool = (
-        CacheConfig.compaction_assume_aligned_turn_boundaries
+    compaction_strategy: str = CacheConfig.compaction_strategy
+    attention_matching_max_queries_per_kv_head: int = (
+        CacheConfig.attention_matching_max_queries_per_kv_head
     )
+    attention_matching_query_source: str = (
+        CacheConfig.attention_matching_query_source
+    )
+    attention_matching_protect_user_prompts: str = (
+        CacheConfig.attention_matching_protect_user_prompts
+    )
+    shuffle_control_chunk_size: int = CacheConfig.shuffle_control_chunk_size
+    shuffle_control_probability: float = CacheConfig.shuffle_control_probability
+    shuffle_control_seed: int = CacheConfig.shuffle_control_seed
+    shuffle_control_region: str = CacheConfig.shuffle_control_region
+    shuffle_control_keep_recent_tokens: int = (
+        CacheConfig.shuffle_control_keep_recent_tokens
+    )
+    shuffle_control_protect_synthetic: bool = (
+        CacheConfig.shuffle_control_protect_synthetic
+    )
+    shuffle_control_kv_only: bool = CacheConfig.shuffle_control_kv_only
+    noise_control_chunk_size: int = CacheConfig.noise_control_chunk_size
+    noise_control_probability: float = CacheConfig.noise_control_probability
+    noise_control_std: float = CacheConfig.noise_control_std
+    noise_control_seed: int = CacheConfig.noise_control_seed
+    noise_control_target: str = CacheConfig.noise_control_target
+    noise_control_mode: str = CacheConfig.noise_control_mode
+    noise_control_region: str = CacheConfig.noise_control_region
+    noise_control_keep_recent_tokens: int = CacheConfig.noise_control_keep_recent_tokens
+    noise_control_protect_synthetic: bool = CacheConfig.noise_control_protect_synthetic
     tokens_only: bool = False
 
     shutdown_timeout: int = 0
@@ -1048,24 +1071,83 @@ class EngineArgs:
             "--compaction-stride", **cache_kwargs["compaction_stride"]
         )
         cache_group.add_argument(
-            "--compaction-protected-prefix-tokens",
-            **cache_kwargs["compaction_protected_prefix_tokens"],
+            "--compaction-strategy", **cache_kwargs["compaction_strategy"]
         )
         cache_group.add_argument(
-            "--compaction-max-turns",
-            **cache_kwargs["compaction_max_turns"],
+            "--attention-matching-max-queries-per-kv-head",
+            **cache_kwargs["attention_matching_max_queries_per_kv_head"],
         )
         cache_group.add_argument(
-            "--compaction-eviction-turn-stride",
-            **cache_kwargs["compaction_eviction_turn_stride"],
+            "--attention-matching-query-source",
+            **cache_kwargs["attention_matching_query_source"],
         )
         cache_group.add_argument(
-            "--compaction-turn-end-token-id",
-            **cache_kwargs["compaction_turn_end_token_id"],
+            "--attention-matching-protect-user-prompts",
+            **cache_kwargs["attention_matching_protect_user_prompts"],
         )
         cache_group.add_argument(
-            "--compaction-assume-aligned-turn-boundaries",
-            **cache_kwargs["compaction_assume_aligned_turn_boundaries"],
+            "--shuffle-control-chunk-size",
+            **cache_kwargs["shuffle_control_chunk_size"],
+        )
+        cache_group.add_argument(
+            "--shuffle-control-probability",
+            **cache_kwargs["shuffle_control_probability"],
+        )
+        cache_group.add_argument(
+            "--shuffle-control-seed",
+            **cache_kwargs["shuffle_control_seed"],
+        )
+        cache_group.add_argument(
+            "--shuffle-control-region",
+            **cache_kwargs["shuffle_control_region"],
+        )
+        cache_group.add_argument(
+            "--shuffle-control-keep-recent-tokens",
+            **cache_kwargs["shuffle_control_keep_recent_tokens"],
+        )
+        cache_group.add_argument(
+            "--shuffle-control-protect-synthetic",
+            **cache_kwargs["shuffle_control_protect_synthetic"],
+        )
+        cache_group.add_argument(
+            "--shuffle-control-kv-only",
+            **cache_kwargs["shuffle_control_kv_only"],
+        )
+        cache_group.add_argument(
+            "--noise-control-chunk-size",
+            **cache_kwargs["noise_control_chunk_size"],
+        )
+        cache_group.add_argument(
+            "--noise-control-probability",
+            **cache_kwargs["noise_control_probability"],
+        )
+        cache_group.add_argument(
+            "--noise-control-std",
+            **cache_kwargs["noise_control_std"],
+        )
+        cache_group.add_argument(
+            "--noise-control-seed",
+            **cache_kwargs["noise_control_seed"],
+        )
+        cache_group.add_argument(
+            "--noise-control-target",
+            **cache_kwargs["noise_control_target"],
+        )
+        cache_group.add_argument(
+            "--noise-control-mode",
+            **cache_kwargs["noise_control_mode"],
+        )
+        cache_group.add_argument(
+            "--noise-control-region",
+            **cache_kwargs["noise_control_region"],
+        )
+        cache_group.add_argument(
+            "--noise-control-keep-recent-tokens",
+            **cache_kwargs["noise_control_keep_recent_tokens"],
+        )
+        cache_group.add_argument(
+            "--noise-control-protect-synthetic",
+            **cache_kwargs["noise_control_protect_synthetic"],
         )
 
         # Model weight offload related configs
@@ -1631,13 +1713,30 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
             compaction_window_size=self.compaction_window_size,
             compaction_stride=self.compaction_stride,
-            compaction_protected_prefix_tokens=self.compaction_protected_prefix_tokens,
-            compaction_max_turns=self.compaction_max_turns,
-            compaction_eviction_turn_stride=self.compaction_eviction_turn_stride,
-            compaction_turn_end_token_id=self.compaction_turn_end_token_id,
-            compaction_assume_aligned_turn_boundaries=(
-                self.compaction_assume_aligned_turn_boundaries
+            compaction_strategy=self.compaction_strategy,
+            attention_matching_max_queries_per_kv_head=(
+                self.attention_matching_max_queries_per_kv_head
             ),
+            attention_matching_query_source=self.attention_matching_query_source,
+            attention_matching_protect_user_prompts=(
+                self.attention_matching_protect_user_prompts
+            ),
+            shuffle_control_chunk_size=self.shuffle_control_chunk_size,
+            shuffle_control_probability=self.shuffle_control_probability,
+            shuffle_control_seed=self.shuffle_control_seed,
+            shuffle_control_region=self.shuffle_control_region,
+            shuffle_control_keep_recent_tokens=self.shuffle_control_keep_recent_tokens,
+            shuffle_control_protect_synthetic=self.shuffle_control_protect_synthetic,
+            shuffle_control_kv_only=self.shuffle_control_kv_only,
+            noise_control_chunk_size=self.noise_control_chunk_size,
+            noise_control_probability=self.noise_control_probability,
+            noise_control_std=self.noise_control_std,
+            noise_control_seed=self.noise_control_seed,
+            noise_control_target=self.noise_control_target,
+            noise_control_mode=self.noise_control_mode,
+            noise_control_region=self.noise_control_region,
+            noise_control_keep_recent_tokens=self.noise_control_keep_recent_tokens,
+            noise_control_protect_synthetic=self.noise_control_protect_synthetic,
         )
 
         # Compaction incompatibility guards.
@@ -1651,25 +1750,14 @@ class EngineArgs:
             assert self.compaction_stride > 0, (
                 "compaction_stride must be > 0 when compaction_window_size is set"
             )
+            if self.compaction_strategy == "attention_matching":
+                assert self.compaction_window_size >= 2 * self.compaction_stride, (
+                    "attention_matching requires compaction_window_size >= "
+                    f"2 * compaction_stride, got window={self.compaction_window_size} "
+                    f"and stride={self.compaction_stride}"
+                )
             assert self.compaction_window_size > self.compaction_stride, (
                 "compaction_window_size must exceed compaction_stride"
-            )
-            assert self.compaction_protected_prefix_tokens >= -1, (
-                "compaction_protected_prefix_tokens must be >= -1 "
-                "(-1 = auto-detect from system message)"
-            )
-        # Turn-mode guards (require window-size set as a safety fallback).
-        if self.compaction_max_turns > 0:
-            assert self.compaction_window_size > 0, (
-                "compaction_max_turns requires compaction_window_size > 0 "
-                "as a safety fallback"
-            )
-            assert self.compaction_eviction_turn_stride >= 1, (
-                "compaction_eviction_turn_stride must be >= 1"
-            )
-            assert self.compaction_protected_prefix_tokens in (0, -1), (
-                "compaction_max_turns implies system-prompt protection; "
-                "set compaction_protected_prefix_tokens to 0 or -1"
             )
 
         ray_runtime_env = None

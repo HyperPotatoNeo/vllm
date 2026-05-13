@@ -119,6 +119,11 @@ class Request:
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             prompt_token_ids, prompt_embeds
         )
+        # Logical prompt length used for stop accounting. This should track
+        # user-visible prompt growth (for example streaming session updates),
+        # but must not shrink when KV compaction rewrites the physical prompt.
+        self.logical_prompt_len = self.num_prompt_tokens
+        self.attention_matching_protected_prompt_len = self.num_prompt_tokens
         self._output_token_ids: list[int] = []
         self._all_token_ids: list[int] = (
             self.prompt_token_ids.copy()
@@ -144,22 +149,22 @@ class Request:
         self.num_total_generated: int = 0
         # History of compaction events (included in API response metadata).
         self.compaction_events: list = []
+        # History of shuffle-control events (robustness-control metadata).
+        self.shuffle_events: list = []
+        # History of Gaussian KV-noise events (robustness-control metadata).
+        self.noise_events: list = []
+        # Next fully completed post-prefix chunk whose Bernoulli trial has not
+        # yet been evaluated by the shuffle-control path.
+        self.shuffle_control_next_chunk_index: int = 0
+        self.noise_control_next_chunk_index: int = 0
         # Flag: request was compacted and needs model runner rebuild.
         self.needs_rebuild: bool = False
-
-        # Turn tracking (only populated when compaction_max_turns > 0).
-        # Absolute positions (in the CURRENT post-eviction _all_token_ids)
-        # of the first token AFTER each <|im_end|> seen so far. Monotonic.
-        # turn_end_positions[0] is the end of the system prompt;
-        # turn_end_positions[2*k] (for k >= 1) is the end of turn k.
-        self.turn_end_positions: list[int] = []
-        # Cursor: tokens in _all_token_ids[:last_turn_scan_pos] have already
-        # been scanned for <|im_end|>. Lazy, extended on demand by the
-        # scheduler. Reset/adjusted on eviction so positions stay valid.
-        self.last_turn_scan_pos: int = 0
-        # Count of whole turns (user+assistant pairs) physically evicted by
-        # prior compactions on this request. Monotonic.
-        self.num_turns_evicted: int = 0
+        # Attention-matching resume metadata. The scheduler only tracks logical
+        # lifecycle state; the worker owns the actual snapshot tensors.
+        self.attention_matching_active: bool = False
+        self.attention_matching_snapshot_version: int | None = None
+        self.attention_matching_restore_pending: bool = False
+        self.attention_matching_target_len: int | None = None
 
         # Multi-modal related
         self.mm_features = mm_features or []

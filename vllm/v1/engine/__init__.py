@@ -14,6 +14,7 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.compaction.shuffle_control import NoiseEvent, ShuffleEvent
 from vllm.v1.core.compaction.types import CompactionEvent
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
@@ -172,6 +173,10 @@ class EngineCoreOutput(
     # overwrite semantics are safe. None when compaction is disabled or when
     # the request has had no compaction events yet.
     compaction_events: list[CompactionEvent] | None = None
+    # Online shuffle-control robustness events that have fired for this request
+    # so far. Same overwrite semantics as compaction_events.
+    shuffle_events: list[ShuffleEvent] | None = None
+    noise_events: list[NoiseEvent] | None = None
 
     @property
     def finished(self) -> bool:

@@ -122,6 +122,8 @@ class RequestOutput:
         *,
         kv_transfer_params: dict[str, Any] | None = None,
         compaction_events: list[Any] | None = None,
+        shuffle_events: list[Any] | None = None,
+        noise_events: list[Any] | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -148,6 +150,8 @@ class RequestOutput:
         # the msgspec struct and creating a dependency cycle; callers cast to
         # list[CompactionEvent] when needed.
         self.compaction_events = compaction_events
+        self.shuffle_events = shuffle_events
+        self.noise_events = noise_events
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
@@ -161,6 +165,10 @@ class RequestOutput:
         # delta that doesn't include them).
         if next_output.compaction_events is not None:
             self.compaction_events = next_output.compaction_events
+        if next_output.shuffle_events is not None:
+            self.shuffle_events = next_output.shuffle_events
+        if next_output.noise_events is not None:
+            self.noise_events = next_output.noise_events
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):

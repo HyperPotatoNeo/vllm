@@ -6,3 +6,4 @@
 # struct definitions. Import from submodules directly:
 #     from vllm.v1.core.compaction.types import CompactionEvent
 #     from vllm.v1.core.compaction.manager import CompactingKVCacheManager
+#     from vllm.v1.core.compaction.am_manager import AttentionMatchingKVCacheManager

@@ -212,6 +212,34 @@ class ECConnectorOutput:
     finished_recving: set[str] | None = None
 
 
+@dataclass
+class AttentionMatchingCompactionResult:
+    request_id: str
+    protected_prefix_len: int
+    synthetic_prefix_len: int
+    exact_kept_tokens: int
+    position_offset_delta: int
+
+
+@dataclass
+class ShuffleControlResult:
+    request_id: str
+    chunk_index: int
+    chunk_start: int
+    chunk_end: int
+    kv_only: bool = False
+
+
+@dataclass
+class NoiseControlResult:
+    request_id: str
+    chunk_index: int
+    chunk_start: int
+    chunk_end: int
+    target: str
+    std: float
+
+
 # ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use list instead.
 @dataclass
@@ -252,6 +280,18 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # req_id -> worker-side AM compaction metadata
+    attention_matching_compactions: dict[str, AttentionMatchingCompactionResult] = (
+        field(default_factory=dict)
+    )
+    # req_id -> worker-side shuffle-control events emitted this step.
+    shuffle_control_results: dict[str, list[ShuffleControlResult]] = field(
+        default_factory=dict
+    )
+    noise_control_results: dict[str, list[NoiseControlResult]] = field(
+        default_factory=dict
+    )
 
 
 # ModelRunnerOutput wrapper for async scheduling.

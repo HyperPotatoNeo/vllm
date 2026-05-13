@@ -956,6 +956,13 @@ class FlexAttentionImpl(AttentionImpl):
             attn_metadata.mask_mod = attn_metadata.get_mask_mod()
             needs_rebuild_block_mask = True
 
+        layer_score_mod = getattr(layer, "score_mod", None)
+        if attn_metadata.score_mod is not layer_score_mod:
+            attn_metadata.score_mod = layer_score_mod
+            attn_metadata.transformed_score_mod = (
+                attn_metadata.get_transformed_score_mod()
+            )
+
         layer_hint = getattr(layer, "block_sparsity_hint", None)
         if (
             layer_hint is not None

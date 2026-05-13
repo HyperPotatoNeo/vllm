@@ -22,6 +22,10 @@ from vllm.v1.sample.logits_processor import (
     MoveDirectionality,
 )
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.core.compaction.am_runtime import (
+    AttentionMatchingRequestState,
+    AttentionMatchingSnapshot,
+)
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 
@@ -55,6 +59,12 @@ class CachedRequestState:
 
     # KV cache compaction: cumulative evicted tokens for RoPE correction.
     position_offset: int = 0
+    attention_matching_protected_prompt_len: int = 0
+    shuffle_control_next_chunk_index: int = 0
+    noise_control_next_chunk_index: int = 0
+    attention_matching_state: AttentionMatchingRequestState | None = None
+    attention_matching_snapshot: AttentionMatchingSnapshot | None = None
+    attention_matching_block_ids_tensor: torch.Tensor | None = None
 
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
@@ -79,6 +89,15 @@ class CachedRequestState:
         if idx - self.num_prompt_tokens < len(self.output_token_ids):
             return self.output_token_ids[idx - self.num_prompt_tokens]
         return -1
+
+    def replace_block_ids(self, block_ids: tuple[list[int], ...]) -> None:
+        self.block_ids = block_ids
+        self.attention_matching_block_ids_tensor = None
+
+    def append_block_ids(self, new_block_ids: tuple[list[int], ...]) -> None:
+        for block_ids, new_ids in zip(self.block_ids, new_block_ids):
+            block_ids.extend(new_ids)
+        self.attention_matching_block_ids_tensor = None
 
 
 class InputBatch:

@@ -106,37 +106,20 @@ class CompactingKVCacheManager(FullAttentionManager):
         return num_computed_tokens >= required_full_length
 
     def compact_request(
-        self,
-        request_id: str,
-        prompt_tokens: int,
-        explicit_block_range: tuple[int, int] | None = None,
+        self, request_id: str, prompt_tokens: int
     ) -> int:
         """Evict oldest post-prompt blocks. Returns tokens evicted.
 
         Steps:
-        1. Determine which block indices to evict (FIFO, custom, or explicit
-           block range for turn-mode eviction)
+        1. Determine which block indices to evict (FIFO or custom)
         2. Free those blocks back to pool
         3. Splice req_to_blocks (delete entries)
         4. Return tokens evicted
-
-        explicit_block_range overrides both stride_blocks and prompt_tokens
-        when set: evicts blocks[start:end] verbatim. Used by turn-mode
-        compaction in the scheduler, which computes its own block-aligned
-        range from completed-turn boundaries. prompt_tokens is still passed
-        for symmetry but ignored in this path.
         """
         blocks = self.req_to_blocks[request_id]
         prompt_blocks = (prompt_tokens + self.block_size - 1) // self.block_size
 
-        if explicit_block_range is not None:
-            start, end = explicit_block_range
-            assert 0 <= start <= end <= len(blocks), (
-                f"explicit_block_range=({start},{end}) out of bounds for "
-                f"req={request_id[:8]} (len={len(blocks)})"
-            )
-            evict_indices = list(range(start, end))
-        elif self.eviction_fn is not None:
+        if self.eviction_fn is not None:
             evict_indices = self.eviction_fn(
                 len(blocks), prompt_blocks, self.stride_blocks
             )

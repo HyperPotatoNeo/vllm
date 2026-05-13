@@ -104,8 +104,22 @@ class CompactionEventPayload(OpenAIBaseModel):
     num_output_tokens_at_compaction: int
     tokens_evicted: int
     position_offset_after: int
-    num_prompt_tokens: int = 0
-    evict_start: int = 0
+
+
+class ShuffleEventPayload(OpenAIBaseModel):
+    num_output_tokens_at_shuffle: int
+    chunk_index: int
+    chunk_start: int
+    chunk_end: int
+
+
+class NoiseEventPayload(OpenAIBaseModel):
+    num_output_tokens_at_noise: int
+    chunk_index: int
+    chunk_start: int
+    chunk_end: int
+    target: str
+    std: float
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -131,6 +145,14 @@ class ChatCompletionResponse(OpenAIBaseModel):
     compaction_events: list[CompactionEventPayload] | None = Field(
         default=None,
         description="KV cache compaction events (vLLM compaction extension).",
+    )
+    shuffle_events: list[ShuffleEventPayload] | None = Field(
+        default=None,
+        description="Shuffle-control robustness events (vLLM extension).",
+    )
+    noise_events: list[NoiseEventPayload] | None = Field(
+        default=None,
+        description="Gaussian KV-noise robustness events (vLLM extension).",
     )
 
 
@@ -375,24 +397,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "token patterns, stopping only when they hit the maximum output length "
         "(e.g. 'abcdabcdabcd...' or '\\emoji \\emoji \\emoji ...'). This feature "
         "can detect such behavior and terminate early, saving time and tokens.",
-    )
-
-    # vLLM extension — kv-eviction block-aligned message padding. When set,
-    # the server SKIPS apply_chat_template and feeds these token ids directly
-    # to the engine. `messages` is still consulted for tool-call / reasoning
-    # metadata (conversation object) but is not re-rendered. Intended for
-    # clients that need byte-exact control over the prompt token stream
-    # (e.g. block-aligned padding for turn-based KV compaction, so that
-    # `<|im_end|>` lands on a block_size boundary and turn eviction is
-    # exact rather than inward-snapped).
-    prompt_token_ids: list[int] | None = Field(
-        default=None,
-        description=(
-            "If set, the server bypasses chat template rendering and uses "
-            "these token ids as the prompt verbatim. `messages` is still "
-            "read for tool-call parser metadata. vLLM extension for clients "
-            "requiring byte-exact prompt control."
-        ),
     )
 
     # --8<-- [end:chat-completion-extra-params]

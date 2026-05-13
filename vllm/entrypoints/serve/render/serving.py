@@ -183,29 +183,6 @@ class OpenAIServingRender:
         Called directly by render_chat_request and delegated to by
         OpenAIServingChat.render_chat_request after its engine-aware checks.
         """
-        # vLLM extension — kv-eviction block-aligned message padding.
-        # Fast path: caller supplied pre-tokenized prompt. Skip chat template
-        # application entirely. `messages` is still surfaced as the
-        # ConversationMessage list so downstream tool-call parsing /
-        # reasoning handlers keep their metadata; only the prompt-token
-        # stream is overridden.
-        if request.prompt_token_ids is not None:
-            if not request.prompt_token_ids:
-                return self.create_error_response(
-                    "prompt_token_ids is set but empty"
-                )
-            # OpenAI ChatCompletionMessageParam is structurally a superset of
-            # ConversationMessage for the fields downstream consumers read
-            # (role, content, tool_calls, name). Cast through list().
-            conversation: list[ConversationMessage] = list(
-                request.messages  # type: ignore[arg-type]
-            )
-            engine_input = tokens_input(
-                list(request.prompt_token_ids),
-                cache_salt=request.cache_salt,
-            )
-            return conversation, [engine_input]
-
         tokenizer = self.renderer.tokenizer
 
         tool_parser = self.tool_parser

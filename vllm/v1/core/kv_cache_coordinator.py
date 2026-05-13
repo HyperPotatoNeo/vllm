@@ -5,6 +5,8 @@ from collections.abc import Sequence
 from math import lcm
 
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.compaction.am_manager import AttentionMatchingKVCacheManager
+from vllm.v1.core.compaction.manager import CompactingKVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -12,7 +14,6 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
     KVCacheBlock,
 )
-from vllm.v1.core.compaction.manager import CompactingKVCacheManager
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
     SingleTypeKVCacheManager,
@@ -44,6 +45,7 @@ class KVCacheCoordinator(ABC):
         metrics_collector: KVCacheMetricsCollector | None = None,
         compaction_window_size: int = 0,
         compaction_stride: int = 0,
+        compaction_strategy: str = "fifo",
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
@@ -67,7 +69,10 @@ class KVCacheCoordinator(ABC):
                 compaction_window_size > 0
                 and isinstance(spec, FullAttentionSpec)
             ):
-                mgr = CompactingKVCacheManager(
+                manager_cls = CompactingKVCacheManager
+                if compaction_strategy == "attention_matching":
+                    manager_cls = AttentionMatchingKVCacheManager
+                mgr = manager_cls(
                     kv_cache_spec=spec,
                     block_pool=self.block_pool,
                     enable_caching=enable_caching,
@@ -294,6 +299,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         metrics_collector: KVCacheMetricsCollector | None = None,
         compaction_window_size: int = 0,
         compaction_stride: int = 0,
+        compaction_strategy: str = "fifo",
     ):
         super().__init__(
             kv_cache_config,
@@ -307,6 +313,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             metrics_collector=metrics_collector,
             compaction_window_size=compaction_window_size,
             compaction_stride=compaction_stride,
+            compaction_strategy=compaction_strategy,
         )
         self.num_single_type_manager = len(self.single_type_managers)
 
@@ -344,6 +351,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         metrics_collector: KVCacheMetricsCollector | None = None,
         compaction_window_size: int = 0,
         compaction_stride: int = 0,
+        compaction_strategy: str = "fifo",
     ):
         super().__init__(
             kv_cache_config,
@@ -357,6 +365,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             metrics_collector=metrics_collector,
             compaction_window_size=compaction_window_size,
             compaction_stride=compaction_stride,
+            compaction_strategy=compaction_strategy,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
@@ -413,6 +422,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         metrics_collector: KVCacheMetricsCollector | None = None,
         compaction_window_size: int = 0,
         compaction_stride: int = 0,
+        compaction_strategy: str = "fifo",
     ):
         super().__init__(
             kv_cache_config,
@@ -426,6 +436,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             metrics_collector=metrics_collector,
             compaction_window_size=compaction_window_size,
             compaction_stride=compaction_stride,
+            compaction_strategy=compaction_strategy,
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -589,10 +600,12 @@ def get_kv_cache_coordinator(
     metrics_collector: KVCacheMetricsCollector | None = None,
     compaction_window_size: int = 0,
     compaction_stride: int = 0,
+    compaction_strategy: str = "fifo",
 ) -> KVCacheCoordinator:
     compaction_kwargs = dict(
         compaction_window_size=compaction_window_size,
         compaction_stride=compaction_stride,
+        compaction_strategy=compaction_strategy,
     )
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(

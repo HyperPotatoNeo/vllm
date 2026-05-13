@@ -35,6 +35,8 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionStreamResponse,
     ChatMessage,
     CompactionEventPayload,
+    NoiseEventPayload,
+    ShuffleEventPayload,
 )
 from vllm.entrypoints.openai.chat_completion.stream_harmony import (
     TokenState,
@@ -1618,10 +1620,34 @@ class OpenAIServingChat(OpenAIServing):
                     num_output_tokens_at_compaction=e.num_output_tokens_at_compaction,
                     tokens_evicted=e.tokens_evicted,
                     position_offset_after=e.position_offset_after,
-                    num_prompt_tokens=e.num_prompt_tokens,
-                    evict_start=e.evict_start,
                 )
                 for e in compaction_events
+            ]
+        shuffle_events_payload = None
+        shuffle_events = getattr(final_res, "shuffle_events", None)
+        if shuffle_events:
+            shuffle_events_payload = [
+                ShuffleEventPayload(
+                    num_output_tokens_at_shuffle=e.num_output_tokens_at_shuffle,
+                    chunk_index=e.chunk_index,
+                    chunk_start=e.chunk_start,
+                    chunk_end=e.chunk_end,
+                )
+                for e in shuffle_events
+            ]
+        noise_events_payload = None
+        noise_events = getattr(final_res, "noise_events", None)
+        if noise_events:
+            noise_events_payload = [
+                NoiseEventPayload(
+                    num_output_tokens_at_noise=e.num_output_tokens_at_noise,
+                    chunk_index=e.chunk_index,
+                    chunk_start=e.chunk_start,
+                    chunk_end=e.chunk_end,
+                    target=e.target,
+                    std=e.std,
+                )
+                for e in noise_events
             ]
 
         response = ChatCompletionResponse(
@@ -1636,6 +1662,8 @@ class OpenAIServingChat(OpenAIServing):
             ),
             kv_transfer_params=final_res.kv_transfer_params,
             compaction_events=compaction_events_payload,
+            shuffle_events=shuffle_events_payload,
+            noise_events=noise_events_payload,
         )
 
         # Log complete response if output logging is enabled

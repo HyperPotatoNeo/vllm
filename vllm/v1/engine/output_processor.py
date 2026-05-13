@@ -27,6 +27,7 @@ from vllm.tracing import (
     instrument_manual,
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.v1.core.compaction.shuffle_control import NoiseEvent, ShuffleEvent
 from vllm.v1.core.compaction.types import CompactionEvent
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
@@ -180,6 +181,8 @@ class RequestState:
         # The scheduler sends the full cumulative list on each EngineCoreOutput,
         # so we use overwrite-on-update semantics (see process_outputs).
         self.compaction_events: list[CompactionEvent] | None = None
+        self.shuffle_events: list[ShuffleEvent] | None = None
+        self.noise_events: list[NoiseEvent] | None = None
 
         # Stream Interval
         self.stream_interval = stream_interval
@@ -281,6 +284,8 @@ class RequestState:
         kv_transfer_params: dict[str, Any] | None = None,
         routed_experts: np.ndarray | None = None,
         compaction_events: list[CompactionEvent] | None = None,
+        shuffle_events: list[ShuffleEvent] | None = None,
+        noise_events: list[NoiseEvent] | None = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
@@ -335,7 +340,7 @@ class RequestState:
 
         return self._new_request_output(
             external_req_id, outputs, finished, kv_transfer_params,
-            compaction_events,
+            compaction_events, shuffle_events, noise_events,
         )
 
     def _new_request_output(
@@ -345,6 +350,8 @@ class RequestState:
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
         compaction_events: list[CompactionEvent] | None = None,
+        shuffle_events: list[ShuffleEvent] | None = None,
+        noise_events: list[NoiseEvent] | None = None,
     ) -> RequestOutput | PoolingRequestOutput:
         # If prompt embeds were used, put placeholder prompt token ids
         prompt_token_ids = self.prompt_token_ids
@@ -381,6 +388,8 @@ class RequestState:
             num_cached_tokens=self.num_cached_tokens,
             metrics=self.stats,
             compaction_events=compaction_events,
+            shuffle_events=shuffle_events,
+            noise_events=noise_events,
         )
 
     def _new_completion_output(
@@ -636,6 +645,10 @@ class OutputProcessor:
             # is unset for a request that had events in a prior step).
             if engine_core_output.compaction_events is not None:
                 req_state.compaction_events = engine_core_output.compaction_events
+            if engine_core_output.shuffle_events is not None:
+                req_state.shuffle_events = engine_core_output.shuffle_events
+            if engine_core_output.noise_events is not None:
+                req_state.noise_events = engine_core_output.noise_events
 
             if pooling_output is None:
                 assert req_state.detokenizer is not None
@@ -661,6 +674,8 @@ class OutputProcessor:
                 kv_transfer_params,
                 routed_experts,
                 req_state.compaction_events,
+                req_state.shuffle_events,
+                req_state.noise_events,
             ):
                 if req_state.streaming_input:
                     request_output.finished = False

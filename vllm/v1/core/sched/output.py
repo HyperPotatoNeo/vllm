@@ -38,6 +38,7 @@ class NewRequestData:
     num_computed_tokens: int
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
+    attention_matching_protected_prompt_len: int = 0
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
@@ -59,6 +60,9 @@ class NewRequestData:
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
+            attention_matching_protected_prompt_len=(
+                request.attention_matching_protected_prompt_len
+            ),
             prefill_token_ids=prefill_token_ids,
         )
 
@@ -127,9 +131,14 @@ class CachedRequestData:
     rebuild_req_ids: set[str] = field(default_factory=set)
     # Position offsets for compacted requests (req_id -> cumulative offset).
     position_offsets: dict[str, int] = field(default_factory=dict)
-    # Updated prompt lengths for compacted requests whose prompt tokens
-    # were evicted (turn-based eviction with protected prefix).
+    # AM rebuilds can change the logical prompt length.
     prompt_lengths: dict[str, int] = field(default_factory=dict)
+    # Resumed AM requests that should restore worker-local snapshots instead of
+    # replaying the logical prompt.
+    attention_matching_restore_req_ids: set[str] = field(default_factory=set)
+    attention_matching_snapshot_versions: dict[str, int] = field(
+        default_factory=dict
+    )
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
