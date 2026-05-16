@@ -160,6 +160,16 @@ class Request:
         # Count of whole turns (user+assistant pairs) physically evicted by
         # prior compactions on this request. Monotonic.
         self.num_turns_evicted: int = 0
+        # Streaming-session marker: num_computed_tokens at the moment of the
+        # most recent _update_request_as_session call, i.e. the partition
+        # between "pre-existing cached prompt" (positions [0, boundary)) and
+        # "newly-appended content this call" (positions [boundary, num_prompt)).
+        # Mid-call admission eviction fires at this boundary BEFORE the new
+        # content is prefilled, so the new content's K vectors are computed
+        # under the post-eviction state. See plans/connect_admission_events_
+        # to_trainer.md "Operative intent" section. Debug/event metadata only;
+        # the kernel uses num_computed_tokens + block_table directly.
+        self.session_prefill_boundary: int = 0
 
         # Multi-modal related
         self.mm_features = mm_features or []

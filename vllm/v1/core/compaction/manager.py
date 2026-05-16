@@ -151,6 +151,22 @@ class CompactingKVCacheManager(FullAttentionManager):
 
         # Free evicted blocks to pool
         evicted_blocks = [blocks[i] for i in evict_indices]
+        # Prefix-caching invariant: a block sitting in the free queue must
+        # have `block_hash is None` and no entry in
+        # `cached_block_hash_to_block`. `free_blocks` only decrements
+        # ref_cnt and appends to the free queue — it does NOT clear the
+        # prefix-cache state. So when compaction frees an admission-
+        # evicted block whose ref_cnt drops to 0, the block re-enters the
+        # free queue WITH its (now stale) hash entry still registered.
+        # The next request that pops this block from the free queue and
+        # tries to cache it via `cache_full_blocks` hits
+        # `assert blk.block_hash is None` at block_pool.py:263.
+        # `_maybe_evict_cached_block` does the right thing: reset_hash +
+        # pop from `cached_block_hash_to_block` (no-op when block_hash is
+        # already None, e.g. when prefix caching is disabled).
+        if getattr(self.block_pool, "enable_caching", False):
+            for blk in evicted_blocks:
+                self.block_pool._maybe_evict_cached_block(blk)
         self.block_pool.free_blocks(evicted_blocks)
 
         # Splice: contiguous range (FIFO) uses fast slice deletion

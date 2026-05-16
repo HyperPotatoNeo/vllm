@@ -1620,6 +1620,11 @@ class OpenAIServingChat(OpenAIServing):
                     position_offset_after=e.position_offset_after,
                     num_prompt_tokens=e.num_prompt_tokens,
                     evict_start=e.evict_start,
+                    kept_indices=list(e.kept_indices),
+                    kept_token_ids=list(e.kept_token_ids),
+                    new_user_fragment_len=int(
+                        getattr(e, "new_user_fragment_len", 0) or 0
+                    ),
                 )
                 for e in compaction_events
             ]

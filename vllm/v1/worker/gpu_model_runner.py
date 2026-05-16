@@ -683,6 +683,11 @@ class GPUModelRunner(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
         # KV cache compaction: pre-allocated GPU buffer for position offsets.
+        # Required for RoPE absolute positions after mid-gen or admission
+        # eviction (position = physical + offset). The admission path now
+        # runs entirely inside `Scheduler.schedule()` — the worker is
+        # compaction-ignorant beyond reading position_offsets through
+        # the standard CachedRequestData rebuild flow.
         self.position_offsets_gpu = torch.zeros(
             self.max_num_reqs, dtype=torch.int64, device=self.device
         )
@@ -1164,6 +1169,16 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                # KV cache compaction: pick up the scheduler-side
+                # position_offset that in-step admission eviction set
+                # before this SchedulerOutput was built. Without this,
+                # the worker's input_batch row would default to 0 and
+                # the prefill kernel would rotate Q in the local
+                # post-trim frame while cached K vectors (from prior
+                # requests' prefix-cache hits) remain rotated at their
+                # original absolute frame, producing a relative-position
+                # skew at the prefill/decode boundary.
+                position_offset=new_req_data.position_offset,
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -2049,6 +2064,56 @@ class GPUModelRunner(
             physical_positions
             + self.position_offsets_gpu[req_indices_gpu]
         )
+
+        # [POS-TRACE] dump per-token positions so we can verify RoPE
+        # positions are monotonically increasing across the request
+        # lifetime (especially across decode steps after admission
+        # compaction). Gated on env var KV_EVICTION_POS_TRACE=1 to
+        # avoid spamming the log.
+        import os as _os
+        if _os.environ.get("KV_EVICTION_POS_TRACE", "0") == "1":
+            try:
+                _physical_cpu = physical_positions.detach().cpu().tolist()
+                _offsets_cpu = (
+                    self.position_offsets_gpu[req_indices_gpu]
+                    .detach().cpu().tolist()
+                )
+                _logical_cpu = self.positions[
+                    :total_num_scheduled_tokens
+                ].detach().cpu().tolist()
+                _req_idx_cpu = req_indices_gpu.detach().cpu().tolist()
+                _num_computed = self.num_computed_tokens[
+                    :num_reqs
+                ].detach().cpu().tolist()
+                _num_offset_per_req = (
+                    self.position_offsets_gpu[:num_reqs]
+                    .detach().cpu().tolist()
+                )
+                logger.info(
+                    "[POS-TRACE] step: num_reqs=%d total_tokens=%d "
+                    "per_req: num_computed=%s position_offsets=%s",
+                    num_reqs, total_num_scheduled_tokens,
+                    _num_computed, _num_offset_per_req,
+                )
+                logger.info(
+                    "[POS-TRACE] per-token (req_idx, physical, offset, logical):"
+                )
+                for _i in range(min(total_num_scheduled_tokens, 32)):
+                    logger.info(
+                        "[POS-TRACE]   t%d: req=%d phys=%d offset=%d logical=%d",
+                        _i,
+                        _req_idx_cpu[_i],
+                        _physical_cpu[_i],
+                        _offsets_cpu[_i],
+                        _logical_cpu[_i],
+                    )
+                if total_num_scheduled_tokens > 32:
+                    logger.info(
+                        "[POS-TRACE]   ... %d more tokens truncated",
+                        total_num_scheduled_tokens - 32,
+                    )
+            except Exception as _e:
+                logger.warning("[POS-TRACE] dump failed: %s", _e)
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -3854,7 +3919,12 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
-            # Update persistent batch states.
+            # Update persistent batch states. Admission-eviction patches
+            # (block_table splice, position_offset bump, prompt trim)
+            # have already been applied inside `Scheduler.schedule()`,
+            # so the CachedRequestData below carries the post-eviction
+            # state. No worker-side compaction dispatch is needed —
+            # `execute_model` runs a single normal forward.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:

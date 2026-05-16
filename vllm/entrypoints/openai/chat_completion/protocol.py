@@ -106,6 +106,19 @@ class CompactionEventPayload(OpenAIBaseModel):
     position_offset_after: int
     num_prompt_tokens: int = 0
     evict_start: int = 0
+    # Indices (pre-event coords) of tokens that physically survive this
+    # eviction. Length = pre-event token count - tokens_evicted. The
+    # orchestrator uses kept_token_ids (below) to assemble the next
+    # turn's prompt as [sys, kept, u_new] for prefix-cache hits; the
+    # trainer uses kept_indices to splice its KV without re-deriving
+    # the eviction range from scalar fields.
+    kept_indices: list[int] = Field(default_factory=list)
+    kept_token_ids: list[int] = Field(default_factory=list)
+    # Length of the new_user_fragment in this admission event — the
+    # tail of the prompt that lies AFTER the last completed turn.
+    # Used by the trainer's segmented_forward mirror to split each
+    # admission boundary into pre- and post-fragment segments.
+    new_user_fragment_len: int = 0
 
 
 class ChatCompletionResponse(OpenAIBaseModel):

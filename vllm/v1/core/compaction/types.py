@@ -69,3 +69,32 @@ class CompactionEvent(
     # Turn mode: cumulative number of turns physically evicted on the
     # request after this event. Defaults to 0 in block-FIFO mode.
     num_turns_evicted_after: int = 0
+
+    # Indices (in pre-event/CURRENT coordinates at the moment this event
+    # fires) of tokens that physically survive this eviction. Sorted
+    # ascending; length = (pre-event token count) - tokens_evicted.
+    # This is vLLM's canonical "what's left in KV after this event" view,
+    # in the same coordinate frame the consumer is in at event time
+    # (post-prior-events, pre-this-event). Empty by default for wire
+    # compat with downstream code that hasn't been updated yet, but
+    # populated unconditionally by the scheduler.
+    kept_indices: list[int] = msgspec.field(default_factory=list)
+
+    # Token IDs at the kept_indices positions, in order. Same length as
+    # kept_indices. Lets the orchestrator assemble the next turn's
+    # prompt as [sys, kept_token_ids, u_new] to hit vLLM's rebuilt
+    # prefix cache, and lets the trainer splice its KV by token rather
+    # than re-deriving the eviction range from scalar fields.
+    kept_token_ids: list[int] = msgspec.field(default_factory=list)
+
+    # Length of the new_user_fragment in this admission event — the
+    # tail of the prompt that lies AFTER the last completed turn
+    # (typically the in-progress turn's user message + assistant
+    # template). vLLM's single-forward pre-eviction path no longer
+    # uses this value internally (kept turns and new_user_fragment
+    # both attend over post-eviction K/V), but it is still emitted so
+    # the trainer can split each admission boundary into pre- and
+    # post-fragment segments when its segmented_forward mirror needs
+    # the boundary. Default 0 for wire compat (omit_defaults) and for
+    # mid-gen events that don't expose a fragment boundary.
+    new_user_fragment_len: int = 0

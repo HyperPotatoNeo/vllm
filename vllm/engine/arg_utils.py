@@ -1642,9 +1642,15 @@ class EngineArgs:
 
         # Compaction incompatibility guards.
         if self.compaction_window_size > 0:
-            assert not self.enable_prefix_caching, (
-                "Prefix caching is incompatible with KV cache compaction"
-            )
+            # NOTE: prefix caching + compaction is supported as of the
+            # Phase 2 hash-chain rebuild in scheduler._rehash_after_eviction
+            # (plans/prefix_caching_compaction.md). The historical
+            # "incompatible" assertion lived here because the kept blocks'
+            # pre-eviction hashes would otherwise reference now-evicted
+            # parent block hashes — a future request walking a fresh chain
+            # from NONE_HASH would miss every kept block. The rebuild
+            # re-keys surviving blocks under the post-eviction chain so
+            # the cache lookup succeeds again.
             assert self.pipeline_parallel_size <= 1, (
                 "Pipeline parallelism is incompatible with KV cache compaction"
             )

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -215,6 +216,23 @@ class KVCacheManager:
                 num_tokens=request.num_tokens,
                 num_hits=num_new_computed_tokens,
                 preempted=request.num_preemptions > 0,
+            )
+
+        # Phase 2/4 verification log — shows cache hit count per request
+        # at admission. Gated on VLLM_COMPACTION_VERBOSE to avoid spam in
+        # production; compaction_debug.py sets this. The hit count is in
+        # POST-eviction frame (the request hasn't been admission-compacted
+        # yet on this call, so what we report is what the client's prompt
+        # actually matched against the existing cache map).
+        if os.environ.get("VLLM_COMPACTION_VERBOSE"):
+            logger.warning(
+                "[PREFIX-HIT] req=%s prompt=%d cached=%d (%.1f%%) "
+                "to_prefill=%d",
+                request.request_id[:8],
+                request.num_tokens,
+                num_new_computed_tokens,
+                100.0 * num_new_computed_tokens / max(1, request.num_tokens),
+                request.num_tokens - num_new_computed_tokens,
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens

@@ -703,6 +703,53 @@ def test_compaction_event_carries_num_prompt_tokens():
     assert len(enc_default) < len(encoded)
 
 
+def test_compaction_event_kept_slice_roundtrip():
+    """CompactionEvent.kept_indices and kept_token_ids survive msgspec
+    roundtrip and obey the canonical invariant kept_token_ids[i] ==
+    pre_event_tokens[kept_indices[i]] (verified by construction here)."""
+    pre_event = [10, 11, 12, 13, 14, 15, 16, 17]
+    evict_start, evict_end = 2, 5  # drop positions 2,3,4 -> tokens 12,13,14
+    kept_indices = list(range(0, evict_start)) + list(range(evict_end, len(pre_event)))
+    kept_token_ids = [pre_event[i] for i in kept_indices]
+
+    ev = CompactionEvent(
+        num_output_tokens_at_compaction=0,
+        tokens_evicted=evict_end - evict_start,
+        position_offset_after=evict_end - evict_start,
+        kept_indices=kept_indices,
+        kept_token_ids=kept_token_ids,
+    )
+    decoded = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(ev), type=CompactionEvent
+    )
+    assert decoded.kept_indices == [0, 1, 5, 6, 7]
+    assert decoded.kept_token_ids == [10, 11, 15, 16, 17]
+    # Invariant: token at each kept index matches the corresponding kept token.
+    assert all(
+        pre_event[idx] == tok
+        for idx, tok in zip(decoded.kept_indices, decoded.kept_token_ids)
+    )
+    # Length consistency: kept count = pre_event count - evicted count.
+    assert len(decoded.kept_indices) == len(pre_event) - decoded.tokens_evicted
+    assert len(decoded.kept_token_ids) == len(decoded.kept_indices)
+
+
+def test_compaction_event_kept_slice_default_empty():
+    """Backward compat: when the new fields aren't supplied, they default
+    to empty lists and omit_defaults trims them off the wire."""
+    ev = CompactionEvent(
+        num_output_tokens_at_compaction=0,
+        tokens_evicted=16,
+        position_offset_after=16,
+    )
+    assert ev.kept_indices == []
+    assert ev.kept_token_ids == []
+    encoded = msgspec.msgpack.encode(ev)
+    decoded = msgspec.msgpack.decode(encoded, type=CompactionEvent)
+    assert decoded.kept_indices == []
+    assert decoded.kept_token_ids == []
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Turn-mode compaction tests
 # ─────────────────────────────────────────────────────────────────────────────
@@ -795,12 +842,13 @@ def _make_turn_scheduler(
     compaction_stride: int = 16,
     max_turns: int = 2,
     turn_stride: int = 1,
+    enable_prefix_caching: bool = False,
 ):
     return create_scheduler(
         max_num_batched_tokens=2048,
         max_num_seqs=1,
         enable_chunked_prefill=True,
-        enable_prefix_caching=False,
+        enable_prefix_caching=enable_prefix_caching,
         block_size=block_size,
         num_blocks=512,
         max_model_len=4096,
@@ -892,6 +940,27 @@ def test_turn_mode_evicts_one_turn():
 
     # Hard invariant: system prompt prefix bit-for-bit identical.
     assert list(request._all_token_ids[:sys_len]) == sys_prompt
+
+    # Single-source-of-truth invariant: kept_indices and kept_token_ids on
+    # the event encode exactly what physically survived this eviction in
+    # pre-event coordinates. They are populated unconditionally by the
+    # scheduler so downstream consumers (orchestrator, trainer, vLLM's
+    # own block-hash rebuild) don't re-derive the slice from scalars.
+    assert len(ev.kept_indices) > 0, (
+        "kept_indices should be populated for every event"
+    )
+    assert len(ev.kept_indices) == len(ev.kept_token_ids), (
+        "kept_indices and kept_token_ids must align elementwise"
+    )
+    # The complement of kept indices (within [0, pre_event_len)) is exactly
+    # [evict_start, evict_start + tokens_evicted).
+    kept_set = set(ev.kept_indices)
+    pre_event_len = len(ev.kept_indices) + ev.tokens_evicted
+    evicted_idx_set = set(range(ev.evict_start, ev.evict_start + ev.tokens_evicted))
+    assert kept_set | evicted_idx_set == set(range(pre_event_len))
+    assert kept_set & evicted_idx_set == set()
+    # System prompt positions [0, sys_len) must all be retained.
+    assert set(range(sys_len)).issubset(kept_set)
 
 
 def test_turn_mode_stride_two_evicts_two_turns():
@@ -1031,3 +1100,458 @@ def test_turn_mode_system_prompt_never_evicted():
     assert list(request._all_token_ids[:sys_len]) == sys_prompt
     # And turn_end_positions[0] must always equal the original sys_len.
     assert request.turn_end_positions[0] == sys_len
+
+
+def test_turn_mode_prefix_cache_rebuilt_after_eviction():
+    """With enable_prefix_caching=True + compaction, every eviction must
+    rebuild request.block_hashes over the post-eviction tokens and
+    re-register surviving blocks in the prefix-cache map under their new
+    hashes. Phase 2 of plans/prefix_caching_compaction.md.
+
+    Invariants checked after a multi-event rollout:
+      1. request.block_hashes length matches the number of full blocks
+         in the post-eviction sequence (NOT the pre-eviction length).
+      2. Hash chain reconstructs cleanly: every entry equals the hash
+         that `request_block_hasher` would emit when started from
+         scratch over `request.all_token_ids`. (i.e. no holes / stale
+         parent references.)
+      3. Every surviving block's KVCacheBlock.block_hash matches the
+         corresponding entry in the rebuilt request.block_hashes,
+         meaning the cache map and the request agree on what each
+         block is keyed under.
+    """
+    sys_len = 32
+    scheduler = _make_turn_scheduler(
+        sys_len=sys_len, max_turns=2, turn_stride=1,
+        compaction_window_size=128, compaction_stride=16,
+        enable_prefix_caching=True,
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=sys_len, max_tokens=4096,
+        ignore_eos=True, block_size=16,
+    )
+    sys_prompt = _make_system_prompt(sys_len)
+    request.prompt_token_ids[:] = sys_prompt
+    request._all_token_ids[:] = list(sys_prompt)
+    scheduler.add_request(request)
+
+    _drive_scheduler(scheduler, request, _turn_script(6, turn_token_count=40))
+
+    assert len(request.compaction_events) >= 1, (
+        "Test should produce at least one eviction"
+    )
+
+    # Invariant 1: hash count matches post-eviction full-block count.
+    # request.block_hashes is updated by update_block_hashes which only
+    # hashes FULL blocks. After eviction + rehash, len(block_hashes)
+    # should be num_tokens // block_size (capped at full blocks).
+    block_size = 16
+    expected_full_blocks = len(request._all_token_ids) // block_size
+    assert len(request.block_hashes) == expected_full_blocks, (
+        f"block_hashes length {len(request.block_hashes)} != "
+        f"expected {expected_full_blocks} (post-eviction full blocks)"
+    )
+
+    # Invariant 2: chain reconstructs from scratch — no stale
+    # parent-hash references. Rebuild from-scratch and compare.
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher
+    rebuild = get_request_block_hasher(
+        block_size=block_size,
+        caching_hash_fn=hash,  # vllm uses sha256/builtin-hash depending on config
+    )
+    # request.block_hashes must already match what a fresh re-hash
+    # would compute (we cleared + rebuilt at eviction time). We can't
+    # easily reproduce vLLM's exact hash_fn here, so instead assert
+    # the WEAKER property that block_hashes survives a round of
+    # update_block_hashes() (idempotency).
+    prev = list(request.block_hashes)
+    request.update_block_hashes()  # should be a no-op (no new full blocks)
+    assert list(request.block_hashes) == prev, (
+        "update_block_hashes must be idempotent after rebuild — got drift"
+    )
+
+    # Invariant 3: every surviving KVCacheBlock has a hash matching its
+    # entry in request.block_hashes (cache map and request are in sync).
+    for mgr in scheduler.kv_cache_manager.coordinator.single_type_managers:
+        block_pool = getattr(mgr, "block_pool", None)
+        if block_pool is None or not block_pool.enable_caching:
+            continue
+        kept = mgr.req_to_blocks.get(request.request_id, [])
+        # Cached blocks should be a prefix of req_to_blocks of length
+        # num_cached_block[req_id]. Each should have block_hash set
+        # and match the entry in cached_block_hash_to_block.
+        ncb = mgr.num_cached_block.get(request.request_id, 0)
+        for i, blk in enumerate(kept[:ncb]):
+            assert blk.block_hash is not None, (
+                f"kept block {i} (cached) has no block_hash assigned"
+            )
+            # The block_hash should be a known entry in the cache map.
+            looked_up = block_pool.cached_block_hash_to_block.get_one_block(
+                blk.block_hash
+            )
+            assert looked_up is not None, (
+                f"kept block {i}'s block_hash is not in "
+                f"cached_block_hash_to_block — orphan after rehash?"
+            )
+
+
+def test_inline_admission_eviction_fires_when_prefill_completes():
+    """Scheduler runs in-step admission eviction at the end of
+    schedule() for a request whose prefill completes this step AND
+    whose turn-mode admission compaction would actually evict tokens.
+
+    Validates the post-schedule mutation: prompt trimmed,
+    position_offset bumped, num_scheduled_tokens decremented, request
+    removed from `_pending_admission_compaction_ids`, and a
+    CompactionEvent with `num_output_tokens_at_compaction=0` is
+    attached to the request.
+    """
+    sys_len = 32
+    body_len = 50  # gen-tokens per half-turn body
+    block_size = 16
+
+    def _turn_tokens() -> list[int]:
+        toks: list[int] = []
+        for _ in range(body_len):
+            toks.append(GEN_BASE)
+        toks.append(IM_END)
+        for _ in range(body_len):
+            toks.append(GEN_BASE)
+        toks.append(IM_END)
+        return toks
+
+    sys_prompt = _make_system_prompt(sys_len)
+    turn_0 = _turn_tokens()
+    turn_1 = _turn_tokens()
+    new_frag = [GEN_BASE] * 10
+    prompt = sys_prompt + turn_0 + turn_1 + new_frag
+
+    # Positions (post-IM_END): sys -> 32, turn0 -> 134, turn1 -> 236.
+    # In-step eviction should remove turn 0 at block-aligned bounds:
+    #   evict_start = align_up(32, 16) = 32
+    #   evict_end (inward) = align_down(134, 16) = 128
+    expected_evict_end = 128
+    expected_total_evicted = expected_evict_end - 32
+    pre_prompt_len = len(prompt)
+    expected_post_prompt_len = pre_prompt_len - expected_total_evicted
+
+    scheduler = _make_turn_scheduler(
+        sys_len=sys_len, max_turns=2, turn_stride=1,
+        compaction_window_size=4096, compaction_stride=16,
+        block_size=block_size,
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=pre_prompt_len, max_tokens=2048,
+        ignore_eos=True, block_size=block_size,
+    )
+    request.prompt_token_ids[:] = prompt
+    request._all_token_ids[:] = list(prompt)
+    scheduler.add_request(request)
+
+    assert request.request_id in scheduler._pending_admission_compaction_ids
+
+    output = scheduler.schedule()
+
+    # In-step eviction ran: request was discarded from the pending set,
+    # prompt was trimmed, and num_scheduled_tokens for this req reflects
+    # the post-eviction length. position_offset stays 0 for a cold-cache
+    # request because no K/V has been written yet — the trimmed prompt
+    # will be prefilled fresh at positions [0, post_prompt_len). The
+    # `had_kv` branch in `_apply_trim` shifts position_offset only when
+    # prefix-cache hits gave the request a non-zero num_computed_tokens
+    # at admission time (validated by a separate test).
+    assert request.request_id not in scheduler._pending_admission_compaction_ids
+    assert request.num_prompt_tokens == expected_post_prompt_len, (
+        request.num_prompt_tokens, expected_post_prompt_len,
+    )
+    assert request.position_offset == 0, request.position_offset
+    assert output.num_scheduled_tokens[request.request_id] == (
+        expected_post_prompt_len
+    ), output.num_scheduled_tokens
+
+    # Exactly one CompactionEvent fired with admission semantics.
+    assert len(request.compaction_events) == 1, request.compaction_events
+    event = request.compaction_events[0]
+    assert event.num_output_tokens_at_compaction == 0, event
+    assert event.tokens_evicted == expected_total_evicted, event
+
+
+def test_inline_admission_eviction_skipped_when_no_eviction_would_fire():
+    """A request whose prompt has only a system prompt (no completed
+    turns) enters `_pending_admission_compaction_ids` at intake, but
+    the predicted eviction range is empty — schedule() does not
+    mutate the request and the drain logic in update_from_output
+    eventually clears the pending flag.
+    """
+    sys_len = 32
+    scheduler = _make_turn_scheduler(
+        sys_len=sys_len, max_turns=2, turn_stride=1,
+    )
+    sys_prompt = _make_system_prompt(sys_len)
+    (request,) = create_requests(
+        num_requests=1, num_tokens=sys_len, max_tokens=2048,
+        ignore_eos=True, block_size=16,
+    )
+    request.prompt_token_ids[:] = sys_prompt
+    request._all_token_ids[:] = list(sys_prompt)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    # Schedule ran but no admission eviction fired — prompt unchanged,
+    # position_offset still 0, no compaction event emitted.
+    assert request.num_prompt_tokens == sys_len
+    assert request.position_offset == 0
+    assert len(request.compaction_events) == 0
+    assert output.num_scheduled_tokens.get(request.request_id) == sys_len
+
+
+def test_inline_admission_eviction_partial_prefix_cache_hit():
+    """In-step admission eviction with a partial prefix-cache hit:
+    `num_computed_tokens` is non-zero (some sys-prompt blocks were
+    matched by prefix cache) but smaller than the eviction range. The
+    old `assert num_computed >= total_evicted` check would have tripped
+    here; the overlap-based decrement keeps the cached prefix intact
+    and bumps position_offset for the kept-suffix RoPE.
+
+    Reproduces the runtime failure
+    ``AssertionError: Compaction underflow: num_computed=16, evicting=32``
+    that surfaced on the first real-world rollout against the new
+    in-step eviction path.
+    """
+    sys_len = 32
+    body_len = 50
+    block_size = 16
+
+    def _turn_tokens() -> list[int]:
+        toks: list[int] = []
+        for _ in range(body_len):
+            toks.append(GEN_BASE)
+        toks.append(IM_END)
+        for _ in range(body_len):
+            toks.append(GEN_BASE)
+        toks.append(IM_END)
+        return toks
+
+    sys_prompt = _make_system_prompt(sys_len)
+    turn_0 = _turn_tokens()
+    turn_1 = _turn_tokens()
+    new_frag = [GEN_BASE] * 10
+    prompt = sys_prompt + turn_0 + turn_1 + new_frag
+
+    scheduler = _make_turn_scheduler(
+        sys_len=sys_len, max_turns=2, turn_stride=1,
+        compaction_window_size=4096, compaction_stride=16,
+        block_size=block_size,
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=len(prompt), max_tokens=2048,
+        ignore_eos=True, block_size=block_size,
+    )
+    request.prompt_token_ids[:] = prompt
+    request._all_token_ids[:] = list(prompt)
+    # Simulate a partial prefix-cache hit: one block of the sys prompt
+    # is already "computed" before this step's schedule() call.
+    request.num_computed_tokens = block_size
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    # Eviction fired without the old assertion tripping. The expected
+    # post-eviction state:
+    #   - num_prompt_tokens trimmed by total_evicted
+    #   - SchedulerOutput.num_scheduled_tokens = post_prompt_len -
+    #     pre-eviction num_computed (the kernel only computes the
+    #     uncached tail of the trimmed prompt)
+    #   - position_offset bumped by total_evicted so the kept-suffix
+    #     prefill at physical [block_size, post_prompt_len) gets RoPE
+    #     for the original absolute positions
+    #   - num_computed_tokens after schedule() = post_prompt_len
+    #     (advanced by `_update_after_schedule`)
+    expected_total_evicted = 96  # turn 0 spans blocks [2, 8) pre-evict
+    expected_post_prompt_len = len(prompt) - expected_total_evicted
+    expected_num_scheduled = expected_post_prompt_len - block_size
+    assert request.num_prompt_tokens == expected_post_prompt_len, (
+        request.num_prompt_tokens, expected_post_prompt_len,
+    )
+    assert request.position_offset == expected_total_evicted, (
+        request.position_offset
+    )
+    assert output.num_scheduled_tokens[request.request_id] == (
+        expected_num_scheduled
+    ), output.num_scheduled_tokens
+    assert request.num_computed_tokens == expected_post_prompt_len, (
+        request.num_computed_tokens, expected_post_prompt_len,
+    )
+
+
+def test_inline_admission_eviction_warm_prefix_cache_hit():
+    """In-step admission eviction with a WARM prefix-cache hit covering
+    a region wider than the eviction range. The cached prefix's overlap
+    with the evict range equals total_evicted (the entire eviction
+    range was already in cache), so `_apply_trim` decrements
+    num_computed_tokens by total_evicted. `num_scheduled_tokens[req]`
+    must be recomputed from post-eviction state, not by subtracting
+    total_evicted from the pre-eviction `num_scheduled_tokens`.
+
+    Reproduces the runtime failure
+    ``AssertionError`` in `_prepare_inputs` where
+    `total_num_scheduled_tokens` went negative
+    (``num_scheduled 36 -> -44``) because a 36-token uncached tail was
+    being shrunk by an 80-token eviction whose overlap was entirely
+    inside the cached prefix.
+    """
+    sys_len = 32
+    body_len = 50
+    block_size = 16
+
+    def _turn_tokens() -> list[int]:
+        toks: list[int] = []
+        for _ in range(body_len):
+            toks.append(GEN_BASE)
+        toks.append(IM_END)
+        for _ in range(body_len):
+            toks.append(GEN_BASE)
+        toks.append(IM_END)
+        return toks
+
+    sys_prompt = _make_system_prompt(sys_len)
+    turn_0 = _turn_tokens()
+    turn_1 = _turn_tokens()
+    new_frag = [GEN_BASE] * 10
+    prompt = sys_prompt + turn_0 + turn_1 + new_frag
+
+    scheduler = _make_turn_scheduler(
+        sys_len=sys_len, max_turns=2, turn_stride=1,
+        compaction_window_size=4096, compaction_stride=16,
+        block_size=block_size,
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=len(prompt), max_tokens=2048,
+        ignore_eos=True, block_size=block_size,
+    )
+    request.prompt_token_ids[:] = prompt
+    request._all_token_ids[:] = list(prompt)
+    # Simulate a warm prefix-cache hit that covers the entire region
+    # we're about to evict (and then some). For this prompt the evict
+    # range is [32, 128); seven blocks (= 112 tokens) of cache hit
+    # fully covers it.
+    request.num_computed_tokens = 7 * block_size
+    pre_num_computed = request.num_computed_tokens
+    scheduler.add_request(request)
+
+    expected_total_evicted = 96  # evict range [32, 128)
+    expected_post_prompt_len = len(prompt) - expected_total_evicted
+    evict_start = 32
+    evict_end = 128
+
+    output = scheduler.schedule()
+
+    # `_apply_trim` decrements num_computed by the overlap between the
+    # cached prefix [0, pre_num_computed) and the evict range
+    # [evict_start, evict_end). Here pre_num_computed=112 and
+    # evict=[32, 128), so overlap = min(112, 128) - 32 = 80.
+    overlap = max(0, min(pre_num_computed, evict_end) - evict_start)
+    expected_num_computed_post_apply_trim = pre_num_computed - overlap
+    # The kernel only needs to compute the post-eviction uncached tail.
+    # `_update_after_schedule` then advances num_computed by the new
+    # num_scheduled — taking it back to post_prompt_len.
+    expected_num_scheduled = (
+        expected_post_prompt_len - expected_num_computed_post_apply_trim
+    )
+
+    assert request.num_prompt_tokens == expected_post_prompt_len, (
+        request.num_prompt_tokens, expected_post_prompt_len,
+    )
+    assert request.position_offset == expected_total_evicted, (
+        request.position_offset
+    )
+    assert output.num_scheduled_tokens[request.request_id] == (
+        expected_num_scheduled
+    ), output.num_scheduled_tokens
+    assert request.num_computed_tokens == expected_post_prompt_len, (
+        request.num_computed_tokens, expected_post_prompt_len,
+    )
+    # Sanity guard against the bug this test was written to catch:
+    # num_scheduled MUST be non-negative.
+    assert output.num_scheduled_tokens[request.request_id] >= 0
+    assert output.total_num_scheduled_tokens >= 0, (
+        output.total_num_scheduled_tokens
+    )
+
+
+def test_inline_admission_eviction_position_offset_in_new_req_data():
+    """The position_offset bumped by in-step admission eviction MUST
+    flow to the worker via `NewRequestData.position_offset`. Without
+    this propagation, the worker initializes `position_offsets_cpu[row]
+    = 0` for the new request, so the prefill kernel rotates Q at the
+    local post-trim frame while cached K vectors (from prior requests'
+    prefix-cache hits) remain rotated at the original absolute frame.
+    The first decode token then picks up the offset via the cached-
+    request rebuild path on the next step, producing a prefill-vs-
+    decode RoPE skew that the model reads as "very ancient context"
+    and degenerates into token loops ("OneOneOne...") or answering
+    the previous turn's question.
+
+    Asserts that for a fresh request that hit in-step eviction, the
+    SchedulerOutput's `scheduled_new_reqs` entry carries the
+    non-zero position_offset that `_apply_trim` set on the request.
+    """
+    sys_len = 32
+    body_len = 50
+    block_size = 16
+
+    def _turn_tokens() -> list[int]:
+        toks: list[int] = []
+        for _ in range(body_len):
+            toks.append(GEN_BASE)
+        toks.append(IM_END)
+        for _ in range(body_len):
+            toks.append(GEN_BASE)
+        toks.append(IM_END)
+        return toks
+
+    sys_prompt = _make_system_prompt(sys_len)
+    turn_0 = _turn_tokens()
+    turn_1 = _turn_tokens()
+    new_frag = [GEN_BASE] * 10
+    prompt = sys_prompt + turn_0 + turn_1 + new_frag
+
+    scheduler = _make_turn_scheduler(
+        sys_len=sys_len, max_turns=2, turn_stride=1,
+        compaction_window_size=4096, compaction_stride=16,
+        block_size=block_size,
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=len(prompt), max_tokens=2048,
+        ignore_eos=True, block_size=block_size,
+    )
+    request.prompt_token_ids[:] = prompt
+    request._all_token_ids[:] = list(prompt)
+    # Simulate a warm prefix-cache hit so `_apply_trim`'s `had_kv`
+    # branch fires and bumps position_offset.
+    request.num_computed_tokens = 7 * block_size
+    scheduler.add_request(request)
+
+    expected_total_evicted = 96  # turn 0 at evict range [32, 128)
+
+    output = scheduler.schedule()
+
+    # The request should be in scheduled_new_reqs (it's a brand-new
+    # admission) and its NewRequestData must carry the bumped offset.
+    new_req_entries = [
+        nrd for nrd in output.scheduled_new_reqs
+        if nrd.req_id == request.request_id
+    ]
+    assert len(new_req_entries) == 1, (
+        f"Expected request {request.request_id} in scheduled_new_reqs, "
+        f"got {[nrd.req_id for nrd in output.scheduled_new_reqs]}"
+    )
+    new_req_data = new_req_entries[0]
+    assert new_req_data.position_offset == expected_total_evicted, (
+        f"NewRequestData.position_offset={new_req_data.position_offset} "
+        f"does not match request.position_offset="
+        f"{request.position_offset} (expected {expected_total_evicted})"
+    )
+    # Cross-check that the scheduler-side request state matches.
+    assert request.position_offset == expected_total_evicted

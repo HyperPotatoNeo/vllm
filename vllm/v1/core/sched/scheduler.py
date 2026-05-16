@@ -309,6 +309,16 @@ class Scheduler(SchedulerInterface):
                 self._compaction_assume_aligned_turn_boundaries,
             )
 
+        # Requests with turn-mode admission compaction pending until
+        # their prefill-completing step. On that step,
+        # `_apply_inline_admission_eviction` (called from `schedule()`
+        # BEFORE the SchedulerOutput is built) runs the eviction loop —
+        # blocks freed, block_table spliced, tokens trimmed,
+        # position_offset bumped — so the worker's prefill kernel sees
+        # the post-eviction state on its first pass. Single forward,
+        # single sample. See plans/single_forward_pre_eviction.md.
+        self._pending_admission_compaction_ids: set[str] = set()
+
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         self.scheduler_reserve_full_isl = (
@@ -424,6 +434,15 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
+
+        # KV cache compaction: admission eviction is driven by
+        # `_apply_inline_admission_eviction` at the end of this method.
+        # When a request's prefill completes this step and it is in
+        # `_pending_admission_compaction_ids`, blocks are freed,
+        # block_table spliced, prompt tokens trimmed, and
+        # position_offset bumped — all before SchedulerOutput is built.
+        # The worker then prefills the post-eviction sequence in a
+        # single normal forward.
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -930,11 +949,29 @@ class Scheduler(SchedulerInterface):
             scheduled_running_reqs
         ) <= len(self.running)
 
+        # KV cache compaction: in-step admission eviction.
+        # For any request in `_pending_admission_compaction_ids` whose
+        # prefill completes this step, run the eviction loop now —
+        # before block_ids/all_token_ids are snapshotted into the
+        # SchedulerOutput. The worker then prefills the post-eviction
+        # sequence in a single normal forward; `new_user_fragment` K/V
+        # is computed under attention over the kept context only because
+        # `turn_to_evict`'s blocks are no longer in the block_table.
+        (
+            total_num_scheduled_tokens,
+            any_inline_evicted,
+        ) = self._apply_inline_admission_eviction(
+            num_scheduled_tokens, total_num_scheduled_tokens
+        )
+
         # Get the longest common prefix among all requests in the running queue.
-        # This can be potentially used for cascade attention.
+        # This can be potentially used for cascade attention. Skip cascade
+        # attention when in-step eviction fired this step — the common
+        # prefix computed against post-eviction block_tables may not
+        # match what the kernel reads given the just-spliced layout.
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
         with record_function_or_nullcontext("schedule: get_num_common_prefix_blocks"):
-            if self.running:
+            if self.running and not any_inline_evicted:
                 any_request_id = self.running[0].request_id
                 num_common_prefix_blocks = (
                     self.kv_cache_manager.get_num_common_prefix_blocks(any_request_id)
@@ -1199,10 +1236,195 @@ class Scheduler(SchedulerInterface):
                 return True
         return False
 
-    def _compact_request(self, request: Request) -> int:
+    def _run_admission_eviction_loop(
+        self,
+        request: Request,
+        effective_num_computed: int | None = None,
+    ) -> int:
+        """Run the turn-mode admission eviction loop on a single request.
+
+        Shared between two callers:
+          - `update_from_output` admission branch (post-Phase-D): fires
+            in the same step as the worker's two-phase forward, so the
+            request-side state is mutated in lockstep with input_batch.
+          - `_update_request_as_session` (per-call mid-session admission,
+            fired after streaming-input session extension and BEFORE the
+            new content is prefilled — see the "Operative intent" section
+            of plans/connect_admission_events_to_trainer.md).
+
+        Each iteration calls _compact_request with post_prefill_admission=True,
+        which:
+          1. Emits a CompactionEvent with num_output_tokens_at_compaction=0
+             (admission semantics).
+          2. Trims prompt_token_ids in addition to _all_token_ids so
+             len(prompt_token_ids) stays consistent with num_prompt_tokens.
+          3. Generalized decrement+shift in _apply_trim handles
+             num_computed_tokens >= total_evicted correctly.
+
+        Returns the number of eviction iterations that fired.
+        """
+        iterations = 0
+        while True:
+            self._scan_new_turn_boundaries(request)
+            if (
+                self._num_live_completed_turns(request)
+                < self._compaction_max_turns
+            ):
+                break
+            evicted = self._compact_request(
+                request,
+                post_prefill_admission=True,
+                effective_num_computed=effective_num_computed,
+            )
+            if evicted == 0:
+                logger.warning(
+                    "[COMPACT] admission eviction bail: req=%s "
+                    "after %d iters (no further eviction possible)",
+                    request.request_id[:8],
+                    iterations,
+                )
+                break
+            # Propagate position_offset / block_table changes to the worker
+            # via the rebuild path. CachedRequestData's position_offsets dict
+            # is populated only for requests in rebuild_req_ids
+            # (scheduler.py:1893-1898). Without these two lines,
+            # position_offset stays at 0 on the worker side and decode-step
+            # Q rotates at `physical + 0` instead of
+            # `physical + total_evicted`.
+            request.needs_rebuild = True
+            self.prev_step_scheduled_req_ids.discard(request.request_id)
+            iterations += 1
+        return iterations
+
+    def _apply_inline_admission_eviction(
+        self,
+        num_scheduled_tokens: dict[str, int],
+        total_num_scheduled_tokens: int,
+    ) -> tuple[int, bool]:
+        """Run admission eviction in-step for any pending request whose
+        prefill completes this step.
+
+        Mutates request state (block_table, position_offset,
+        _all_token_ids, prompt_token_ids) via `_run_admission_eviction_
+        loop` and decrements `num_scheduled_tokens[req_id]` by the
+        number of tokens trimmed off the prompt so the worker prefills
+        only the post-eviction sequence in a single forward.
+
+        Called from `schedule()` BEFORE `num_common_prefix_blocks` is
+        computed and BEFORE `_make_cached_request_data` snapshots
+        block_ids — the rebuild flag set by the inner loop takes effect
+        on this same step's SchedulerOutput.
+
+        Returns:
+            (updated_total_num_scheduled_tokens, any_eviction_fired)
+        """
+        if (
+            not self._compaction_enabled
+            or not self._pending_admission_compaction_ids
+            or self._compaction_max_turns <= 0
+        ):
+            return total_num_scheduled_tokens, False
+
+        any_evicted = False
+        delta_total = 0
+        # Snapshot since `_run_admission_eviction_loop` discards from the
+        # set via its inner helpers, and we also discard explicitly.
+        pending_snapshot = list(self._pending_admission_compaction_ids)
+        for req_id in pending_snapshot:
+            num_new = num_scheduled_tokens.get(req_id, 0)
+            if num_new == 0:
+                continue
+            request = self.requests.get(req_id)
+            if request is None:
+                self._pending_admission_compaction_ids.discard(req_id)
+                continue
+            # Only fire when prefill completes this step. Chunked-prefill
+            # mid-chunks defer to the step that actually finishes prefill.
+            if (
+                request.num_computed_tokens + num_new
+                < request.num_prompt_tokens
+            ):
+                continue
+
+            pre_prompt = request.num_prompt_tokens
+            # The prefill kernel runs AFTER this method returns, so at
+            # eviction time `num_computed_tokens` reflects only the
+            # prefix-cache hits (0 for cold-cache). Pass the post-prefill
+            # position (= pre-eviction num_prompt_tokens) as the clamp
+            # ceiling so the planner's "never evict past KV that will
+            # exist" guard treats the to-be-prefilled prompt range as
+            # safe — the block_table is spliced before the kernel runs,
+            # so the kernel writes K/V only at post-eviction positions.
+            iterations = self._run_admission_eviction_loop(
+                request, effective_num_computed=pre_prompt,
+            )
+            self._pending_admission_compaction_ids.discard(req_id)
+            if iterations == 0:
+                continue
+            total_evicted = pre_prompt - request.num_prompt_tokens
+            if total_evicted <= 0:
+                continue
+            # Recompute `num_scheduled_tokens` from post-eviction state.
+            # Naively subtracting `total_evicted` from `num_new` is wrong
+            # under partial / warm prefix-cache hits: when the cache
+            # already covered some of the now-evicted positions,
+            # `_apply_trim` decrements `num_computed_tokens` by the
+            # overlap (not by `total_evicted`), so the residual prefill
+            # work is just `num_prompt_post - num_computed_post`. The
+            # naive subtraction would drive this NEGATIVE (e.g.
+            # `num_scheduled 36 -> -44` for a 80-tok eviction whose
+            # 80-tok overlap was entirely inside a 112-tok prefix-cache
+            # prefix) and trip
+            # `assert total_num_scheduled_tokens > 0` in the worker's
+            # `_prepare_inputs`.
+            new_num_scheduled = (
+                request.num_prompt_tokens - request.num_computed_tokens
+            )
+            assert new_num_scheduled >= 0, (
+                f"compaction: req={req_id[:8]} post-evict scheduled<0: "
+                f"num_prompt={request.num_prompt_tokens}, "
+                f"num_computed={request.num_computed_tokens}, "
+                f"total_evicted={total_evicted}, num_new_pre={num_new}"
+            )
+            num_scheduled_tokens[req_id] = new_num_scheduled
+            delta_total += new_num_scheduled - num_new
+            any_evicted = True
+            logger.info(
+                "[COMPACT/inline] req=%s prefill completes this step; "
+                "evicted %d tokens across %d iter(s); "
+                "num_scheduled %d -> %d, num_prompt %d -> %d, "
+                "num_computed=%d, position_offset=%d",
+                req_id[:8], total_evicted, iterations,
+                num_new, new_num_scheduled,
+                pre_prompt, request.num_prompt_tokens,
+                request.num_computed_tokens,
+                request.position_offset,
+            )
+
+        return total_num_scheduled_tokens + delta_total, any_evicted
+
+    def _compact_request(
+        self,
+        request: Request,
+        *,
+        post_prefill_admission: bool = False,
+        effective_num_computed: int | None = None,
+    ) -> int:
         """Compact a request: splice blocks, trim tokens, update state.
 
         After this, the request looks like a shorter sequence to all consumers.
+
+        Args:
+            request: the Request to compact.
+            post_prefill_admission: when True, this call is firing from the
+                deferred-admission hook (Path 2: evict after prefill). In
+                that case, the evict range overlaps the prompt — so the
+                `prompt_token_ids` Python list must also be trimmed (mirror
+                of pre-prefill admission's behavior), and the emitted event
+                is tagged with num_output_tokens_at_compaction=0 (admission
+                semantics) even though num_total_generated may be >0
+                because vLLM already sampled the first decoded token from
+                the prefill-end logit before this hook ran.
         """
         # Locate the compaction-capable manager up front so we can use its
         # block_size to plan the eviction range (turn mode) before calling
@@ -1225,7 +1447,10 @@ class Scheduler(SchedulerInterface):
         last_turn_evicted = -1
         stride_used = 0
         if self._compaction_max_turns > 0:
-            plan = self._plan_turn_evict_range(request, block_size)
+            plan = self._plan_turn_evict_range(
+                request, block_size,
+                effective_num_computed=effective_num_computed,
+            )
             if plan is None:
                 return 0  # Nothing safe to evict (e.g. too-short turns)
             evict_start, evict_end, last_turn_evicted, stride_used = plan
@@ -1263,6 +1488,21 @@ class Scheduler(SchedulerInterface):
                 request._all_token_ids[evict_start:evict_end]
             )
 
+        # Snapshot the KEPT slice (in pre-event coords) BEFORE mutation.
+        # Scheduler is the single source of truth for what physically
+        # survives this eviction. Surfaced on the event so consumers
+        # don't re-derive the slice from scalar fields (which is how the
+        # trainer's evict_start_per_boundary plumbing went dead).
+        pre_event_len = len(request._all_token_ids)
+        kept_indices = (
+            list(range(0, evict_start))
+            + list(range(evict_end, pre_event_len))
+        )
+        kept_token_ids = (
+            list(request._all_token_ids[0:evict_start])
+            + list(request._all_token_ids[evict_end:pre_event_len])
+        )
+
         # Record event BEFORE mutating state.
         if self._compaction_max_turns > 0:
             num_turns_evicted_after = (
@@ -1270,8 +1510,19 @@ class Scheduler(SchedulerInterface):
             )
         else:
             num_turns_evicted_after = 0
+        # New_user_fragment_len: length of the in-progress turn's tail
+        # (the chunk that, under the new single-forward design, vLLM
+        # prefills under POST-eviction K/V). Only meaningful for
+        # admission events; zero on mid-gen events since they don't
+        # expose a fragment boundary. Emitted on the CompactionEvent
+        # so the trainer's segmented_forward can mirror the split.
+        new_user_fragment_len = self._compute_new_user_fragment_len(
+            request, evict_end
+        ) if post_prefill_admission else 0
         event = CompactionEvent(
-            num_output_tokens_at_compaction=request.num_total_generated,
+            num_output_tokens_at_compaction=(
+                0 if post_prefill_admission else request.num_total_generated
+            ),
             tokens_evicted=total_evicted,
             position_offset_after=request.position_offset + total_evicted,
             num_prompt_tokens=request.num_prompt_tokens,
@@ -1279,6 +1530,9 @@ class Scheduler(SchedulerInterface):
             evicted_token_ids=evicted_token_ids,
             last_turn_evicted=last_turn_evicted,
             num_turns_evicted_after=num_turns_evicted_after,
+            kept_indices=kept_indices,
+            kept_token_ids=kept_token_ids,
+            new_user_fragment_len=new_user_fragment_len,
         )
         request.compaction_events.append(event)
 
@@ -1298,8 +1552,13 @@ class Scheduler(SchedulerInterface):
         )
 
         # --- Mutate request to look like a shorter sequence ---
-        # Delegates to the shared _apply_trim helper (also used by
-        # admission-time prefill compaction).
+        # Delegates to the shared _apply_trim helper. For mid-gen the
+        # evict range is in the generated output, so prompt_token_ids
+        # stays untouched. For post-prefill admission, the evict range
+        # overlaps the prompt, so we MUST trim prompt_token_ids to keep
+        # `len(prompt_token_ids) == num_prompt_tokens` consistent
+        # (otherwise the scheduler tries to re-prefill the un-trimmed
+        # tail and hangs).
         prompt_tokens_evicted, output_tokens_evicted = self._apply_trim(
             request,
             evict_start=evict_start,
@@ -1307,7 +1566,7 @@ class Scheduler(SchedulerInterface):
             total_evicted=total_evicted,
             stride_used=stride_used,
             num_turns_evicted_after=num_turns_evicted_after,
-            trim_prompt_token_ids=False,
+            trim_prompt_token_ids=post_prefill_admission,
         )
 
         if prompt_tokens_evicted > 0:
@@ -1321,10 +1580,68 @@ class Scheduler(SchedulerInterface):
                 request.position_offset,
             )
 
+        # ──── Monotonic-position fix for chained admission ────
+        # If admission's prefix-cache hit pulled in K vectors beyond
+        # evict_end (= survivors), those K have logical positions baked
+        # in from a PRIOR admission's position_offset. The new prefill
+        # will write K at logical = physical + this_admission's_offset,
+        # which can collide with the survivors' logical positions
+        # (e.g. survivors at logical [96..111] from step N-1's prefill,
+        # new prefill at logical [64..99] from step N's offset bump
+        # → duplicate logical positions in cache → garbage attention).
+        #
+        # Free ONLY the survivor cache blocks (not the pre-allocated
+        # empty blocks beyond them) so the post-admission cache has only
+        # the protected prefix [0, evict_start), and force re-prefill of
+        # the rest at the new offset. The pre-allocated empty blocks are
+        # preserved so the prefill has slots to write into.
+        #
+        # Gate on prompt_tokens_evicted > 0 to apply only on admission
+        # (mid-gen evicts OUTPUT and its survivor K positions don't
+        # collide because they were written under the same offset that
+        # subsequent decode will use).
+        if prompt_tokens_evicted > 0 and request.num_computed_tokens > evict_start:
+            blocks = compaction_mgr.req_to_blocks[request.request_id]
+            protected_blocks = evict_start // block_size
+            # num_computed_post counts the cached K (post-admission). Blocks
+            # in [protected_blocks, num_cached_blocks_post) are the survivors
+            # we need to drop. Blocks beyond num_cached_blocks_post are
+            # pre-allocated EMPTY slots reserved for prefill — leave them.
+            num_cached_blocks_post = (
+                request.num_computed_tokens + block_size - 1
+            ) // block_size
+            survivor_blocks = blocks[protected_blocks:num_cached_blocks_post]
+            if survivor_blocks:
+                if getattr(compaction_mgr.block_pool, "enable_caching", False):
+                    for blk in survivor_blocks:
+                        compaction_mgr.block_pool._maybe_evict_cached_block(blk)
+                compaction_mgr.block_pool.free_blocks(survivor_blocks)
+                # Splice out the survivor blocks; pre-allocated empty
+                # blocks shift down to fill the gap.
+                del blocks[protected_blocks:num_cached_blocks_post]
+                prev_num_computed = request.num_computed_tokens
+                request.num_computed_tokens = evict_start
+                logger.warning(
+                    "[COMPACT-MONO] req=%s freed %d survivor blocks "
+                    "(indices [%d, %d)) beyond evict_start=%d; "
+                    "num_computed: %d -> %d (forcing re-prefill to "
+                    "ensure monotonic K positions)",
+                    request.request_id[:8],
+                    len(survivor_blocks),
+                    protected_blocks,
+                    num_cached_blocks_post,
+                    evict_start,
+                    prev_num_computed,
+                    request.num_computed_tokens,
+                )
+
         return total_evicted
 
     def _plan_turn_evict_range(
-        self, request: Request, block_size: int
+        self,
+        request: Request,
+        block_size: int,
+        effective_num_computed: int | None = None,
     ) -> tuple[int, int, int, int] | None:
         """Compute the (evict_start, evict_end, last_turn_evicted, stride)
         plan for a turn-mode eviction.
@@ -1340,6 +1657,15 @@ class Scheduler(SchedulerInterface):
         included in this eviction (turn 0 = first user+assistant pair
         after the system prompt), in absolute terms (not relative to
         already-evicted turns).
+
+        `effective_num_computed` overrides the safety clamp ceiling
+        (`evict_end` is clamped to `effective_num_computed // block_size *
+        block_size`). Default = `request.num_computed_tokens` (matches
+        mid-gen semantics: never evict KV that hasn't been written).
+        Phase-B2 inline-admission planning passes
+        `request.num_prompt_tokens` because the prefill in the current
+        step will populate KV for all prompt positions before the
+        worker consumes the plan.
         """
         positions = request.turn_end_positions
         # positions only tracks non-evicted content:
@@ -1392,16 +1718,52 @@ class Scheduler(SchedulerInterface):
             )
             return None
 
-        # Safety: never evict past num_computed_tokens (no KV exists yet).
+        # Safety: never evict past the KV that will exist when this
+        # plan is consumed. For mid-gen this is num_computed_tokens;
+        # for inline-admission Phase B2 the caller passes
+        # num_prompt_tokens because the prefill completing this step
+        # will write KV at all prompt positions.
+        clamp_ceiling = (
+            request.num_computed_tokens
+            if effective_num_computed is None
+            else effective_num_computed
+        )
         evict_end = min(
             evict_end,
-            (request.num_computed_tokens // block_size) * block_size,
+            (clamp_ceiling // block_size) * block_size,
         )
         if evict_end <= evict_start:
             return None
 
         last_turn_evicted = request.num_turns_evicted + stride - 1
         return (evict_start, evict_end, last_turn_evicted, stride)
+
+    def _compute_new_user_fragment_len(
+        self, request: Request, evict_end: int
+    ) -> int:
+        """Length of the in-progress turn's tail (the new_user_fragment
+        whose K/V vLLM prefills under post-eviction attention in the
+        single-forward in-step admission path). Emitted on
+        CompactionEvent.new_user_fragment_len so the trainer's
+        segmented_forward mirror can split each admission boundary at
+        the same offset.
+
+        Returns 0 when there's no fragment (e.g. all prompt tokens are
+        completed turns, or turn-mode is disabled, or no turn boundaries
+        have been scanned yet). The trainer treats 0 as "no split".
+        """
+        if self._compaction_max_turns <= 0:
+            return 0
+        positions = request.turn_end_positions
+        live_completed = self._num_live_completed_turns(request)
+        if not positions or live_completed == 0:
+            return 0
+        new_user_fragment_start = positions[-1]
+        if new_user_fragment_start >= request.num_prompt_tokens:
+            return 0
+        if new_user_fragment_start <= evict_end:
+            new_user_fragment_start = evict_end
+        return max(0, request.num_prompt_tokens - new_user_fragment_start)
 
     def _apply_trim(
         self,
@@ -1416,13 +1778,17 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[int, int]:
         """Mutate request state to reflect eviction of [evict_start, evict_end).
 
-        Shared between mid-generation compaction (_compact_request, where
-        KV blocks have already been physically evicted via the manager)
-        and admission-time prefill compaction (_maybe_compact_prompt,
-        where no blocks exist yet and the prompt itself is trimmed).
+        Shared between mid-generation compaction (`_compact_request`
+        called from `update_from_output`, where the to-be-evicted KV
+        blocks have already been physically populated by prior steps)
+        and in-step admission compaction (`_compact_request` called
+        via `_run_admission_eviction_loop` from
+        `_apply_inline_admission_eviction`, where blocks are freed at
+        the END of `schedule()` BEFORE the worker's prefill kernel
+        runs).
 
         When trim_prompt_token_ids=True, the raw prompt_token_ids list is
-        also trimmed — required at admission time so that prefill sees
+        also trimmed — required for admission so the worker prefills
         the shortened prompt. Mid-generation callers pass False because
         prompt_token_ids is a historical artifact at that point and
         mutating it would confuse downstream consumers (segmented_forward
@@ -1440,13 +1806,26 @@ class Scheduler(SchedulerInterface):
         del request._all_token_ids[evict_start:evict_end]
         request.all_token_ids = ConstantList(request._all_token_ids)
 
-        # 1b. Admission-time: also trim the raw prompt_token_ids list so
-        # prefill runs on the shortened prompt.
-        if trim_prompt_token_ids:
+        # 1b. Whenever prompt tokens are evicted, also trim the raw
+        # prompt_token_ids list so it stays consistent with
+        # num_prompt_tokens (decremented in step 3). Required for:
+        #   - Pre-prefill admission (old code path).
+        #   - Post-prefill deferred admission (Path 2: evict-after-prefill).
+        #   - Mid-gen eviction whose range overlaps the prompt (this can
+        #     fire during chunked prefill before output starts).
+        # The `trim_prompt_token_ids` flag is preserved for API
+        # compatibility but is now effectively unused — we infer from
+        # prompt_tokens_evicted > 0 whether to trim the list. Without this
+        # trim, `len(prompt_token_ids) > num_prompt_tokens` and the
+        # scheduler may try to re-prefill the un-trimmed tail (whose KV
+        # blocks were just evicted), causing engine stall or wrong logits.
+        if prompt_tokens_evicted > 0:
             assert request.prompt_token_ids is not None, (
-                "admission-time compaction requires prompt_token_ids"
+                "prompt-overlapping eviction requires prompt_token_ids"
             )
-            del request.prompt_token_ids[evict_start:evict_end]
+            del request.prompt_token_ids[
+                evict_start : evict_start + prompt_tokens_evicted
+            ]
 
         # 2. Trim output_token_ids for any evicted output tokens.
         if output_tokens_evicted > 0:
@@ -1460,30 +1839,41 @@ class Scheduler(SchedulerInterface):
         if prompt_tokens_evicted > 0:
             request.num_prompt_tokens -= prompt_tokens_evicted
 
-        # 4. Reduce num_computed_tokens. At admission time this is 0 and
-        # no KV has been computed, so skip the decrement path entirely.
-        if not trim_prompt_token_ids:
-            assert request.num_computed_tokens >= total_evicted, (
-                f"Compaction underflow: num_computed="
-                f"{request.num_computed_tokens}, evicting={total_evicted}"
+        # 4 & 5. Decrement num_computed_tokens by the OVERLAP between the
+        # cached K/V prefix [0, num_computed) and the eviction range
+        # [evict_start, evict_end). Shift position_offset by total_evicted
+        # so post-eviction physical positions rotate at the same absolute
+        # RoPE positions they had pre-eviction.
+        #
+        # Cases:
+        #   - Cold cache (num_computed == 0): no KV exists. Skip both —
+        #     the trimmed prompt is freshly prefilled with positions
+        #     [0, post_prompt_len) and position_offset stays 0. Trainer
+        #     mirror also fresh-prefills the trimmed prompt.
+        #   - Partial prefix-cache hit (num_computed <= evict_start):
+        #     overlap == 0. Cached K/V at physical [0, num_computed)
+        #     survives the splice unchanged (those blocks are not in the
+        #     evict range). num_computed_tokens stays the same;
+        #     position_offset bumps by total_evicted so subsequent
+        #     prefill of physical [num_computed, post_prompt_len) gets
+        #     RoPE for the original-absolute positions of the kept-
+        #     suffix tokens.
+        #   - Cross-range cache (evict_start < num_computed < evict_end):
+        #     cached K/V at physical [evict_start, num_computed) was in
+        #     freed blocks. overlap = num_computed - evict_start.
+        #     Decrement reduces num_computed to evict_start.
+        #   - Warm cache (num_computed >= evict_end), e.g. post-prefill
+        #     deferred admission or mid-gen eviction:
+        #     overlap == total_evicted. Decrement matches the old "always
+        #     subtract total_evicted" behavior; shift keeps decode-Q in
+        #     the original absolute frame.
+        had_kv = request.num_computed_tokens > 0
+        if had_kv:
+            overlap = max(
+                0,
+                min(request.num_computed_tokens, evict_end) - evict_start,
             )
-            request.num_computed_tokens -= total_evicted
-        else:
-            assert request.num_computed_tokens == 0, (
-                "admission-time compaction must run before any forward "
-                f"(num_computed_tokens={request.num_computed_tokens})"
-            )
-
-        # 5. Update position offset.
-        # For mid-gen eviction (trim_prompt_token_ids=False), KV blocks are
-        # already allocated and the next decode token must keep its absolute
-        # RoPE position, so we shift the offset by the number of evicted tokens.
-        # For admission-time eviction (trim_prompt_token_ids=True), no KV
-        # exists yet — the shorter prompt is prefilled as a fresh sequence with
-        # position_ids = [0, 1, ..., len-1].  Incrementing the offset here
-        # would shift those positions in the model runner, creating a mismatch
-        # with the trainer (which always uses arange(0, seq_len)).  Skip it.
-        if not trim_prompt_token_ids:
+            request.num_computed_tokens -= overlap
             request.position_offset += total_evicted
 
         # 6. Turn mode: drop the markers for the evicted turns and shift
@@ -1509,134 +1899,77 @@ class Scheduler(SchedulerInterface):
             request.last_turn_scan_pos = len(request._all_token_ids)
             request.num_turns_evicted = num_turns_evicted_after
 
+        # 7. Prefix-cache rebuild. After eviction, request.block_hashes is
+        # stale (refers to the pre-eviction token sequence + evicted parent
+        # hashes) and the kept blocks are registered in
+        # cached_block_hash_to_block under those stale hashes — so a future
+        # request whose prompt matches the post-eviction sequence would
+        # compute a fresh hash chain from NONE_HASH and miss every kept
+        # block. Rebuild the chain and re-register the survivors under
+        # their new hashes so prefix caching can actually hit on the kept
+        # window. No-op when prefix caching is disabled.
+        self._rehash_after_eviction(request)
+
         return prompt_tokens_evicted, output_tokens_evicted
 
-    def _maybe_compact_prompt(self, request: Request) -> None:
-        """Prefill-time turn compaction.
+    def _rehash_after_eviction(self, request: Request) -> None:
+        """Rebuild the block-hash chain after eviction trimmed
+        request._all_token_ids, and re-register surviving blocks in the
+        prefix-cache map under their new hashes.
 
-        Runs at request admission, BEFORE the request is enqueued for
-        prefill. Loops until live_completed_turns < max_turns, trimming
-        stride turns per iteration. Each iteration records a
-        CompactionEvent with num_output_tokens_at_compaction=0 so the
-        trainer can replay the eviction chain.
+        Required for prefix caching to hit on a future request whose
+        prompt matches the post-eviction sequence. Without this:
 
-        Fixes the first-token distribution drift that occurs when
-        compaction fires AFTER the initial prefill: the first decoded
-        token would be sampled under the full (pre-eviction) KV while
-        every subsequent token sees the post-eviction KV.
+          1. request.block_hashes encodes the pre-eviction chain. Block
+             N's hash references h(block_{N-1}) — but block_{N-1} may
+             have been freed by this eviction, and h(block_{N-1}) is
+             not what a fresh request walking the chain from NONE_HASH
+             would compute over the post-eviction tokens.
+          2. KVCacheBlocks for surviving blocks still carry their
+             pre-eviction hashes in `block_hash` and entries in
+             `cached_block_hash_to_block` — so even if a future request
+             SOMEHOW computed the same stale hash, it would be matching
+             on a chain that no longer reflects the physical state.
 
-        No-op if turn mode is disabled, prompt does not exceed
-        max_turns, or no compaction-capable KV manager is present.
+        Implementation:
+          a. For each single-type manager with caching enabled, pop the
+             stale hash entries for the request's surviving blocks from
+             `cached_block_hash_to_block`, reset each block's stored
+             hash to None, and zero the manager's
+             `num_cached_block[req_id]` counter so the next
+             `cache_blocks()` call re-registers them.
+          b. Clear `request.block_hashes` and call `update_block_hashes`
+             to rebuild the chain from scratch over the post-eviction
+             token sequence.
+
+        No-op when prefix caching is globally disabled (the common
+        case today; this method exists to unlock enabling it).
         """
-        if self._compaction_max_turns <= 0:
+        if not self.cache_config.enable_prefix_caching:
             return
-        if request.prompt_token_ids is None:
-            return
-
-        # Locate block_size via the compaction manager.
-        compaction_mgr: "CompactingKVCacheManager | None" = None
         for mgr in self.kv_cache_manager.coordinator.single_type_managers:
-            if isinstance(mgr, CompactingKVCacheManager):
-                compaction_mgr = mgr
-                break
-        if compaction_mgr is None:
-            return
-        block_size = compaction_mgr.block_size
-
-        # Loop: keep evicting stride turns until under the ceiling.
-        # Without the loop, prompts with many more turns than max_turns
-        # (e.g. 8 live with max=4, stride=2) would only shed 2 turns at
-        # admission, leaving the excess to mid-generation compaction
-        # which fires AFTER the first token — defeating the purpose.
-        while True:
-            self._scan_new_turn_boundaries(request)
-            if (
-                self._num_live_completed_turns(request)
-                < self._compaction_max_turns
-            ):
-                return
-
-            # _plan_turn_evict_range's final clamp pins evict_end to
-            # (num_computed_tokens // block_size) * block_size, which is
-            # 0 at admission — that would produce an empty range. Plan
-            # the range manually here, skipping that clamp (no KV exists
-            # yet, so the "don't evict past computed KV" guard is vacuous).
-            positions = request.turn_end_positions
-            live_turns = self._num_live_completed_turns(request)
-            stride = min(self._compaction_eviction_turn_stride, live_turns)
-            if stride <= 0:
-                return
-            turn_first_start_pos = positions[0]
-            turn_last_end_pos = positions[2 * stride]
-
-            evict_start = (
-                (turn_first_start_pos + block_size - 1) // block_size
-            ) * block_size
-            if self._compaction_assume_aligned_turn_boundaries:
-                evict_end = (
-                    (turn_last_end_pos + block_size - 1) // block_size
-                ) * block_size
-            else:
-                evict_end = (turn_last_end_pos // block_size) * block_size
-
-            if evict_end <= evict_start:
-                logger.warning(
-                    "[COMPACT] admission-time bail: req=%s "
-                    "turn_first_start=%d turn_last_end=%d "
-                    "block_size=%d -> empty range",
-                    request.request_id[:8],
-                    turn_first_start_pos, turn_last_end_pos, block_size,
-                )
-                return
-
-            total_evicted = evict_end - evict_start
-            last_turn_evicted = request.num_turns_evicted + stride - 1
-            num_turns_evicted_after = request.num_turns_evicted + stride
-
-            # Snapshot evicted tokens before mutation (debug only).
-            evicted_token_ids: list[int] = []
-            if os.environ.get("VLLM_COMPACTION_DEBUG_TOKENS"):
-                evicted_token_ids = list(
-                    request._all_token_ids[evict_start:evict_end]
-                )
-
-            # Record event BEFORE mutating state. num_output_tokens=0
-            # marks this as an admission-time event for the trainer.
-            event = CompactionEvent(
-                num_output_tokens_at_compaction=0,
-                tokens_evicted=total_evicted,
-                position_offset_after=request.position_offset + total_evicted,
-                num_prompt_tokens=request.num_prompt_tokens,
-                evict_start=evict_start,
-                evicted_token_ids=evicted_token_ids,
-                last_turn_evicted=last_turn_evicted,
-                num_turns_evicted_after=num_turns_evicted_after,
-            )
-            request.compaction_events.append(event)
-
-            logger.warning(
-                "[COMPACT] admission req=%s prompt_len=%d evict=[%d,%d) "
-                "total=%d live_turns=%d stride=%d last_turn=%d",
-                request.request_id[:8],
-                request.num_prompt_tokens,
-                evict_start, evict_end,
-                total_evicted,
-                live_turns, stride, last_turn_evicted,
-            )
-
-            # Trim both _all_token_ids AND prompt_token_ids (admission).
-            # No block-manager call: no blocks allocated yet, so the
-            # shorter prompt will simply be prefilled normally.
-            self._apply_trim(
-                request,
-                evict_start=evict_start,
-                evict_end=evict_end,
-                total_evicted=total_evicted,
-                stride_used=stride,
-                num_turns_evicted_after=num_turns_evicted_after,
-                trim_prompt_token_ids=True,
-            )
-            # Loop continues: re-scan boundaries on the shorter prompt.
+            block_pool = getattr(mgr, "block_pool", None)
+            if block_pool is None or not block_pool.enable_caching:
+                continue
+            kept_blocks = mgr.req_to_blocks.get(request.request_id, [])
+            for blk in kept_blocks:
+                if blk.block_hash is not None:
+                    # pop is a no-op if the entry doesn't match the
+                    # block_id (defensive against hash collisions).
+                    block_pool.cached_block_hash_to_block.pop(
+                        blk.block_hash, blk.block_id
+                    )
+                    blk.reset_hash()
+            # Tell the manager that nothing is cached for this request
+            # — so its next cache_blocks() call re-registers the kept
+            # blocks under the freshly-computed hashes.
+            if request.request_id in mgr.num_cached_block:
+                mgr.num_cached_block[request.request_id] = 0
+        # Rebuild the request's hash chain over the (post-trim)
+        # all_token_ids. block_hashes is a typed wrapper around a list;
+        # use .clear() / .extend() rather than rebinding the attribute.
+        request.block_hashes.clear()
+        request.update_block_hashes()
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -1711,6 +2044,18 @@ class Scheduler(SchedulerInterface):
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
         session.status = RequestStatus.WAITING
+
+        # Mid-call admission eviction: at this point session.num_computed_tokens
+        # is the count of tokens whose K already lives in cache from the
+        # previous call, and session.num_prompt_tokens has just grown to
+        # include the newly-appended content. Fire admission eviction NOW —
+        # the splice mutates block_table + position_offset BEFORE the new
+        # content is scheduled for prefill on the next step, so the new
+        # content's K vectors are written under the post-eviction state.
+        # See plans/connect_admission_events_to_trainer.md "Operative intent".
+        session.session_prefill_boundary = session.num_computed_tokens
+        if self._compaction_max_turns > 0:
+            self._run_admission_eviction_loop(session)
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
@@ -2133,13 +2478,42 @@ class Scheduler(SchedulerInterface):
                         req_id,
                     )
 
-            # --- KV cache compaction ---
+            # --- Turn-boundary scan (turn-mode compaction) ---
+            # Keep `request.turn_end_positions` in sync with newly
+            # appended tokens. Previously this scan was triggered as a
+            # side-effect of `_should_compact` in the mid-gen block
+            # below; the Phase-D `_pending_admission_compaction_ids`
+            # gate on that block prevents it from firing for reqs that
+            # never get a plan emitted (e.g. live_turns < max_turns).
+            # Call directly so the scan happens regardless of which
+            # compaction branch (or neither) fires.
+            if self._compaction_enabled and self._compaction_max_turns > 0:
+                self._scan_new_turn_boundaries(request)
+
+            # KV cache compaction: admission eviction has already fired
+            # inline inside `schedule()` via
+            # `_apply_inline_admission_eviction`. Drain any residual
+            # pending ids whose prefill has now completed without a plan
+            # being emitted (e.g. live_turns dropped below max_turns
+            # mid-flight), so the mid-gen branch below — gated on
+            # `not in _pending` — can fire for them later.
+            if (
+                request.request_id in self._pending_admission_compaction_ids
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                self._pending_admission_compaction_ids.discard(request.request_id)
+
+            # --- KV cache compaction: mid-gen sliding window ---
             # After tokens are appended and stop is checked, compact if needed.
             # Must be AFTER stop check (don't compact finished requests).
+            # Excluded for reqs still in _pending_admission_compaction_ids:
+            # those will be handled by the admission path on the step
+            # where their plan finally emits.
             if (
                 not stopped
                 and self._compaction_enabled
                 and request.num_output_placeholders == 0
+                and request.request_id not in self._pending_admission_compaction_ids
             ):
                 while self._should_compact(request):
                     tokens_evicted = self._compact_request(request)
@@ -2468,12 +2842,18 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
-            # Prefill-time turn compaction: if the prompt already has
-            # more completed turns than max_turns, trim the oldest
-            # turns NOW so prefill runs on the shortened prompt and the
-            # first decoded token is sampled from the post-compaction
-            # KV (eliminating first-token distribution drift).
-            self._maybe_compact_prompt(request)
+            # Mark the request for in-step admission eviction at its
+            # prefill-completing step. `_apply_inline_admission_eviction`
+            # in `schedule()` consumes the pending set: when prefill
+            # completes this step AND `live_turns >= max_turns`, it
+            # frees the to-be-evicted blocks BEFORE the worker's prefill
+            # kernel fires, so `new_user_fragment` K/V is computed under
+            # attention over the kept context only. Single forward.
+            if (
+                self._compaction_max_turns > 0
+                and request.prompt_token_ids is not None
+            ):
+                self._pending_admission_compaction_ids.add(request.request_id)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.log_stats:

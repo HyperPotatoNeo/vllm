@@ -42,6 +42,22 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # KV cache compaction: cumulative RoPE offset for this request at
+    # the moment it enters the worker. Non-zero only when in-step
+    # admission eviction fired in `Scheduler.schedule()` BEFORE this
+    # SchedulerOutput was built — the helper bumps `request.position_
+    # offset` by `total_evicted` so the worker's prefill kernel rotates
+    # Q at the post-eviction absolute frame matching the cached K
+    # vectors (which were written by prior requests at their original
+    # absolute positions). Without this field, NewRequestData would
+    # default the worker-side offset to 0, the prefill's K writes
+    # would be rotated in the LOCAL frame, and the first decode token
+    # (which DOES pick up the bumped offset via `request.position_
+    # offset` on subsequent steps) would attend the prefilled K with
+    # an offset-by-total_evicted skew — surfacing as token loops and
+    # the model answering the previous turn's question.
+    position_offset: int = 0
+
     @classmethod
     def from_request(
         cls,
@@ -60,6 +76,7 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prefill_token_ids=prefill_token_ids,
+            position_offset=request.position_offset,
         )
 
     def __repr__(self) -> str:
