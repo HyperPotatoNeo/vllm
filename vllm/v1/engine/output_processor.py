@@ -281,6 +281,7 @@ class RequestState:
         kv_transfer_params: dict[str, Any] | None = None,
         routed_experts: np.ndarray | None = None,
         compaction_events: list[CompactionEvent] | None = None,
+        padding_token_ids: list[int] | None = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
@@ -335,7 +336,7 @@ class RequestState:
 
         return self._new_request_output(
             external_req_id, outputs, finished, kv_transfer_params,
-            compaction_events,
+            compaction_events, padding_token_ids,
         )
 
     def _new_request_output(
@@ -345,6 +346,7 @@ class RequestState:
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
         compaction_events: list[CompactionEvent] | None = None,
+        padding_token_ids: list[int] | None = None,
     ) -> RequestOutput | PoolingRequestOutput:
         # If prompt embeds were used, put placeholder prompt token ids
         prompt_token_ids = self.prompt_token_ids
@@ -381,6 +383,7 @@ class RequestState:
             num_cached_tokens=self.num_cached_tokens,
             metrics=self.stats,
             compaction_events=compaction_events,
+            padding_token_ids=padding_token_ids,
         )
 
     def _new_completion_output(
@@ -661,6 +664,7 @@ class OutputProcessor:
                 kv_transfer_params,
                 routed_experts,
                 req_state.compaction_events,
+                engine_core_output.padding_token_ids,
             ):
                 if req_state.streaming_input:
                     request_output.finished = False

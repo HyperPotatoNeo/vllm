@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -208,12 +209,30 @@ class SingleTypeKVCacheManager(ABC):
             allocated_blocks = self.block_pool.get_new_blocks(
                 cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
             )
+            # Stamp logical_start on the external-token tail, mirroring
+            # allocate_new_blocks. allocate_new_computed_blocks is only
+            # called for FRESH requests (fast-path check at line 165), so
+            # the request's position_offset is 0 at this point — external
+            # tokens were transferred from a remote engine and their K was
+            # rotated at their absolute logical positions, which equals
+            # block_idx * block_size in the fresh request's frame.
+            start_idx = len(req_blocks)
+            for i, b in enumerate(allocated_blocks):
+                assert b.logical_start < 0, (
+                    f"external-tail block {b.block_id} should be -1 from "
+                    f"get_new_blocks, got {b.logical_start}"
+                )
+                b.logical_start = (start_idx + i) * self.block_size
             req_blocks.extend(allocated_blocks)
             if type(self.kv_cache_spec) is FullAttentionSpec:
                 self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
     def allocate_new_blocks(
-        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+        self,
+        request_id: str,
+        num_tokens: int,
+        num_tokens_main_model: int,
+        request_position_offset: int = 0,
     ) -> list[KVCacheBlock]:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
@@ -226,6 +245,14 @@ class SingleTypeKVCacheManager(ABC):
             num_tokens_main_model: The number of tokens for the main model (aka target
                 model in spec decode). w/o spec decode, it is num_tokens;
                 with spec decode, it is num_tokens - num_lookahead_tokens.
+            request_position_offset: The request's current position_offset.
+                Used to stamp each freshly-allocated block with the logical
+                position of its first K vector (= block_idx * block_size
+                + offset). Required for the piecewise position_offset fix
+                (plans/piecewise_position_offset.md) so admission can
+                compute max_survivor_logical from cached blocks. Set to 0
+                if not in a compaction context — the stamped values are
+                harmless when unused.
         Returns:
             The new allocated blocks.
         """
@@ -236,6 +263,21 @@ class SingleTypeKVCacheManager(ABC):
             return []
         else:
             new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+            # Stamp each fresh block with its logical_start. After the
+            # free→re-alloc lifecycle fix, get_new_blocks unconditionally
+            # resets logical_start to -1 before handing the block over,
+            # so the assertion below is a hard invariant — if it fires,
+            # something pulled blocks through a path that didn't reset.
+            start_idx = len(req_blocks)
+            for i, b in enumerate(new_blocks):
+                assert b.logical_start < 0, (
+                    f"fresh block {b.block_id} from get_new_blocks must have "
+                    f"logical_start=-1, got {b.logical_start}"
+                )
+                b.logical_start = (
+                    (start_idx + i) * self.block_size
+                    + request_position_offset
+                )
             req_blocks.extend(new_blocks)
             if type(self.kv_cache_spec) is FullAttentionSpec:
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
@@ -319,7 +361,7 @@ class SingleTypeKVCacheManager(ABC):
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
-    ) -> tuple[list[KVCacheBlock], ...]:
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         """
         Get the longest cache hit prefix of the blocks that is not longer than
         `max_length`. The prefix should be a common prefix hit for all the
@@ -328,6 +370,11 @@ class SingleTypeKVCacheManager(ABC):
         If eagle is enabled, drop the last matched block to force recompute the
         last block to get the required hidden states for eagle drafting head.
         Need to be customized for each attention type.
+
+        Returns (computed_blocks, inherited_offset) where inherited_offset
+        is the writer's position_offset frame that the inheriting request
+        should seed its own position_offset from. Non-compaction subclasses
+        always return 0 for inherited_offset (no admission frame concept).
 
         Args:
             block_hashes: The block hashes of the request.
@@ -417,6 +464,79 @@ class SingleTypeKVCacheManager(ABC):
 
 
 class FullAttentionManager(SingleTypeKVCacheManager):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+    ) -> int:
+        if (
+            os.environ.get("KVE_FULL_ATTN_DEFER_SAME_STEP_PREFIX") == "1"
+            and len(new_computed_blocks) > 0
+            and any(
+                block.block_hash in self.cached_blocks_this_step
+                for block in new_computed_blocks
+                if block.block_hash is not None
+            )
+        ):
+            # Full-attention prefix hits are not safe when they depend on
+            # blocks first cached earlier in the same scheduler step. Those
+            # K/V rows are produced by the model run for that step; an
+            # inheriting request scheduled into the same run can see the
+            # hash before the writer's K/V is actually materialized. Match
+            # MambaManager's same-step guard: force the request to wait for
+            # a later scheduler step, when the cached blocks are fully
+            # written.
+            return self.block_pool.num_gpu_blocks + 1
+        if (
+            os.environ.get("KVE_FULL_ATTN_DEFER_LIVE_PREFIX") == "1"
+            and len(new_computed_blocks) > 0
+            and any(
+                block.ref_cnt > 0
+                for block in new_computed_blocks
+                if not block.is_null
+            )
+        ):
+            # Stronger diagnostic: do not inherit blocks still owned by a live
+            # request. Finished prefix-cache blocks sit in the free queue with
+            # ref_cnt == 0 until touched by the inheritor; live-owned blocks
+            # have ref_cnt > 0. This tests whether paged attention is sensitive
+            # to consuming another active request's cache rows.
+            return self.block_pool.num_gpu_blocks + 1
+        return super().get_num_blocks_to_allocate(
+            request_id,
+            num_tokens,
+            new_computed_blocks,
+            total_computed_tokens,
+            num_tokens_main_model,
+        )
+
+    def cache_blocks(self, request: Request, num_tokens: int) -> None:
+        num_cached_blocks_before = self.num_cached_block.get(
+            request.request_id, 0
+        )
+        super().cache_blocks(request, num_tokens)
+        num_cached_blocks_after = self.num_cached_block.get(
+            request.request_id, 0
+        )
+        if num_cached_blocks_after > num_cached_blocks_before:
+            for block in self.req_to_blocks[request.request_id][
+                num_cached_blocks_before:num_cached_blocks_after
+            ]:
+                if block.is_null:
+                    continue
+                assert block.block_hash is not None
+                self.cached_blocks_this_step.add(block.block_hash)
+
+    def new_step_starts(self) -> None:
+        self.cached_blocks_this_step.clear()
+
     @classmethod
     def find_longest_cache_hit(
         cls,
@@ -429,7 +549,24 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
-    ) -> tuple[list[KVCacheBlock], ...]:
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        """Walk the block-hash chain, inheriting cached blocks. Tracks the
+        cached writer's position_offset frame so a request inheriting
+        post-admission K from a prior request can seed its own
+        position_offset and use the inherited K as-is (matching Q
+        rotations to K rotations).
+
+        Returns (computed_blocks_per_group, inherited_offset). The
+        inherited_offset is `cached_block.logical_start - block_idx *
+        block_size` (uniform across all post-sys inherited blocks for a
+        single writer). It's 0 when only sys-prompt blocks were
+        inherited (writer at offset=0) or when no cache hit occurred.
+
+        The chain truncates at the first block whose offset disagrees
+        with the established inherited_offset — this guards against the
+        (rare) multi-writer mixed-frame case where the chain crosses
+        between writers with different admission states.
+        """
         assert isinstance(
             kv_cache_spec, FullAttentionSpec | ChunkedLocalAttentionSpec
         ), (
@@ -443,17 +580,195 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         if dcp_world_size * pcp_world_size > 1:
             block_size *= dcp_world_size * pcp_world_size
         max_num_blocks = max_length // block_size
-        for block_hash in itertools.islice(block_hashes, max_num_blocks):
-            # block_hashes is a chain of block hashes. If a block hash is not
-            # in the cached_block_hash_to_id, the following block hashes are
-            # not computed yet for sure.
-            if cached_block := block_pool.get_cached_block(
+        # `inherited_offset` is established by the first cached block whose
+        # logical_start indicates a non-zero writer offset. Subsequent
+        # blocks must match — else we truncate to preserve uniformity
+        # within the inherited chain.
+        inherited_offset = 0
+        offset_established = False
+        import os as _diag_os
+        _diag_enabled = _diag_os.environ.get("KV_EVICTION_BUG_TRACE") == "1"
+        # New focused trace: per-block-idx outcome for the chain walk.
+        # Enable with KVE_TRACE_CACHE_HIT=1. Logs one [TRACE-HIT] line
+        # per block_idx with hash hit/miss + candidate (cb, logical_start)
+        # tuples + final chain decision, so we can see exactly where
+        # the chain truncates and why.
+        _trace_hit = _diag_os.environ.get("KVE_TRACE_CACHE_HIT") == "1"
+        if _diag_enabled or _trace_hit:
+            import logging as _diag_log
+            _diag_logger = _diag_log.getLogger("vllm.compaction_diag")
+        # Two-phase chain walk. Greedy step-by-step picking is wrong
+        # because the inheritor's eventual position_offset is determined
+        # by the chain itself, and once we commit to frame X all
+        # post-sys K rotations in the chain must be at X (a cb=0 K's
+        # rotation R(physical+0) doesn't match an inheritor's
+        # Q rotation R(physical+X)). So we look ahead: enumerate every
+        # block's candidate frames once, then pick the inheritor frame
+        # that maximizes total chain extension.
+        #
+        # Per-block candidates are a (cb_offset, [block,...]) list. Sys
+        # blocks always have cb=0 only in cache (sys is never shifted,
+        # no writer can produce a non-zero-offset sys block). Post-sys
+        # blocks may have cb=0 (from a fresh writer that never evicted)
+        # and/or cb=X (from a writer at post-admission offset X).
+        all_candidates: list[list[tuple[int, list[KVCacheBlock]]]] = []
+        for block_idx, block_hash in enumerate(
+            itertools.islice(block_hashes, max_num_blocks)
+        ):
+            candidates = block_pool.get_all_cached_blocks(
                 block_hash, kv_cache_group_ids
-            ):
-                for computed, cached in zip(computed_blocks, cached_block):
-                    computed.append(cached)
-            else:
+            )
+            if not candidates:
+                # Hash absent from cache — chain ends here naturally.
+                if _trace_hit:
+                    _diag_logger.warning(
+                        "[TRACE-HIT] block_idx=%d HASH-MISS "
+                        "(block_hash absent from block_pool — chain ends "
+                        "here, will be re-prefilled by worker)",
+                        block_idx,
+                    )
                 break
+
+            expected_zero = block_idx * block_size
+            if _trace_hit:
+                _cand_dump = [
+                    f"(block_id={c[0].block_id},"
+                    f"logical_start={c[0].logical_start},"
+                    f"cb={c[0].logical_start - expected_zero})"
+                    for c in candidates if c[0].logical_start >= 0
+                ]
+                _diag_logger.warning(
+                    "[TRACE-HIT] block_idx=%d HASH-HIT  n_candidates=%d "
+                    "expected_zero=%d  candidates=%s",
+                    block_idx, len(candidates), expected_zero,
+                    "[" + ", ".join(_cand_dump) + "]",
+                )
+
+            scored: list[tuple[int, list[KVCacheBlock]]] = []
+            for cand in candidates:
+                if cand[0].logical_start < 0:
+                    if _diag_enabled or _trace_hit:
+                        _diag_logger.warning(
+                            "[DIAG-CACHE-HIT-MINUS-ONE] block_idx=%d "
+                            "block_id=%d logical_start=-1 expected=%d "
+                            "(skipped; rotation frame unknown)",
+                            block_idx, cand[0].block_id, expected_zero,
+                        )
+                    continue
+                cb = cand[0].logical_start - expected_zero
+                if not all(
+                    b.logical_start - expected_zero == cb for b in cand
+                ):
+                    if _diag_enabled or _trace_hit:
+                        _diag_logger.warning(
+                            "[DIAG-CACHE-HIT-CROSS-GROUP-MISMATCH] "
+                            "block_idx=%d (candidate skipped)",
+                            block_idx,
+                        )
+                    continue
+                scored.append((cb, cand))
+
+            if not scored:
+                if _diag_enabled or _trace_hit:
+                    _diag_logger.warning(
+                        "[DIAG-CACHE-HIT-BREAK-NO-VALID-CANDIDATE] "
+                        "block_idx=%d (chain truncated)",
+                        block_idx,
+                    )
+                break
+            all_candidates.append(scored)
+
+        if all_candidates:
+            # Identify the sys/post-sys boundary heuristically: sys
+            # blocks have cb=0 as the ONLY available frame (no writer
+            # produces non-zero-offset sys blocks). The first block
+            # where the candidate set is not exactly {0} marks the
+            # transition. This also covers the case where a post-sys
+            # block coincidentally has only cb=0 candidates (= chain
+            # treats it as sys-like for accounting; doesn't affect
+            # correctness because cb=0 K with inheritor at offset=0
+            # is the only consistent reading).
+            sys_end = len(all_candidates)
+            for idx, scored in enumerate(all_candidates):
+                cbs = {cb for cb, _ in scored}
+                if cbs != {0}:
+                    sys_end = idx
+                    break
+
+            # Within post-sys [sys_end..], pick the frame X (including
+            # 0) that maximizes the consecutive run of blocks with a
+            # cb=X candidate. The inheritor commits to that frame.
+            post_frames: set[int] = {0}
+            for scored in all_candidates[sys_end:]:
+                for cb, _ in scored:
+                    post_frames.add(cb)
+
+            best_frame = 0
+            best_post_run = 0
+            for X in post_frames:
+                run = 0
+                for scored in all_candidates[sys_end:]:
+                    if any(cb == X for cb, _ in scored):
+                        run += 1
+                    else:
+                        break
+                if run > best_post_run:
+                    best_post_run = run
+                    best_frame = X
+
+            total_L = sys_end + best_post_run
+            if _trace_hit:
+                # Show why the chain stopped where it did.
+                if total_L < len(all_candidates):
+                    nxt = all_candidates[total_L]
+                    nxt_cbs = sorted({cb for cb, _ in nxt})
+                    _diag_logger.warning(
+                        "[TRACE-HIT] CHAIN-TRUNCATE sys_end=%d "
+                        "post_run=%d best_frame=%d total_L=%d  "
+                        "STOPPED at block_idx=%d (no candidate with "
+                        "cb=%d available; available_cbs=%s)",
+                        sys_end, best_post_run, best_frame, total_L,
+                        total_L, best_frame, nxt_cbs,
+                    )
+                else:
+                    _diag_logger.warning(
+                        "[TRACE-HIT] CHAIN-FULL sys_end=%d post_run=%d "
+                        "best_frame=%d total_L=%d (chain extended to "
+                        "the natural end of the candidate set)",
+                        sys_end, best_post_run, best_frame, total_L,
+                    )
+            if best_frame != 0:
+                inherited_offset = best_frame
+                offset_established = True
+                if _diag_enabled:
+                    _diag_logger.warning(
+                        "[DIAG-INHERIT-SEED-NONZERO] sys_end=%d "
+                        "post_run=%d seed_offset=%d (lookahead chose "
+                        "frame; total chain length=%d)",
+                        sys_end, best_post_run, best_frame, total_L,
+                    )
+
+            # Walk the chain picking blocks for the chosen plan.
+            for block_idx in range(total_L):
+                scored = all_candidates[block_idx]
+                if block_idx < sys_end:
+                    target = 0
+                else:
+                    target = best_frame
+                chosen = next((c for cb, c in scored if cb == target), None)
+                # Lookahead guarantees the candidate exists; if not,
+                # something raced. Log and stop gracefully.
+                if chosen is None:
+                    if _diag_enabled:
+                        _diag_logger.warning(
+                            "[DIAG-CACHE-HIT-RACE] block_idx=%d "
+                            "expected_cb=%d available=%s (stopping)",
+                            block_idx, target,
+                            sorted({cb for cb, _ in scored}),
+                        )
+                    break
+                for computed, cached in zip(computed_blocks, chosen):
+                    computed.append(cached)
         if use_eagle and computed_blocks[0]:
             # Need to drop the last matched block if eagle is enabled.
             for computed in computed_blocks:
@@ -464,7 +779,12 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         ):
             for computed in computed_blocks:
                 computed.pop()
-        return computed_blocks
+        # If trimming dropped all hits, the inherited_offset was based on
+        # a now-discarded block — reset to 0 so callers don't try to seed
+        # from a frame they're not actually inheriting.
+        if not computed_blocks[0]:
+            inherited_offset = 0
+        return computed_blocks, inherited_offset
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         blocks = self.req_to_blocks[running_request_id]
@@ -494,7 +814,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
-    ) -> tuple[list[KVCacheBlock], ...]:
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         assert isinstance(kv_cache_spec, SlidingWindowSpec), (
             "SlidingWindowManager can only be used for sliding window groups"
         )
@@ -570,7 +890,9 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             )
             for computed in computed_blocks:
                 computed.pop()
-        return computed_blocks
+        # SlidingWindow doesn't participate in compaction's offset frame;
+        # always returns 0 (no inherited offset to seed).
+        return computed_blocks, 0
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
@@ -627,7 +949,7 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
-    ) -> tuple[list[KVCacheBlock], ...]:
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         """
         For chunked local attention, we need to find the longest cache hit
         prefix of the blocks that is not longer than `max_length`. The prefix
@@ -705,7 +1027,9 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
                     computed.append(cached)
             else:
                 break
-        return computed_blocks
+        # ChunkedLocalAttention doesn't participate in compaction's offset
+        # frame; always returns 0 (no inherited offset to seed).
+        return computed_blocks, 0
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
@@ -787,7 +1111,7 @@ class MambaManager(SingleTypeKVCacheManager):
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
-    ) -> tuple[list[KVCacheBlock], ...]:
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         assert isinstance(kv_cache_spec, MambaSpec), (
             "MambaManager can only be used for mamba groups"
         )
@@ -821,7 +1145,8 @@ class MambaManager(SingleTypeKVCacheManager):
                     computed.append(cached)
                 break  # we just need the last match - early stopping
 
-        return computed_blocks
+        # Mamba doesn't participate in compaction's offset frame; always 0.
+        return computed_blocks, 0
 
     def remove_skipped_blocks(self, request_id: str, num_computed_tokens: int) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
@@ -998,6 +1323,18 @@ class MambaManager(SingleTypeKVCacheManager):
                 else:
                     assert num_new_blocks <= self.num_speculative_blocks + 1
                 new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+                # Stamp logical_start. Mamba doesn't use RoPE rotations,
+                # so the value is purely bookkeeping — but cache_full_blocks
+                # asserts it's set on any block being cached. Use the
+                # block's slot index in the request frame (offset=0 always
+                # for Mamba; no position_offset semantics here).
+                start_idx = len(req_blocks)
+                for i, b in enumerate(new_blocks):
+                    assert b.logical_start < 0, (
+                        f"mamba fresh block {b.block_id} should be -1 from "
+                        f"get_new_blocks, got {b.logical_start}"
+                    )
+                    b.logical_start = (start_idx + i) * self.block_size
                 req_blocks.extend(new_blocks)
                 self._allocated_block_reqs.add(request_id)
                 return req_blocks[prev_block_len:]
@@ -1069,7 +1406,7 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
-    ) -> tuple[list[KVCacheBlock], ...]:
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         assert isinstance(kv_cache_spec, CrossAttentionSpec), (
             "CrossAttentionManager can only be used for cross-attention groups"
         )

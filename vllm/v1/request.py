@@ -91,6 +91,16 @@ class Request:
         self.events: list[EngineCoreEvent] = []
         self.stop_reason: int | str | None = None
 
+        # KV cache compaction (block_aligned_finish): once generation has
+        # stopped, the scheduler may transition the request into an
+        # auto-padding step that runs one more forward over filler tokens
+        # so the trailing partial block enters the prefix cache. While
+        # `padding_pending` is True, the request is held in `self.running`
+        # and the worker should skip sampling for it.
+        self.num_padding_tokens: int = 0
+        self.padding_pending: bool = False
+        self._pending_finish_status: "RequestStatus | None" = None
+
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
 
@@ -249,6 +259,27 @@ class Request:
             self._all_token_ids.extend(token_ids)
             self.num_total_generated += len(token_ids)
 
+        self.update_block_hashes()
+
+    def append_padding_token_ids(
+        self,
+        padding_token_id: int,
+        count: int,
+    ) -> None:
+        """Append filler tokens that extend the KV cache to a block
+        boundary. Unlike append_output_token_ids these don't enter
+        `_output_token_ids` (they aren't user-facing outputs); they
+        only grow `_all_token_ids` (which `num_tokens` keys off) so
+        the next scheduling iteration's allocate_slots/cache_blocks
+        will write K/V for them and cache the resulting full block.
+
+        Used by `compaction_block_aligned_finish` (see CacheConfig).
+        """
+        if count <= 0:
+            return
+        for _ in range(count):
+            self._all_token_ids.append(padding_token_id)
+        self.num_padding_tokens += count
         self.update_block_hashes()
 
     def update_block_hashes(self) -> None:

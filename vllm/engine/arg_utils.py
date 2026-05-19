@@ -636,6 +636,12 @@ class EngineArgs:
     compaction_assume_aligned_turn_boundaries: bool = (
         CacheConfig.compaction_assume_aligned_turn_boundaries
     )
+    compaction_block_aligned_finish: bool = (
+        CacheConfig.compaction_block_aligned_finish
+    )
+    compaction_filler_token_id: int = (
+        CacheConfig.compaction_filler_token_id
+    )
     tokens_only: bool = False
 
     shutdown_timeout: int = 0
@@ -1066,6 +1072,14 @@ class EngineArgs:
         cache_group.add_argument(
             "--compaction-assume-aligned-turn-boundaries",
             **cache_kwargs["compaction_assume_aligned_turn_boundaries"],
+        )
+        cache_group.add_argument(
+            "--compaction-block-aligned-finish",
+            **cache_kwargs["compaction_block_aligned_finish"],
+        )
+        cache_group.add_argument(
+            "--compaction-filler-token-id",
+            **cache_kwargs["compaction_filler_token_id"],
         )
 
         # Model weight offload related configs
@@ -1638,6 +1652,8 @@ class EngineArgs:
             compaction_assume_aligned_turn_boundaries=(
                 self.compaction_assume_aligned_turn_boundaries
             ),
+            compaction_block_aligned_finish=self.compaction_block_aligned_finish,
+            compaction_filler_token_id=self.compaction_filler_token_id,
         )
 
         # Compaction incompatibility guards.

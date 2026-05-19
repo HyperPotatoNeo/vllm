@@ -104,6 +104,7 @@ class Scheduler(SchedulerInterface):
             defaultdict(set) if include_finished_set else None
         )
         self.prev_step_scheduled_req_ids: set[str] = set()
+        self._kve_sched_sig_step = 0
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -273,6 +274,27 @@ class Scheduler(SchedulerInterface):
         )
         self._compaction_protected_prefix = (
             self.cache_config.compaction_protected_prefix_tokens
+        )
+        # Block size of the compaction manager (cached once at init). Used
+        # to block-align protected_prefix_len in `_ppl()` so the piecewise
+        # position rule transitions at a block boundary — RoPE rotations
+        # are baked into K at write time at block granularity, so the Q
+        # rotation gate must also be block-aligned to avoid partial-block
+        # frame mismatches at the sys/post-sys boundary.
+        self._compaction_block_size = 0
+        if self._compaction_enabled:
+            for mgr in self.kv_cache_manager.coordinator.single_type_managers:
+                if isinstance(mgr, CompactingKVCacheManager):
+                    self._compaction_block_size = mgr.block_size
+                    break
+        # Auto-pad the trailing partial block at request finish (see
+        # `compaction_block_aligned_finish` in CacheConfig). Cached at
+        # init for the hot-path check in `update_from_output`.
+        self._compaction_block_aligned_finish = (
+            self.cache_config.compaction_block_aligned_finish
+        )
+        self._compaction_filler_token_id = (
+            self.cache_config.compaction_filler_token_id
         )
         # Turn-mode compaction state.
         self._compaction_max_turns = self.cache_config.compaction_max_turns
@@ -468,6 +490,13 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.new_step_starts()
 
         # First, schedule the RUNNING requests.
+        if self._compaction_block_aligned_finish:
+            _pad_pend = [r.request_id[:8] for r in self.running if r.padding_pending]
+            if _pad_pend:
+                logger.info(
+                    "[COMPACT/auto-pad] schedule(): %d padding-pending in running queue: %s",
+                    len(_pad_pend), _pad_pend,
+                )
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
@@ -647,8 +676,23 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
+        pad_pending_barrier = (
+            os.environ.get("KVE_PAD_PENDING_BARRIER") == "1"
+            and any(req.padding_pending for req in scheduled_running_reqs)
+        )
+        if pad_pending_barrier:
+            logger.info(
+                "[SCHED-DIAG] padding-pending barrier: deferring waiting "
+                "requests until padding forwards complete; scheduled=%s",
+                [req.request_id[:8] for req in scheduled_running_reqs],
+            )
+
         # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+        if (
+            not preempted_reqs
+            and self._pause_state == PauseState.UNPAUSED
+            and not pad_pending_barrier
+        ):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
@@ -692,13 +736,277 @@ class Scheduler(SchedulerInterface):
                 num_external_computed_tokens = 0
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
+                pending_inherit_event: CompactionEvent | None = None
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
+                    trace_prefix_dep = os.environ.get("KVE_TRACE_PREFIX_DEP") == "1"
+                    drop_unready_prefix_dep = (
+                        os.environ.get("KVE_DROP_UNREADY_PREFIX_DEPS") == "1"
+                    )
+                    drop_live_prefix_dep = (
+                        os.environ.get("KVE_DROP_LIVE_PREFIX_DEPS") == "1"
+                    )
+                    truncate_unready_prefix_dep = (
+                        os.environ.get("KVE_TRUNCATE_UNREADY_PREFIX_DEPS") == "1"
+                    )
+                    truncate_live_prefix_dep = (
+                        os.environ.get("KVE_TRUNCATE_LIVE_PREFIX_DEPS") == "1"
+                    )
+                    live_block_owner = {}
+                    if (
+                        trace_prefix_dep
+                        or drop_unready_prefix_dep
+                        or drop_live_prefix_dep
+                        or truncate_unready_prefix_dep
+                        or truncate_live_prefix_dep
+                    ):
+                        for live_request in self.running:
+                            live_blocks = self.kv_cache_manager.get_blocks(
+                                live_request.request_id
+                            )
+                            live_status = getattr(
+                                live_request.status, "name", str(live_request.status)
+                            )
+                            for live_group_idx, live_group in enumerate(
+                                live_blocks.blocks
+                            ):
+                                for live_block_idx, live_block in enumerate(live_group):
+                                    live_block_owner.setdefault(
+                                        live_block.block_id,
+                                        (
+                                            live_request.request_id[:8],
+                                            live_group_idx,
+                                            live_block_idx,
+                                            bool(live_request.padding_pending),
+                                            live_request.num_computed_tokens,
+                                            live_request.num_tokens,
+                                            live_status,
+                                        ),
+                                    )
+
                     # Get locally-cached tokens.
-                    new_computed_blocks, num_new_local_computed_tokens = (
+                    new_computed_blocks, num_new_local_computed_tokens, inherited_offset = (
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
+                    if (
+                        (trace_prefix_dep
+                         or drop_unready_prefix_dep
+                         or drop_live_prefix_dep
+                         or truncate_unready_prefix_dep
+                         or truncate_live_prefix_dep)
+                        and num_new_local_computed_tokens > 0
+                    ):
+                        dep_count = 0
+                        unready_count = 0
+                        first_live_dep_block_idx = None
+                        first_unready_dep_block_idx = None
+                        dep_samples = []
+                        unready_samples = []
+                        for group_idx, group in enumerate(new_computed_blocks.blocks):
+                            for block_idx, block in enumerate(group):
+                                owner = live_block_owner.get(block.block_id)
+                                if owner is None:
+                                    continue
+                                (
+                                    owner_req_id,
+                                    owner_group_idx,
+                                    owner_block_idx,
+                                    owner_padding_pending,
+                                    owner_num_computed,
+                                    owner_num_tokens,
+                                    owner_status,
+                                ) = owner
+                                if owner_req_id == request.request_id[:8]:
+                                    continue
+                                dep_count += 1
+                                if first_live_dep_block_idx is None:
+                                    first_live_dep_block_idx = block_idx
+                                owner_block_end = (
+                                    owner_block_idx + 1
+                                ) * self._compaction_block_size
+                                owner_unready = (
+                                    self._compaction_block_size > 0
+                                    and owner_num_computed < owner_block_end
+                                )
+                                if owner_unready:
+                                    unready_count += 1
+                                    if first_unready_dep_block_idx is None:
+                                        first_unready_dep_block_idx = block_idx
+                                if len(dep_samples) < 8:
+                                    dep_samples.append(
+                                        "g%d:b%d:id=%d->req=%s/g%d:b%d/"
+                                        "pending=%d/computed=%d/%d/status=%s"
+                                        % (
+                                            group_idx,
+                                            block_idx,
+                                            block.block_id,
+                                            owner_req_id,
+                                            owner_group_idx,
+                                            owner_block_idx,
+                                            int(owner_padding_pending),
+                                            owner_num_computed,
+                                            owner_num_tokens,
+                                            owner_status,
+                                        )
+                                    )
+                                if owner_unready and len(unready_samples) < 8:
+                                    unready_samples.append(
+                                        "g%d:b%d:id=%d->req=%s/g%d:b%d/"
+                                        "computed=%d/%d"
+                                        % (
+                                            group_idx,
+                                            block_idx,
+                                            block.block_id,
+                                            owner_req_id,
+                                            owner_group_idx,
+                                            owner_block_idx,
+                                            owner_num_computed,
+                                            owner_num_tokens,
+                                        )
+                                    )
+                        logger.warning(
+                            "[PREFIX-DEP] req=%s cached=%d prompt=%d "
+                            "deps=%d unready=%d samples=%s unready_samples=%s",
+                            request.request_id[:8],
+                            num_new_local_computed_tokens,
+                            request.num_tokens,
+                            dep_count,
+                            unready_count,
+                            dep_samples,
+                            unready_samples,
+                        )
+                        truncate_at = None
+                        truncate_reason = ""
+                        if (
+                            truncate_unready_prefix_dep
+                            and first_unready_dep_block_idx is not None
+                        ):
+                            truncate_at = first_unready_dep_block_idx
+                            truncate_reason = "unready"
+                        elif (
+                            truncate_live_prefix_dep
+                            and first_live_dep_block_idx is not None
+                        ):
+                            truncate_at = first_live_dep_block_idx
+                            truncate_reason = "live"
+                        if truncate_at is not None:
+                            old_cached_tokens = num_new_local_computed_tokens
+                            safe_blocks = max(0, truncate_at)
+                            truncated = tuple(
+                                list(group[:safe_blocks])
+                                for group in new_computed_blocks.blocks
+                            )
+                            new_computed_blocks = (
+                                self.kv_cache_manager.create_kv_cache_blocks(
+                                    truncated
+                                )
+                            )
+                            num_new_local_computed_tokens = (
+                                safe_blocks * self._compaction_block_size
+                            )
+                            inherited_offset = 0
+                            if num_new_local_computed_tokens > 0:
+                                for block_idx, block in enumerate(
+                                    new_computed_blocks.blocks[0]
+                                ):
+                                    if block.logical_start < 0:
+                                        continue
+                                    block_offset = (
+                                        block.logical_start
+                                        - block_idx
+                                        * self._compaction_block_size
+                                    )
+                                    if block_offset != 0:
+                                        inherited_offset = block_offset
+                                        break
+                            request.position_offset = inherited_offset
+                            logger.warning(
+                                "[PREFIX-DEP-TRUNC] req=%s reason=%s "
+                                "cached=%d->%d blocks=%d->%d deps=%d "
+                                "unready=%d inherited_offset=%d",
+                                request.request_id[:8],
+                                truncate_reason,
+                                old_cached_tokens,
+                                num_new_local_computed_tokens,
+                                old_cached_tokens
+                                // max(1, self._compaction_block_size),
+                                safe_blocks,
+                                dep_count,
+                                unready_count,
+                                inherited_offset,
+                            )
+                        should_drop_live_dep = (
+                            (drop_live_prefix_dep and dep_count > 0)
+                            or (drop_unready_prefix_dep and unready_count > 0)
+                        )
+                        if should_drop_live_dep:
+                            logger.warning(
+                                "[PREFIX-DEP-DROP] req=%s dropping local "
+                                "prefix hit cached=%d prompt=%d deps=%d "
+                                "unready=%d inherited_offset=%d",
+                                request.request_id[:8],
+                                num_new_local_computed_tokens,
+                                request.num_tokens,
+                                dep_count,
+                                unready_count,
+                                inherited_offset,
+                            )
+                            new_computed_blocks = (
+                                self.kv_cache_manager.empty_kv_cache_blocks
+                            )
+                            num_new_local_computed_tokens = 0
+                            inherited_offset = 0
+                            request.position_offset = 0
+                    # Build the synthetic inherit event now, but only append it
+                    # after allocate_slots succeeds. Some prefix-readiness
+                    # diagnostics intentionally defer a WAITING request after
+                    # get_computed_blocks seeded position_offset; appending here
+                    # would leave stale trainer metadata on the retry.
+                    if (
+                        num_new_local_computed_tokens > 0
+                        and self._compaction_enabled
+                        and self._compaction_max_turns > 0
+                    ):
+                        sys_boundary_raw = self._effective_prompt_tokens(request)
+                        # Block-align to match inference's piecewise rule
+                        # (which now uses block-aligned protected_prefix_len
+                        # via _ppl). The trainer's per_call_segmented_forward
+                        # uses evict_start as the piecewise split, so both
+                        # sides must use the same block-aligned boundary
+                        # or trainer-K and inference-K diverge on the
+                        # boundary block's post-sys slots.
+                        bs = self._compaction_block_size
+                        if bs > 0:
+                            sys_boundary = (
+                                (sys_boundary_raw + bs - 1) // bs
+                            ) * bs
+                            sys_boundary = min(
+                                sys_boundary, request.num_prompt_tokens
+                            )
+                        else:
+                            sys_boundary = sys_boundary_raw
+                        # new_user_fragment_len: length of the prompt past
+                        # the inherited tail (the truly NEW content this
+                        # call submitted). Asserted > 0 by the trainer.
+                        nuf_len = max(
+                            1,
+                            request.num_prompt_tokens
+                            - num_new_local_computed_tokens,
+                        )
+                        pending_inherit_event = CompactionEvent(
+                            num_output_tokens_at_compaction=0,  # admission-shape
+                            tokens_evicted=0,
+                            position_offset_after=inherited_offset,
+                            num_prompt_tokens=request.num_prompt_tokens,
+                            evict_start=sys_boundary,
+                            evicted_token_ids=[],
+                            last_turn_evicted=-1,
+                            num_turns_evicted_after=request.num_turns_evicted,
+                            kept_indices=[],  # identity / not used by trainer
+                            kept_token_ids=[],  # not used by trainer for this event
+                            new_user_fragment_len=nuf_len,
+                        )
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -712,6 +1020,8 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
+                            if pending_inherit_event is not None:
+                                request.position_offset = 0
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
@@ -762,6 +1072,8 @@ class Scheduler(SchedulerInterface):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        if pending_inherit_event is not None:
+                            request.position_offset = 0
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
@@ -783,6 +1095,8 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
+                            if pending_inherit_event is not None:
+                                request.position_offset = 0
                             break
 
                 if self.need_mamba_block_aligned_split:
@@ -793,6 +1107,8 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens,
                     )
                     if num_new_tokens == 0:
+                        if pending_inherit_event is not None:
+                            request.position_offset = 0
                         break
 
                 # Handles an edge case when P/D Disaggregation
@@ -828,6 +1144,8 @@ class Scheduler(SchedulerInterface):
                 ):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if pending_inherit_event is not None:
+                        request.position_offset = 0
                     break
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
@@ -848,7 +1166,24 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if pending_inherit_event is not None:
+                        request.position_offset = 0
                     break
+
+                if pending_inherit_event is not None:
+                    request.compaction_events.append(pending_inherit_event)
+                    logger.info(
+                        "[COMPACT/inherit] req=%s seeded "
+                        "position_offset=%d (sys=%d, nuf_len=%d, "
+                        "cached_tokens=%d); synthetic event emitted "
+                        "for trainer mirror",
+                        request.request_id[:8],
+                        pending_inherit_event.position_offset_after,
+                        pending_inherit_event.evict_start,
+                        pending_inherit_event.new_user_fragment_len,
+                        request.num_prompt_tokens
+                        - pending_inherit_event.new_user_fragment_len,
+                    )
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -932,6 +1267,14 @@ class Scheduler(SchedulerInterface):
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
 
+                if os.environ.get("KVE_SERIALIZE_WAITING_REQUESTS") == "1":
+                    logger.info(
+                        "[SCHED-DIAG] scheduled one waiting request; "
+                        "deferring remaining waiting requests to the next "
+                        "engine step"
+                    )
+                    break
+
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
@@ -978,6 +1321,14 @@ class Scheduler(SchedulerInterface):
                 )
 
         # Construct the scheduler output.
+        # Compute protected_prefix_len per request for the 2-piece
+        # position fix (plans/piecewise_position_offset.md). When
+        # compaction is disabled this is 0 (no offset is ever applied
+        # anyway). For compacted requests this is the sys boundary that
+        # the worker uses to gate position_offset application.
+        def _ppl(req: Request) -> int:
+            return self._worker_protected_prefix_len(req)
+
         if self.use_v2_model_runner:
             scheduled_new_reqs = scheduled_new_reqs + scheduled_resumed_reqs
             scheduled_resumed_reqs = []
@@ -986,13 +1337,16 @@ class Scheduler(SchedulerInterface):
                     req,
                     req_to_new_blocks[req.request_id].get_block_ids(),
                     req._all_token_ids,
+                    protected_prefix_len=_ppl(req),
                 )
                 for req in scheduled_new_reqs
             ]
         else:
             new_reqs_data = [
                 NewRequestData.from_request(
-                    req, req_to_new_blocks[req.request_id].get_block_ids()
+                    req,
+                    req_to_new_blocks[req.request_id].get_block_ids(),
+                    protected_prefix_len=_ppl(req),
                 )
                 for req in scheduled_new_reqs
             ]
@@ -1016,6 +1370,77 @@ class Scheduler(SchedulerInterface):
             else None
         )
 
+        # KV cache compaction auto-pad: collect request IDs whose
+        # scheduled tokens are filler padding (no sampling for these).
+        no_sample_req_ids: set[str] = set()
+        if self._compaction_block_aligned_finish:
+            for req_id in num_scheduled_tokens:
+                req = self.requests.get(req_id)
+                if req is not None and req.padding_pending:
+                    no_sample_req_ids.add(req_id)
+
+        if os.environ.get("KVE_TRACE_SCHED_SIG", "0") == "1":
+            self._kve_sched_sig_step += 1
+            req_range_env = os.environ.get("KVE_TRACE_SCHED_REQ_NUM_RANGE", "")
+            req_nums: set[int] | None = None
+            if req_range_env:
+                req_nums = set()
+                for part in req_range_env.split(","):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    if ":" in part:
+                        lo_s, hi_s = part.split(":", 1)
+                        lo, hi = int(lo_s), int(hi_s)
+                        req_nums.update(range(lo, hi + 1))
+                    else:
+                        req_nums.add(int(part))
+
+            def _req_num(req_id: str) -> int | None:
+                try:
+                    return int(req_id.split("-", 1)[0])
+                except (TypeError, ValueError):
+                    return None
+
+            for req_id, num_sched in num_scheduled_tokens.items():
+                req_num = _req_num(req_id)
+                if req_nums is not None and req_num not in req_nums:
+                    continue
+                req = self.requests.get(req_id)
+                if req is None:
+                    continue
+                pre = req.num_computed_tokens
+                post = pre + num_sched
+                if req.padding_pending:
+                    phase = "pad"
+                elif pre < req.num_prompt_tokens:
+                    phase = "prefill" if post <= req.num_prompt_tokens else "mixed"
+                else:
+                    phase = "decode"
+                token_ids = req.all_token_ids[pre:post]
+                logger.warning(
+                    "[SCHED-SIG] step=%d req=%s req_num=%s phase=%s "
+                    "sched=%d pre=%d post=%d prompt=%d tokens=%d "
+                    "cached=%d pos_off=%d pad_pending=%s no_sample=%s "
+                    "events=%d tok_head=%s tok_tail=%s",
+                    self._kve_sched_sig_step,
+                    req_id[:12],
+                    str(req_num),
+                    phase,
+                    num_sched,
+                    pre,
+                    post,
+                    req.num_prompt_tokens,
+                    req.num_tokens,
+                    req.num_cached_tokens,
+                    req.position_offset,
+                    req.padding_pending,
+                    req_id in no_sample_req_ids,
+                    len(req.compaction_events or []),
+                    token_ids[:8],
+                    token_ids[-8:],
+                )
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1032,6 +1457,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            no_sample_req_ids=no_sample_req_ids,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1201,6 +1627,24 @@ class Scheduler(SchedulerInterface):
             return min(boundary, request.num_prompt_tokens)
         return request.num_prompt_tokens
 
+    def _worker_protected_prefix_len(self, request: Request) -> int:
+        """Protected-prefix boundary shipped to the worker.
+
+        The raw protected prefix can end in the middle of a KV block, but
+        prefix-cache reuse is block-granular. The worker's piecewise RoPE
+        gate must therefore transition on a block boundary so a cached block
+        is not interpreted partly in the no-offset frame and partly in the
+        post-admission offset frame.
+        """
+        if not self._compaction_enabled:
+            return 0
+        sys_end = self._effective_prompt_tokens(request)
+        bs = self._compaction_block_size
+        if bs > 0 and sys_end > 0:
+            sys_end = ((sys_end + bs - 1) // bs) * bs
+            sys_end = min(sys_end, request.num_prompt_tokens)
+        return sys_end
+
     def _should_compact(self, request: Request) -> bool:
         """Check if compaction should fire for this request.
 
@@ -1347,6 +1791,16 @@ class Scheduler(SchedulerInterface):
                 continue
 
             pre_prompt = request.num_prompt_tokens
+            # Snapshot the pre-eviction "new user fragment" length: this
+            # is the number of prompt tokens that have NOT been written
+            # to KV cache yet (= the tail past the prefix-cache match).
+            # Invariant: compaction must never drop these — they're the
+            # user's freshly-submitted content. If the post-eviction
+            # residual is smaller, V silently truncated the user's
+            # prompt (typically because turn-boundary block-align
+            # snapped past `cached_tokens` into the new_user region).
+            pre_new_user_len = pre_prompt - request.num_computed_tokens
+            pre_cached_tokens = request.num_computed_tokens
             # The prefill kernel runs AFTER this method returns, so at
             # eviction time `num_computed_tokens` reflects only the
             # prefix-cache hits (0 for cold-cache). Pass the post-prefill
@@ -1364,6 +1818,38 @@ class Scheduler(SchedulerInterface):
             total_evicted = pre_prompt - request.num_prompt_tokens
             if total_evicted <= 0:
                 continue
+            # ── DIAGNOSTIC ASSERT: compaction must not drop new-user
+            # content. The post-eviction "residual prefill" length
+            # (num_prompt_post - num_computed_post) is what the worker
+            # will prefill in this step. It MUST equal the pre-eviction
+            # new_user_fragment length (= the tail past the original
+            # prefix-cache match). If it's smaller, V evicted past the
+            # cache boundary and dropped tokens the user submitted but
+            # V never wrote to KV — they will not appear in any K/V
+            # cache row, silently truncating the user's prompt.
+            # Gated by env var so this stays opt-in; flip on during
+            # diagnostic runs to surface drops, off in production.
+            if os.environ.get("KVE_ASSERT_NO_NEW_USER_DROP", "") == "1":
+                post_new_user_len = (
+                    request.num_prompt_tokens - request.num_computed_tokens
+                )
+                assert post_new_user_len == pre_new_user_len, (
+                    f"[COMPACT/assert] req={req_id[:8]} compaction "
+                    f"dropped new-user content: pre_new_user_len="
+                    f"{pre_new_user_len} post_new_user_len="
+                    f"{post_new_user_len} (delta="
+                    f"{pre_new_user_len - post_new_user_len} tokens "
+                    f"truncated from the user's prompt). "
+                    f"pre_cached_tokens={pre_cached_tokens} "
+                    f"pre_prompt={pre_prompt} "
+                    f"post_prompt={request.num_prompt_tokens} "
+                    f"post_computed={request.num_computed_tokens} "
+                    f"total_evicted={total_evicted}. "
+                    f"This means `_plan_turn_evict_range` chose an "
+                    f"evict_end that crossed `cached_tokens` (likely "
+                    f"because block-align-up of the turn boundary "
+                    f"snapped past the prefix-cache match)."
+                )
             # Recompute `num_scheduled_tokens` from post-eviction state.
             # Naively subtracting `total_evicted` from `num_new` is wrong
             # under partial / warm prefix-cache hits: when the cache
@@ -1503,7 +1989,9 @@ class Scheduler(SchedulerInterface):
             + list(request._all_token_ids[evict_end:pre_event_len])
         )
 
-        # Record event BEFORE mutating state.
+        # Compute event metadata that we'll use AFTER _apply_trim and
+        # smart-bump. The event itself is emitted later so that
+        # `position_offset_after` reflects the FINAL post-bump value.
         if self._compaction_max_turns > 0:
             num_turns_evicted_after = (
                 request.num_turns_evicted + stride_used
@@ -1519,34 +2007,16 @@ class Scheduler(SchedulerInterface):
         new_user_fragment_len = self._compute_new_user_fragment_len(
             request, evict_end
         ) if post_prefill_admission else 0
-        event = CompactionEvent(
-            num_output_tokens_at_compaction=(
-                0 if post_prefill_admission else request.num_total_generated
-            ),
-            tokens_evicted=total_evicted,
-            position_offset_after=request.position_offset + total_evicted,
-            num_prompt_tokens=request.num_prompt_tokens,
-            evict_start=evict_start,
-            evicted_token_ids=evicted_token_ids,
-            last_turn_evicted=last_turn_evicted,
-            num_turns_evicted_after=num_turns_evicted_after,
-            kept_indices=kept_indices,
-            kept_token_ids=kept_token_ids,
-            new_user_fragment_len=new_user_fragment_len,
-        )
-        request.compaction_events.append(event)
 
         logger.warning(
             "[COMPACT] req=%s effective_prompt=%d num_prompt=%d "
-            "evict=[%d,%d) total=%d generated=%d events=%d "
-            "turn_mode=%s last_turn=%d",
+            "evict=[%d,%d) total=%d generated=%d turn_mode=%s last_turn=%d",
             request.request_id[:8],
             effective_prompt,
             request.num_prompt_tokens,
             evict_start, evict_end,
             total_evicted,
             request.num_total_generated,
-            len(request.compaction_events),
             self._compaction_max_turns > 0,
             last_turn_evicted,
         )
@@ -1580,60 +2050,118 @@ class Scheduler(SchedulerInterface):
                 request.position_offset,
             )
 
-        # ──── Monotonic-position fix for chained admission ────
-        # If admission's prefix-cache hit pulled in K vectors beyond
-        # evict_end (= survivors), those K have logical positions baked
-        # in from a PRIOR admission's position_offset. The new prefill
-        # will write K at logical = physical + this_admission's_offset,
-        # which can collide with the survivors' logical positions
-        # (e.g. survivors at logical [96..111] from step N-1's prefill,
-        # new prefill at logical [64..99] from step N's offset bump
-        # → duplicate logical positions in cache → garbage attention).
+        # ──── Smart position_offset bump (piecewise position fix) ────
+        # Goal: ensure new K writes after this admission land at
+        # logical positions ABOVE all surviving K. Achieved by bumping
+        # position_offset to max(simple_bump, max_survivor_logical + 1
+        # - num_computed_post). Survivors STAY in cache (no re-prefill).
         #
-        # Free ONLY the survivor cache blocks (not the pre-allocated
-        # empty blocks beyond them) so the post-admission cache has only
-        # the protected prefix [0, evict_start), and force re-prefill of
-        # the rest at the new offset. The pre-allocated empty blocks are
-        # preserved so the prefill has slots to write into.
+        # This relies on per-block logical_start being populated at
+        # allocation time (Phase A of plans/piecewise_position_offset.md).
+        # The GPU's position computation must apply the bumped offset
+        # ONLY to physical positions >= protected_prefix_len (Phase D),
+        # so sys K at logical [0..protected_prefix_len) keeps offset=0
+        # and stays correct.
         #
         # Gate on prompt_tokens_evicted > 0 to apply only on admission
-        # (mid-gen evicts OUTPUT and its survivor K positions don't
-        # collide because they were written under the same offset that
-        # subsequent decode will use).
-        if prompt_tokens_evicted > 0 and request.num_computed_tokens > evict_start:
+        # (mid-gen evicts OUTPUT; its survivor K share the same offset
+        # as subsequent decode writes, so the simple bump is sufficient).
+        if prompt_tokens_evicted > 0 and request.num_computed_tokens > 0:
             blocks = compaction_mgr.req_to_blocks[request.request_id]
-            protected_blocks = evict_start // block_size
-            # num_computed_post counts the cached K (post-admission). Blocks
-            # in [protected_blocks, num_cached_blocks_post) are the survivors
-            # we need to drop. Blocks beyond num_cached_blocks_post are
-            # pre-allocated EMPTY slots reserved for prefill — leave them.
-            num_cached_blocks_post = (
+            # Only scan blocks that ACTUALLY have K written. Blocks beyond
+            # num_cached_blocks are pre-allocated empty slots for upcoming
+            # prefill — they have logical_start stamped (from Phase A) but
+            # no K vectors yet, so they shouldn't constrain the offset.
+            num_cached_blocks = (
                 request.num_computed_tokens + block_size - 1
             ) // block_size
-            survivor_blocks = blocks[protected_blocks:num_cached_blocks_post]
-            if survivor_blocks:
-                if getattr(compaction_mgr.block_pool, "enable_caching", False):
-                    for blk in survivor_blocks:
-                        compaction_mgr.block_pool._maybe_evict_cached_block(blk)
-                compaction_mgr.block_pool.free_blocks(survivor_blocks)
-                # Splice out the survivor blocks; pre-allocated empty
-                # blocks shift down to fill the gap.
-                del blocks[protected_blocks:num_cached_blocks_post]
-                prev_num_computed = request.num_computed_tokens
-                request.num_computed_tokens = evict_start
-                logger.warning(
-                    "[COMPACT-MONO] req=%s freed %d survivor blocks "
-                    "(indices [%d, %d)) beyond evict_start=%d; "
-                    "num_computed: %d -> %d (forcing re-prefill to "
-                    "ensure monotonic K positions)",
-                    request.request_id[:8],
-                    len(survivor_blocks),
-                    protected_blocks,
-                    num_cached_blocks_post,
-                    evict_start,
-                    prev_num_computed,
-                    request.num_computed_tokens,
+            max_survivor_logical = -1
+            for b in blocks[:num_cached_blocks]:
+                if b.logical_start >= 0:
+                    max_survivor_logical = max(
+                        max_survivor_logical,
+                        b.logical_start + block_size - 1,
+                    )
+            if max_survivor_logical >= 0:
+                required_offset = (
+                    max_survivor_logical + 1
+                    - request.num_computed_tokens
                 )
+                if required_offset > request.position_offset:
+                    logger.warning(
+                        "[COMPACT-SMART] req=%s position_offset %d -> %d "
+                        "(max_survivor_logical=%d, num_computed_post=%d). "
+                        "Survivors kept in cache; new prefill writes "
+                        "above all survivor positions.",
+                        request.request_id[:8],
+                        request.position_offset,
+                        required_offset,
+                        max_survivor_logical,
+                        request.num_computed_tokens,
+                    )
+                    request.position_offset = required_offset
+
+            # Re-stamp logical_start on the "future-K" blocks (those past
+            # num_cached_blocks — pre-allocated for upcoming prefill but
+            # not yet written). They were stamped at allocate_new_blocks
+            # time with the PRE-admission position_offset. After admission
+            # bumps position_offset, the worker's forward will rotate K at
+            # the NEW offset, so logical_start must match — otherwise a
+            # FUTURE inheritor that hits these blocks via prefix-cache
+            # will compute the wrong seed offset, causing accumulated
+            # Q-K rotation drift across inheritance generations.
+            new_offset = request.position_offset
+            for new_idx, b in enumerate(blocks[num_cached_blocks:],
+                                        start=num_cached_blocks):
+                if b.logical_start >= 0:
+                    correct_logical_start = new_idx * block_size + new_offset
+                    if b.logical_start != correct_logical_start:
+                        if os.environ.get("KV_EVICTION_BUG_TRACE") == "1":
+                            logger.warning(
+                                "[COMPACT-RESTAMP] req=%s block_id=%d "
+                                "idx=%d logical_start %d -> %d "
+                                "(post-admission new-K block)",
+                                request.request_id[:8], b.block_id,
+                                new_idx, b.logical_start,
+                                correct_logical_start,
+                            )
+                        b.logical_start = correct_logical_start
+
+        # Emit the CompactionEvent NOW — after _apply_trim and the smart
+        # bump have both run. `request.position_offset` is the final
+        # post-bump value; trainer's `position_offset_after` mirror must
+        # match this exactly (mismatch produces Q-K rotation drift across
+        # the trainer/inference boundary). Prior code emitted the event
+        # before mutation, relying on smart-bump never raising above the
+        # simple bump — which empirically held but isn't a load-bearing
+        # invariant. With cross-request offset inheritance (seeded
+        # position_offset on prefix-cache hit) smart-bump may fire more
+        # often, so the post-mutation emission becomes load-bearing.
+        event = CompactionEvent(
+            num_output_tokens_at_compaction=(
+                0 if post_prefill_admission else request.num_total_generated
+            ),
+            tokens_evicted=total_evicted,
+            position_offset_after=request.position_offset,
+            num_prompt_tokens=request.num_prompt_tokens,
+            evict_start=evict_start,
+            evicted_token_ids=evicted_token_ids,
+            last_turn_evicted=last_turn_evicted,
+            num_turns_evicted_after=num_turns_evicted_after,
+            kept_indices=kept_indices,
+            kept_token_ids=kept_token_ids,
+            new_user_fragment_len=new_user_fragment_len,
+        )
+        request.compaction_events.append(event)
+        if os.environ.get("KV_EVICTION_BUG_TRACE") == "1":
+            logger.warning(
+                "[COMPACT-EVENT] req=%s evict_start=%d total=%d "
+                "position_offset_after=%d events=%d",
+                request.request_id[:8],
+                evict_start, total_evicted,
+                request.position_offset,
+                len(request.compaction_events),
+            )
 
         return total_evicted
 
@@ -2078,6 +2606,7 @@ class Scheduler(SchedulerInterface):
         rebuild_req_ids: set[str] = set()
         position_offsets: dict[str, int] = {}
         prompt_lengths: dict[str, int] = {}
+        protected_prefix_lens: dict[str, int] = {}
 
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
@@ -2106,6 +2635,15 @@ class Scheduler(SchedulerInterface):
                 rebuild_req_ids.add(req_id)
                 position_offsets[req_id] = req.position_offset
                 prompt_lengths[req_id] = req.num_prompt_tokens
+                # Ship the request's protected_prefix_len so the worker
+                # can apply the 2-piece position rule (Phase D). Static
+                # per request after admission, so we only send it on
+                # rebuild events (= when admission fired or other state
+                # mutations require a worker resync).
+                if self._compaction_enabled:
+                    protected_prefix_lens[req_id] = (
+                        self._worker_protected_prefix_len(req)
+                    )
                 all_token_ids[req_id] = req.all_token_ids.copy()
                 # Send full block_ids (not just new) for rebuild.
                 full_block_ids = tuple(
@@ -2145,6 +2683,7 @@ class Scheduler(SchedulerInterface):
             rebuild_req_ids=rebuild_req_ids,
             position_offsets=position_offsets,
             prompt_lengths=prompt_lengths,
+            protected_prefix_lens=protected_prefix_lens,
         )
 
     def _try_schedule_encoder_inputs(
@@ -2443,20 +2982,141 @@ class Scheduler(SchedulerInterface):
 
             routed_experts = None
             finish_reason = None
+            padding_token_ids_for_output: list[int] | None = None
             if stopped:
                 routed_experts = self._get_routed_experts(request)
 
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
+
+                # Compaction auto-pad: when enabled, defer the actual
+                # free + worker-finish-notification by one step so the
+                # next `schedule()` iter can prefill `pad_len` filler
+                # tokens, land the trailing partial block in the prefix
+                # cache, and only then free. The output (EOS + completion
+                # tokens) is still emitted THIS step exactly as before —
+                # we just keep the request alive internally for one more
+                # forward.
+                auto_pad_active = (
+                    self._compaction_block_aligned_finish
+                    and self.cache_config.enable_prefix_caching
+                    and self._compaction_block_size > 0
+                    and not request.padding_pending
+                    and status_before_stop == RequestStatus.RUNNING
+                    and request.num_tokens % self._compaction_block_size != 0
+                    and not request.streaming_queue
+                )
+                if auto_pad_active:
+                    pad_len = self._compaction_block_size - (
+                        request.num_tokens % self._compaction_block_size
+                    )
+                    pre_pad_num_tokens = request.num_tokens
+                    request.append_padding_token_ids(
+                        self._compaction_filler_token_id,
+                        pad_len,
+                    )
+                    # Surface the padding ids on this step's output. The
+                    # orchestrator forwards them to the trainer (which
+                    # appends them to its pre-trim K-cache contribution
+                    # for THIS call) and to vLLM's prefix cache lookup
+                    # for the NEXT call (which inherits these blocks).
+                    padding_token_ids_for_output = [
+                        self._compaction_filler_token_id
+                    ] * pad_len
+                    # Stash the original finish status so we can restore
+                    # it after the padding step (FINISHED_STOPPED vs
+                    # FINISHED_LENGTH_CAPPED is user-visible).
+                    request._pending_finish_status = request.status
+                    request.padding_pending = True
+                    request.status = RequestStatus.RUNNING
+                    # CRITICAL: force the next schedule() iter to ship
+                    # the UPDATED all_token_ids (incl. the padding ids
+                    # we just appended) to the worker. Without this,
+                    # `_make_cached_request_data` treats the request
+                    # as already-scheduled (it WAS scheduled in this
+                    # step) and skips the all_token_ids copy, so the
+                    # worker's token_ids_cpu still holds stale slots
+                    # at [pre_pad_num_tokens..num_tokens) and the
+                    # auto-pad forward writes K for the wrong tokens.
+                    # The K-dump diagnostic (debug/compare_kv.py)
+                    # confirmed this: V's K at the auto-pad slots was
+                    # not the filler token's K at any plausible
+                    # position. Setting needs_rebuild=True routes
+                    # through the rebuild branch in
+                    # `_make_cached_request_data`, which always
+                    # re-ships all_token_ids verbatim.
+                    request.needs_rebuild = True
+                    self.prev_step_scheduled_req_ids.discard(
+                        request.request_id
+                    )
+                    logger.info(
+                        "[COMPACT/auto-pad] req=%s appended %d filler "
+                        "tokens (pre=%d post=%d, block=%d); next step "
+                        "will prefill the padding to land the final "
+                        "block in the prefix cache",
+                        request.request_id[:8],
+                        pad_len,
+                        pre_pad_num_tokens,
+                        request.num_tokens,
+                        self._compaction_block_size,
+                    )
+                    # Output still emitted via routed_experts /
+                    # finish_reason set above. Skip _handle_stopped_request
+                    # and _free_request — the request stays in self.running
+                    # for the next schedule() iter to prefill the padding
+                    # tokens. Don't add to stopped_running_reqs (we want
+                    # it kept). Don't add to finished_req_ids (we want
+                    # the worker to keep its input_batch entry).
+                else:
+                    finished = self._handle_stopped_request(request)
+                    if finished:
+                        kv_transfer_params = self._free_request(request)
+
+                    if status_before_stop == RequestStatus.RUNNING:
+                        stopped_running_reqs.add(request)
+                    else:
+                        stopped_preempted_reqs.add(request)
+
+            # Finalize compaction auto-pad: if the request is in the
+            # padding step AND num_computed_tokens has now caught up to
+            # num_tokens (i.e. the filler forward completed this step),
+            # transition to the original FINISHED status and free. The
+            # EngineCoreOutput for this request was already emitted at
+            # the prior (stop) step — there is nothing to add here, so
+            # skip the rest of the loop iteration to avoid running
+            # turn-boundary scans / compaction passes on a now-freed
+            # request (whose blocks list is empty and would assert).
+            if (
+                request.padding_pending
+                and request.num_computed_tokens >= request.num_tokens
+            ):
+                logger.info(
+                    "[COMPACT/auto-pad] req=%s finalizing: num_computed=%d "
+                    "num_tokens=%d; restoring finish status",
+                    request.request_id[:8],
+                    request.num_computed_tokens,
+                    request.num_tokens,
+                )
+                request.padding_pending = False
+                if request._pending_finish_status is not None:
+                    request.status = request._pending_finish_status
+                    request._pending_finish_status = None
+                else:
+                    request.status = RequestStatus.FINISHED_STOPPED
                 finished = self._handle_stopped_request(request)
                 if finished:
-                    kv_transfer_params = self._free_request(request)
-
-                if status_before_stop == RequestStatus.RUNNING:
-                    stopped_running_reqs.add(request)
-                else:
-                    stopped_preempted_reqs.add(request)
+                    self._free_request(request)
+                stopped_running_reqs.add(request)
+                continue
+            if request.padding_pending:
+                logger.info(
+                    "[COMPACT/auto-pad] req=%s still pending: "
+                    "num_computed=%d num_tokens=%d (waiting for forward)",
+                    request.request_id[:8],
+                    request.num_computed_tokens,
+                    request.num_tokens,
+                )
 
             # Extract sample logprobs if needed.
             if (
@@ -2508,9 +3168,13 @@ class Scheduler(SchedulerInterface):
             # Must be AFTER stop check (don't compact finished requests).
             # Excluded for reqs still in _pending_admission_compaction_ids:
             # those will be handled by the admission path on the step
-            # where their plan finally emits.
+            # where their plan finally emits. Also excluded for reqs
+            # that were just finalized in the auto-pad path: their
+            # status is FINISHED_* and their blocks are already freed,
+            # so any compaction attempt would index out of bounds.
             if (
                 not stopped
+                and not request.is_finished()
                 and self._compaction_enabled
                 and request.num_output_placeholders == 0
                 and request.request_id not in self._pending_admission_compaction_ids
@@ -2566,6 +3230,7 @@ class Scheduler(SchedulerInterface):
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                         compaction_events=compaction_events,
+                        padding_token_ids=padding_token_ids_for_output,
                     )
                 )
             else:
@@ -2942,6 +3607,26 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        # KV compaction: ensure any block that became full on the request's
+        # final decode step gets registered in the prefix-cache pool before
+        # its blocks are freed. Otherwise the last block — whose state
+        # transitioned from partial to full via the in-step kernel write
+        # — is lost because `allocate_slots` for that step computed
+        # `num_full_blocks` from the pre-decode `request.num_tokens` and
+        # the request finishes before a subsequent `allocate_slots`
+        # observes the completed block. Manifests as future calls within
+        # the same rollout chain failing to prefix-cache-hit the last
+        # block of the prior writer (see find_longest_cache_hit TRACE
+        # HASH-MISS at block_idx = N-1 where N is the writer's final
+        # block count). The auto-pad path inadvertently registered the
+        # block via its extra scheduling iter, masking this for non-
+        # block-aligned writers; block-aligned writers (auto-pad no-op)
+        # exposed the bug. Safe: cache_blocks is idempotent when blocks
+        # are already cached and only fires when prefix caching is on.
+        if self.cache_config.enable_prefix_caching and request.num_tokens > 0:
+            self.kv_cache_manager.cache_blocks(
+                request, request.num_tokens
+            )
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
 

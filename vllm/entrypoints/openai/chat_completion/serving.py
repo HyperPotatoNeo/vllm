@@ -1629,6 +1629,15 @@ class OpenAIServingChat(OpenAIServing):
                 for e in compaction_events
             ]
 
+        # KV cache compaction auto-pad: filler token ids appended by vLLM
+        # at finish-time so the trailing block lands in the prefix cache.
+        # The orchestrator needs these for trainer K-cache layout alignment
+        # AND to include in the next call's submitted prompt (so vLLM's
+        # prefix cache hits the padded blocks).
+        padding_token_ids_payload = (
+            list(getattr(final_res, "padding_token_ids", None) or []) or None
+        )
+
         response = ChatCompletionResponse(
             id=request_id,
             created=created_time,
@@ -1641,6 +1650,7 @@ class OpenAIServingChat(OpenAIServing):
             ),
             kv_transfer_params=final_res.kv_transfer_params,
             compaction_events=compaction_events_payload,
+            padding_token_ids=padding_token_ids_payload,
         )
 
         # Log complete response if output logging is enabled

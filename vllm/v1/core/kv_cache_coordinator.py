@@ -167,6 +167,7 @@ class KVCacheCoordinator(ABC):
         num_tokens: int,
         num_tokens_main_model: int,
         num_encoder_tokens: int = 0,
+        request_position_offset: int = 0,
     ) -> tuple[list[KVCacheBlock], ...]:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
@@ -181,6 +182,9 @@ class KVCacheCoordinator(ABC):
                 with spec decode, it is num_tokens - num_lookahead_tokens.
             num_encoder_tokens: The number of encoder tokens for allocating
                 blocks for cross-attention.
+            request_position_offset: The request's current position_offset.
+                Threaded down to single_type_manager.allocate_new_blocks so
+                each freshly-allocated block can record its logical_start.
 
         Returns:
             The new allocated blocks.
@@ -192,6 +196,7 @@ class KVCacheCoordinator(ABC):
                 if isinstance(manager, CrossAttentionManager)
                 else num_tokens,
                 num_tokens_main_model,
+                request_position_offset=request_position_offset,
             )
             for manager in self.single_type_managers
         )
@@ -265,11 +270,18 @@ class KVCacheCoordinator(ABC):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
-    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
+        """Returns (computed_blocks, num_computed_tokens, inherited_offset).
+
+        inherited_offset is the writer's position_offset frame that the
+        inheriting request should seed its own position_offset from.
+        0 when no offset inheritance is needed.
+        """
         pass
 
     def new_step_starts(self) -> None:
         """Called when a new step is started."""
+        self.block_pool.new_step_starts()
         for manager in self.single_type_managers:
             manager.new_step_starts()
 
@@ -317,11 +329,11 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
-    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
         blocks: tuple[list[KVCacheBlock], ...] = tuple(
             [] for _ in range(self.num_single_type_manager)
         )
-        return blocks, 0
+        return blocks, 0, 0
 
 
 class UnitaryKVCacheCoordinator(KVCacheCoordinator):
@@ -379,8 +391,8 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
-    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
-        hit_blocks = self.single_type_managers[0].find_longest_cache_hit(
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
+        hit_blocks, inherited_offset = self.single_type_managers[0].find_longest_cache_hit(
             block_hashes=block_hashes,
             max_length=max_cache_hit_length,
             kv_cache_group_ids=[0],
@@ -391,7 +403,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             dcp_world_size=self.dcp_world_size,
             pcp_world_size=self.pcp_world_size,
         )
-        return hit_blocks, len(hit_blocks[0]) * self.block_size
+        return hit_blocks, len(hit_blocks[0]) * self.block_size, inherited_offset
 
 
 class HybridKVCacheCoordinator(KVCacheCoordinator):
@@ -487,7 +499,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
-    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
         """
         Find the longest cache hit using an iterative fixed-point algorithm.
 
@@ -544,7 +556,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     num_blocks = curr_hit_length // spec.block_size
                     curr_hit_length = num_blocks * spec.block_size
                 else:
-                    hit_blocks = manager_cls.find_longest_cache_hit(
+                    hit_blocks, _hybrid_inh_offset = manager_cls.find_longest_cache_hit(
                         block_hashes=_get_block_hashes(spec),
                         max_length=curr_hit_length,
                         kv_cache_group_ids=group_ids,
@@ -553,6 +565,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         use_eagle=self.use_eagle,
                         alignment_tokens=self.lcm_block_size,
                     )
+                    # Hybrid coord ignores inherited_offset (compaction is
+                    # gated to FullAttention-only via CompactingKVCacheManager).
                     curr_hit_length = len(hit_blocks[0]) * spec.block_size
                     for group_id, blocks in zip(group_ids, hit_blocks):
                         hit_blocks_by_group[group_id] = blocks
@@ -574,7 +588,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
         return tuple(
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
-        ), hit_length
+        ), hit_length, 0  # hybrid never seeds inherited_offset
 
 
 def get_kv_cache_coordinator(

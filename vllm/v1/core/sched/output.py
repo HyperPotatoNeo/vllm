@@ -58,12 +58,21 @@ class NewRequestData:
     # the model answering the previous turn's question.
     position_offset: int = 0
 
+    # 2-piece piecewise position fix: physical positions [0, protected_prefix_len)
+    # rotate at offset 0 (sys K stays correct at logical [0..protected_prefix_len)).
+    # Physical positions >= protected_prefix_len rotate at `position_offset`.
+    # Required by the piecewise position_offset fix
+    # (plans/piecewise_position_offset.md) to keep sys K correct while letting
+    # admission bump the offset to clear survivor logical positions for new K.
+    protected_prefix_len: int = 0
+
     @classmethod
     def from_request(
         cls,
         request: Request,
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
+        protected_prefix_len: int = 0,
     ) -> "NewRequestData":
         return cls(
             req_id=request.request_id,
@@ -77,6 +86,7 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prefill_token_ids=prefill_token_ids,
             position_offset=request.position_offset,
+            protected_prefix_len=protected_prefix_len,
         )
 
     def __repr__(self) -> str:
@@ -147,6 +157,11 @@ class CachedRequestData:
     # Updated prompt lengths for compacted requests whose prompt tokens
     # were evicted (turn-based eviction with protected prefix).
     prompt_lengths: dict[str, int] = field(default_factory=dict)
+    # 2-piece piecewise position: per-request protected_prefix_len for
+    # compacted requests. Worker uses physical >= protected_prefix_len
+    # to decide whether to apply position_offset. Static during a request's
+    # lifetime (= sys boundary), so only needs to be shipped on rebuild.
+    protected_prefix_lens: dict[str, int] = field(default_factory=dict)
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -262,6 +277,13 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+
+    # KV cache compaction: request IDs whose scheduled tokens are filler
+    # padding used to block-align the KV cache at request finish (see
+    # `compaction_block_aligned_finish` in CacheConfig). The worker
+    # should run the forward to write K/V for these tokens but skip
+    # sampling — no new output tokens are produced this step.
+    no_sample_req_ids: set[str] = field(default_factory=set)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

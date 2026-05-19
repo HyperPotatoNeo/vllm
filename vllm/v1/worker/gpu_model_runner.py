@@ -691,6 +691,15 @@ class GPUModelRunner(
         self.position_offsets_gpu = torch.zeros(
             self.max_num_reqs, dtype=torch.int64, device=self.device
         )
+        # 2-piece position fix (plans/piecewise_position_offset.md): per-request
+        # sys boundary. Physical positions < protected_prefix_len rotate at
+        # offset 0; physical positions >= protected_prefix_len rotate at
+        # position_offset. Keeps sys K correct (frozen at logical [0..ppl))
+        # while admission can bump position_offset to clear survivor logical
+        # positions for new K writes.
+        self.protected_prefix_lens_gpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.int64, device=self.device
+        )
         self.prev_num_draft_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
@@ -1179,6 +1188,7 @@ class GPUModelRunner(
                 # original absolute frame, producing a relative-position
                 # skew at the prefill/decode boundary.
                 position_offset=new_req_data.position_offset,
+                protected_prefix_len=new_req_data.protected_prefix_len,
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -1285,6 +1295,13 @@ class GPUModelRunner(
                 req_state.position_offset = req_data.position_offsets.get(
                     req_id, 0
                 )
+                # 2-piece position fix: protected_prefix_len is static
+                # per-request after admission, but we still ship it on
+                # every rebuild as a defensive resync.
+                if req_id in req_data.protected_prefix_lens:
+                    req_state.protected_prefix_len = (
+                        req_data.protected_prefix_lens[req_id]
+                    )
                 # Update prompt length if prompt tokens were evicted
                 # (turn-based eviction with protected prefix).
                 if req_id in req_data.prompt_lengths:
@@ -1970,6 +1987,15 @@ class GPUModelRunner(
         self.discard_request_mask.np[:num_reqs] = (
             self.optimistic_seq_lens_cpu[:num_reqs].numpy() < num_tokens_np
         )
+        # KV cache compaction auto-pad: requests in the padding step
+        # forward filler tokens but produce no sampled output. Mark them
+        # as discard so their sampled_token_ids slot is cleared before
+        # returning to the scheduler.
+        no_sample_req_ids = getattr(scheduler_output, "no_sample_req_ids", None)
+        if no_sample_req_ids:
+            for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                if req_id in no_sample_req_ids:
+                    self.discard_request_mask.np[i] = True
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
         # Sync num_accepted_tokens from CPU (set by
@@ -2054,15 +2080,26 @@ class GPUModelRunner(
             physical_positions,
         )
 
-        # RoPE positions = physical + offset (correct absolute positions).
-        # Bulk-copy position_offsets from CPU to pre-allocated GPU buffer.
+        # RoPE positions: 2-piece piecewise (plans/piecewise_position_offset.md).
+        #   physical [0, protected_prefix_len) → offset 0     (sys K frozen at [0..ppl))
+        #   physical [protected_prefix_len, ...) → position_offset  (post-sys, smart-bumped)
+        # Sys K stays at its original logical positions while admission can bump
+        # position_offset high enough to clear survivor logical positions.
+        # Bulk-copy both per-request scalars from CPU to pre-allocated GPU buffers.
         self.position_offsets_gpu[:num_reqs].copy_(
             self.input_batch.position_offsets_cpu_tensor[:num_reqs],
             non_blocking=True,
         )
+        self.protected_prefix_lens_gpu[:num_reqs].copy_(
+            self.input_batch.protected_prefix_lens_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
+        per_token_ppl = self.protected_prefix_lens_gpu[req_indices_gpu]
+        per_token_offset = self.position_offsets_gpu[req_indices_gpu]
+        is_post_sys = (physical_positions >= per_token_ppl).to(torch.int64)
         self.positions[:total_num_scheduled_tokens] = (
             physical_positions
-            + self.position_offsets_gpu[req_indices_gpu]
+            + per_token_offset * is_post_sys
         )
 
         # [POS-TRACE] dump per-token positions so we can verify RoPE

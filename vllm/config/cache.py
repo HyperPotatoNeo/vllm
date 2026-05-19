@@ -196,6 +196,24 @@ class CacheConfig:
     tail of the last evicted turn. Only consulted when
     compaction_max_turns > 0."""
 
+    compaction_block_aligned_finish: bool = False
+    """KV cache compaction: when True, after each request finishes
+    generation, append filler tokens to extend the request's KV cache
+    to a block boundary. This makes the FINAL partial block enter the
+    prefix cache too, so subsequent inheritor requests can recover
+    those tokens without re-prefilling them. Eliminates the
+    'partial-tail re-prefill' that V does on subsequent calls
+    (currently the dominant K-mismatch source for trainer-vs-inference
+    KL on context-recall predictions). Requires enable_prefix_caching."""
+
+    compaction_filler_token_id: int = 151643
+    """KV cache compaction: token ID used by
+    compaction_block_aligned_finish to pad the cache to a block
+    boundary. Should match the orchestrator's chat-template filler
+    token so that subsequent submitted prompts hash-match the
+    auto-padded prefix cache at the padded positions. Default is
+    Qwen3's `<|endoftext|>` (151643)."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -232,6 +250,8 @@ class CacheConfig:
             "compaction_eviction_turn_stride",
             "compaction_turn_end_token_id",
             "compaction_assume_aligned_turn_boundaries",
+            "compaction_block_aligned_finish",
+            "compaction_filler_token_id",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors

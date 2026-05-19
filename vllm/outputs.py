@@ -122,6 +122,7 @@ class RequestOutput:
         *,
         kv_transfer_params: dict[str, Any] | None = None,
         compaction_events: list[Any] | None = None,
+        padding_token_ids: list[int] | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -148,6 +149,14 @@ class RequestOutput:
         # the msgspec struct and creating a dependency cycle; callers cast to
         # list[CompactionEvent] when needed.
         self.compaction_events = compaction_events
+        # KV cache compaction auto-pad: filler token ids that vLLM appended to
+        # this request's KV cache at finish-time (so the trailing block lands
+        # in the prefix cache). These tokens were NOT sampled — exclude from
+        # the visible completion text. The orchestrator forwards them to the
+        # trainer so its persistent KV cache layout matches vLLM's, and to
+        # the next call's submitted prompt so vLLM's prefix cache hits the
+        # padded blocks.
+        self.padding_token_ids = padding_token_ids
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""

@@ -32,6 +32,7 @@ from collections.abc import Callable
 # existing callers (scheduler.py, package __init__, tests) keep working.
 from vllm.v1.core.compaction.types import CompactionEvent  # noqa: F401
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 
 class CompactingKVCacheManager(FullAttentionManager):
@@ -50,6 +51,16 @@ class CompactingKVCacheManager(FullAttentionManager):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        # Hybrid-model guard: the piecewise position_offset logic and the
+        # find_longest_cache_hit offset-mismatch guard both assume
+        # FullAttentionSpec semantics (block_idx * block_size == logical
+        # position when offset=0). Sliding-window and chunked-local specs
+        # use different cache-hit topologies; compaction has not been
+        # validated against them.
+        assert isinstance(self.kv_cache_spec, FullAttentionSpec), (
+            f"CompactingKVCacheManager requires FullAttentionSpec, "
+            f"got {type(self.kv_cache_spec).__name__}"
+        )
         self.compaction_window_size = compaction_window_size
         self.compaction_stride = compaction_stride
         self.eviction_fn = eviction_fn  # None = default FIFO

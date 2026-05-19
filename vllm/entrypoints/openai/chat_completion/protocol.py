@@ -145,6 +145,17 @@ class ChatCompletionResponse(OpenAIBaseModel):
         default=None,
         description="KV cache compaction events (vLLM compaction extension).",
     )
+    # KV cache compaction auto-pad filler token ids appended by vLLM at
+    # finish-time. Empty/None when auto-pad did not fire. Consumed by the
+    # kv-eviction orchestrator/trainer for K-cache layout alignment and
+    # prefix-cache hit on the next call's submitted prompt.
+    padding_token_ids: list[int] | None = Field(
+        default=None,
+        description=(
+            "Auto-pad filler token ids appended to the KV cache at finish "
+            "(vLLM compaction extension)."
+        ),
+    )
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):

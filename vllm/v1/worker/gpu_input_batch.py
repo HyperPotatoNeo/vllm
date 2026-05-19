@@ -56,6 +56,10 @@ class CachedRequestState:
     # KV cache compaction: cumulative evicted tokens for RoPE correction.
     position_offset: int = 0
 
+    # 2-piece piecewise position fix: sys boundary. position_offset is
+    # applied to Q only when physical >= protected_prefix_len.
+    protected_prefix_len: int = 0
+
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             self.prompt_token_ids, self.prompt_embeds
@@ -160,6 +164,23 @@ class InputBatch:
             pin_memory=pin_memory,
         )
         self.position_offsets_cpu = self.position_offsets_cpu_tensor.numpy()
+
+        # KV cache compaction (2-piece position fix): per-request boundary
+        # at which `position_offset` starts applying. Physical positions
+        # [0, protected_prefix_len) get offset=0 (sys); physical positions
+        # >= protected_prefix_len get the request's position_offset.
+        # Required so sys K (frozen at logical [0..ppl)) is read at its
+        # original logical positions while admission can bump offset
+        # high for post-sys K.
+        self.protected_prefix_lens_cpu_tensor = torch.zeros(
+            (max_num_reqs,),
+            device="cpu",
+            dtype=torch.int64,
+            pin_memory=pin_memory,
+        )
+        self.protected_prefix_lens_cpu = (
+            self.protected_prefix_lens_cpu_tensor.numpy()
+        )
 
         # Block table.
         self.block_table = MultiGroupBlockTable(
@@ -364,6 +385,7 @@ class InputBatch:
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
         self.position_offsets_cpu[req_index] = request.position_offset
+        self.protected_prefix_lens_cpu[req_index] = request.protected_prefix_len
         self.block_table.add_row(request.block_ids, req_index)
 
         if sampling_params := request.sampling_params:
@@ -740,6 +762,9 @@ class InputBatch:
             self.position_offsets_cpu[empty_index] = self.position_offsets_cpu[
                 last_req_index
             ]
+            self.protected_prefix_lens_cpu[empty_index] = (
+                self.protected_prefix_lens_cpu[last_req_index]
+            )
             self.block_table.move_row(last_req_index, empty_index)
 
             self.request_lora_mapping[empty_index] = self.request_lora_mapping[

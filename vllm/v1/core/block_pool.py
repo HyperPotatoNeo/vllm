@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -70,6 +71,24 @@ class BlockHashToBlockMap:
                 return next(iter(blocks.values()))
             self._unexpected_blocks_type(blocks)
         return None
+
+    def get_all_blocks(self, key: BlockHashWithGroupId) -> list[KVCacheBlock]:
+        """
+        Returns all blocks stored under the given hash key. Multiple
+        blocks can share a hash when distinct requests cache identical
+        content at different rotation frames (e.g., two requests whose
+        admissions left them at different position_offsets). Callers
+        that need to disambiguate by frame must use this method.
+        """
+        blocks = self._cache.get(key)
+        if blocks is None:
+            return []
+        if isinstance(blocks, KVCacheBlock):
+            return [blocks]
+        if isinstance(blocks, dict):
+            return list(blocks.values())
+        self._unexpected_blocks_type(blocks)
+        return []
 
     def insert(self, key: BlockHashWithGroupId, block: KVCacheBlock) -> None:
         """
@@ -168,6 +187,10 @@ class BlockPool:
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
+        # Blocks registered in the prefix-cache map during the current
+        # scheduler step. Their hashes are visible before the worker has
+        # necessarily written the corresponding K/V rows.
+        self.cached_block_ids_this_step: set[int] = set()
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
@@ -206,6 +229,72 @@ class BlockPool:
                 return None
             cached_blocks.append(block)
         return cached_blocks
+
+    def get_all_cached_blocks(
+        self, block_hash: BlockHash, kv_cache_group_ids: list[int]
+    ) -> list[list[KVCacheBlock]]:
+        """Return every candidate cached-block tuple at this hash, one
+        entry per distinct writer.
+
+        Why this exists: with compaction, two requests can write
+        identical content (same block_hash) at DIFFERENT rotation
+        frames — e.g., writer A admitted at turn 3 ends up with
+        post-sys blocks at position_offset=480; writer B admitted at
+        turn 5 at position_offset=576. They both insert under the same
+        key in `cached_block_hash_to_block`. `get_cached_block`'s
+        get_one_block returns whichever lands first in dict iteration,
+        and the chain-hit logic's BREAK-ON-MIXED guard then truncates
+        the chain at the first frame disagreement.
+
+        Frame-aware callers (find_longest_cache_hit) use this to
+        enumerate candidates and pick the one whose logical_start
+        agrees with the chain's established offset, restoring the
+        cache hit that would otherwise be lost.
+
+        Returns a list of "candidate tuples", each tuple being a
+        list[KVCacheBlock] of length len(kv_cache_group_ids). The
+        cartesian product across groups is intentional but typically
+        each group has a single candidate (multi-group hybrid setups
+        are rare). Empty list = full cache miss.
+        """
+        per_group_candidates: list[list[KVCacheBlock]] = []
+        for group_id in kv_cache_group_ids:
+            block_hash_with_group_id = make_block_hash_with_group_id(
+                block_hash, group_id
+            )
+            blocks = self.cached_block_hash_to_block.get_all_blocks(
+                block_hash_with_group_id
+            )
+            if blocks and (
+                os.environ.get("KVE_FULL_ATTN_FILTER_SAME_STEP_PREFIX") == "1"
+                or os.environ.get("KVE_FULL_ATTN_FILTER_LIVE_PREFIX") == "1"
+            ):
+                filter_same_step = (
+                    os.environ.get("KVE_FULL_ATTN_FILTER_SAME_STEP_PREFIX") == "1"
+                )
+                filter_live = (
+                    os.environ.get("KVE_FULL_ATTN_FILTER_LIVE_PREFIX") == "1"
+                )
+                blocks = [
+                    block
+                    for block in blocks
+                    if not (
+                        (
+                            filter_same_step
+                            and block.block_id in self.cached_block_ids_this_step
+                        )
+                        or (filter_live and block.ref_cnt > 0)
+                    )
+                ]
+            if not blocks:
+                return []
+            per_group_candidates.append(blocks)
+        # Cartesian product. For the common single-group case this is
+        # just [[b] for b in per_group_candidates[0]].
+        if len(per_group_candidates) == 1:
+            return [[b] for b in per_group_candidates[0]]
+        import itertools as _it
+        return [list(combo) for combo in _it.product(*per_group_candidates)]
 
     def cache_full_blocks(
         self,
@@ -260,7 +349,30 @@ class BlockPool:
             # align mode. We skip null blocks here.
             if blk.is_null:
                 continue
-            assert blk.block_hash is None
+            # Block may already have a hash set if it is SHARED across
+            # requests via prefix-cache hit AND another sharing request's
+            # cache_blocks already ran in this scheduling step. This
+            # happens with compaction's `_rehash_after_eviction`, which
+            # resets `num_cached_block[req] = 0` for every admitted
+            # request — so when two admitted requests both share sys-prompt
+            # blocks, the first to call cache_blocks() in the next step
+            # sets hashes on those shared blocks, and the second hits this
+            # assertion. Skip safely: shared blocks have identical content
+            # → identical chain hash, so the block is already registered
+            # under the correct hash.
+            if blk.block_hash is not None:
+                continue
+            # Invariant: a block being added to the prefix-cache map must
+            # carry a valid logical_start so the offset-mismatch guard in
+            # find_longest_cache_hit can validate future inheritors. The
+            # only way logical_start ends up >= 0 is via allocate_new_blocks
+            # (the canonical fresh-allocation stamp). If this fires, some
+            # code path took blocks through get_new_blocks but skipped the
+            # stamp (e.g. an unhandled KV-connector tail).
+            assert blk.logical_start >= 0, (
+                f"cache_full_blocks: block {blk.block_id} has logical_start"
+                f"=-1 — fresh blocks must be stamped before caching"
+            )
             block_hash = new_block_hashes[i]
 
             # Update and added the full block to the cache.
@@ -269,8 +381,23 @@ class BlockPool:
             )
             blk.block_hash = block_hash_with_group_id
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
+            self.cached_block_ids_this_step.add(blk.block_id)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
+            # [TRACE-CACHE-REGISTER] one line per block-pool insert.
+            # Gated by env var so it's silent unless requested.
+            import os as _trc_os
+            if _trc_os.environ.get("KVE_TRACE_CACHE_REGISTER") == "1":
+                import logging as _trc_log
+                _trc_log.getLogger("vllm.compaction_diag").warning(
+                    "[TRACE-CACHE-REGISTER] req=%s block_idx=%d "
+                    "block_id=%d logical_start=%d num_cached_before=%d "
+                    "num_full_after=%d",
+                    request.request_id[:8],
+                    num_cached_blocks + i,
+                    blk.block_id, blk.logical_start,
+                    num_cached_blocks, num_full_blocks,
+                )
 
         if self.enable_kv_cache_events:
             if num_cached_blocks == 0:
@@ -338,12 +465,23 @@ class BlockPool:
             for block in ret:
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
+                # logical_start is reset AT RE-ALLOCATION (not at free time).
+                # A block sitting in the free queue between requests retains
+                # its writer's logical_start so the offset-mismatch guard in
+                # find_longest_cache_hit can validate prefix-cache hits with
+                # truthful frame information. Once the block is popped here
+                # for a new request, the prior frame is no longer valid —
+                # allocate_new_blocks will stamp the new value.
+                block.reset_logical_start()
+                assert block.logical_start == -1
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         else:
             for block in ret:
                 assert block.ref_cnt == 0
+                block.reset_logical_start()
+                assert block.logical_start == -1
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
@@ -418,6 +556,13 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
+        # NOTE: logical_start is intentionally NOT reset here. A freed
+        # block typically stays registered in cached_block_hash_to_block
+        # so future requests can prefix-cache-hit it. The offset-mismatch
+        # guard in find_longest_cache_hit needs the writer's logical_start
+        # to validate the hit. Reset happens at re-allocation time in
+        # get_new_blocks (after _maybe_evict_cached_block clears the hash
+        # entry, the block is no longer reachable via prefix-cache lookup).
         self.free_block_queue.append_n(
             [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
         )
@@ -462,9 +607,12 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
 
-        # Remove all hashes from all blocks.
+        # Remove all hashes from all blocks. Also reset logical_start —
+        # symmetric with reset_hash since both are the "rotation-frame
+        # metadata" a fresh request would need to validate a hit.
         for block in self.blocks:
             block.reset_hash()
+            block.reset_logical_start()
 
         if self.metrics_collector:
             self.metrics_collector.reset()
@@ -475,6 +623,9 @@ class BlockPool:
             self.kv_event_queue.append(AllBlocksCleared())
 
         return True
+
+    def new_step_starts(self) -> None:
+        self.cached_block_ids_this_step.clear()
 
     def get_num_free_blocks(self) -> int:
         """Get the number of free blocks in the pool.

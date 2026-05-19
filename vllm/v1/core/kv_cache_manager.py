@@ -178,7 +178,9 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
-    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
+    def get_computed_blocks(
+        self, request: Request
+    ) -> tuple[KVCacheBlocks, int, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
@@ -189,13 +191,19 @@ class KVCacheManager:
             A tuple containing:
                 - A list of blocks that are computed for the request.
                 - The number of computed tokens.
+                - The inherited position_offset (0 if no offset inheritance).
+                  When >0, this request inherited blocks from a post-admission
+                  writer; the request's position_offset has been seeded to
+                  this value so inference's piecewise rule rotates Q at the
+                  writer's frame. Caller (scheduler) should emit a synthetic
+                  CompactionEvent so the trainer mirror also uses this frame.
         """
         # We skip finding the prefix cache hit when prefix caching is
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
         if not self.enable_caching or request.skip_reading_prefix_cache:
-            return self.empty_kv_cache_blocks, 0
+            return self.empty_kv_cache_blocks, 0, 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
         # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
@@ -204,11 +212,40 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
-        computed_blocks, num_new_computed_tokens = (
+        computed_blocks, num_new_computed_tokens, inherited_offset = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
             )
         )
+
+        # Seed the inheritor's position_offset from the writer's frame
+        # (see plans/piecewise_position_offset.md / feedback-full-prefix-
+        # caching-required). When prefix cache returns blocks written
+        # post-admission (logical_start > block_idx * block_size), the
+        # inheritor's Q must rotate at the writer's offset frame so the
+        # cached K rotations align. The piecewise GPU formula
+        # (`physical + position_offset * is_post_sys`) then naturally
+        # rotates Q correctly without re-prefilling the inherited tail.
+        if inherited_offset > 0:
+            # request.position_offset must be 0 here (fresh request — this
+            # is usually the only call to get_computed_blocks per request).
+            # A scheduler diagnostic may defer a WAITING request after this
+            # seed and retry it later; allow the retry when it rediscovers
+            # the same frame.
+            assert request.position_offset in (0, inherited_offset), (
+                f"unexpected non-zero position_offset={request.position_offset} "
+                f"on a request hitting prefix cache with inherited frame "
+                f"offset {inherited_offset}"
+            )
+            request.position_offset = inherited_offset
+            if os.environ.get("KV_EVICTION_BUG_TRACE") == "1":
+                logger.warning(
+                    "[DIAG-INHERIT-SEED] req=%s seeded position_offset=%d "
+                    "from %d cached blocks (inheritor will reuse writer's "
+                    "frame; no re-prefill)",
+                    request.request_id[:8], inherited_offset,
+                    num_new_computed_tokens // (request.num_tokens // max(1, len(request.block_hashes))),
+                )
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -235,7 +272,11 @@ class KVCacheManager:
                 request.num_tokens - num_new_computed_tokens,
             )
 
-        return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+        return (
+            self.create_kv_cache_blocks(computed_blocks),
+            num_new_computed_tokens,
+            inherited_offset,
+        )
 
     def can_fit_full_sequence(
         self,
@@ -428,6 +469,7 @@ class KVCacheManager:
             num_tokens_need_slot,
             num_tokens_main_model,
             num_encoder_tokens,
+            request_position_offset=request.position_offset,
         )
 
         # P/D: delay caching blocks if we have to recv from

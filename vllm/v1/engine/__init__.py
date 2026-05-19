@@ -172,6 +172,14 @@ class EngineCoreOutput(
     # overwrite semantics are safe. None when compaction is disabled or when
     # the request has had no compaction events yet.
     compaction_events: list[CompactionEvent] | None = None
+    # KV cache compaction auto-pad: filler token ids appended to this
+    # request's KV cache at finish-time so the trailing block lands in the
+    # prefix cache. Emitted on the same EngineCoreOutput that carries
+    # finish_reason. Excluded from the visible completion (these tokens were
+    # not sampled), but the orchestrator MUST forward them to the trainer so
+    # its persistent KV cache layout matches vLLM's (V's cache for the next
+    # call will inherit these padded blocks via prefix cache).
+    padding_token_ids: list[int] | None = None
 
     @property
     def finished(self) -> bool:
