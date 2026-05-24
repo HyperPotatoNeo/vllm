@@ -361,6 +361,20 @@ class BlockPool:
             # → identical chain hash, so the block is already registered
             # under the correct hash.
             if blk.block_hash is not None:
+                import os as _trc_os
+                if _trc_os.environ.get("KVE_TRACE_CACHE_REGISTER") == "1":
+                    import logging as _trc_log
+                    _trc_log.getLogger("vllm.compaction_diag").warning(
+                        "[TRACE-CACHE-REGISTER-SKIP] req=%s block_idx=%d "
+                        "block_id=%d logical_start=%d num_cached_before=%d "
+                        "num_full_after=%d reason=already-hashed",
+                        request.request_id[:8],
+                        num_cached_blocks + i,
+                        blk.block_id,
+                        blk.logical_start,
+                        num_cached_blocks,
+                        num_full_blocks,
+                    )
                 continue
             # Invariant: a block being added to the prefix-cache map must
             # carry a valid logical_start so the offset-mismatch guard in

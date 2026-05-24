@@ -301,7 +301,36 @@ class SingleTypeKVCacheManager(ABC):
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
 
+        if os.environ.get("KVE_TRACE_CACHE_COMMIT") == "1":
+            import logging as _diag_log
+            req_blocks = self.req_to_blocks.get(request.request_id, [])
+            _diag_log.getLogger("vllm.compaction_diag").warning(
+                "[TRACE-CACHE-COMMIT] req=%s num_tokens=%d block_size=%d "
+                "cached_before=%d full_blocks=%d req_blocks=%d "
+                "num_computed=%d num_prompt=%d position_offset=%d "
+                "padding_pending=%d",
+                request.request_id[:8],
+                num_tokens,
+                self.block_size,
+                num_cached_blocks,
+                num_full_blocks,
+                len(req_blocks),
+                request.num_computed_tokens,
+                request.num_prompt_tokens,
+                request.position_offset,
+                int(getattr(request, "padding_pending", False)),
+            )
+
         if num_cached_blocks >= num_full_blocks:
+            if os.environ.get("KVE_TRACE_CACHE_COMMIT") == "1":
+                import logging as _diag_log
+                _diag_log.getLogger("vllm.compaction_diag").warning(
+                    "[TRACE-CACHE-COMMIT-SKIP] req=%s cached_before=%d "
+                    "full_blocks=%d reason=already-marked-cached",
+                    request.request_id[:8],
+                    num_cached_blocks,
+                    num_full_blocks,
+                )
             return
 
         self.block_pool.cache_full_blocks(
@@ -314,6 +343,13 @@ class SingleTypeKVCacheManager(ABC):
         )
 
         self.num_cached_block[request.request_id] = num_full_blocks
+        if os.environ.get("KVE_TRACE_CACHE_COMMIT") == "1":
+            import logging as _diag_log
+            _diag_log.getLogger("vllm.compaction_diag").warning(
+                "[TRACE-CACHE-COMMIT-DONE] req=%s cached_after=%d",
+                request.request_id[:8],
+                num_full_blocks,
+            )
 
     def free(self, request_id: str) -> None:
         """
