@@ -5,7 +5,7 @@ import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -66,6 +66,18 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class Phase4Pin:
+    entries: list[tuple[Any, list[Any]]]
+    token_count: int
+    block_count: int
+    request_id: str
+    call_idx: int | None
+    created_at: float
+    consumed_by_request_id: str | None = None
+    consumed_at: float | None = None
 
 
 class Scheduler(SchedulerInterface):
@@ -344,8 +356,11 @@ class Scheduler(SchedulerInterface):
         # retained rollout state. The normal prefix cache is LRU/evictable, so
         # keep one pinned finished-state block list per rollout trace until the
         # next request for that trace has attached it.
-        self._phase4_pinned_blocks: dict[str, list[tuple[Any, list[Any]]]] = {}
+        self._phase4_pinned_blocks: dict[str, Phase4Pin] = {}
         self._phase4_pin_order: deque[str] = deque()
+        self._phase4_pin_hit_repeats: defaultdict[
+            tuple[str, str, str, int, int, int, int], int
+        ] = defaultdict(int)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
@@ -743,6 +758,8 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 pending_inherit_event: CompactionEvent | None = None
+                phase4_pin_trace_to_mark_consumed = ""
+                phase4_pin_call_to_mark_consumed = ""
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
@@ -969,15 +986,18 @@ class Scheduler(SchedulerInterface):
                     # diagnostics intentionally defer a WAITING request after
                     # get_computed_blocks seeded position_offset; appending here
                     # would leave stale trainer metadata on the retry.
+                    expected_cached_tokens = self._phase4_expected_cached_tokens(
+                        request
+                    )
                     if (
-                        num_new_local_computed_tokens > 0
+                        (
+                            num_new_local_computed_tokens > 0
+                            or expected_cached_tokens is not None
+                        )
                         and self._compaction_enabled
                         and self._compaction_max_turns > 0
                     ):
                         sys_boundary_raw = self._effective_prompt_tokens(request)
-                        expected_cached_tokens = (
-                            self._phase4_expected_cached_tokens(request)
-                        )
                         extra_args = (
                             request.sampling_params.extra_args
                             if request.sampling_params is not None
@@ -1009,6 +1029,7 @@ class Scheduler(SchedulerInterface):
                             pinned = self._phase4_pinned_cache_blocks(
                                 phase4_trace_id, expected_cached_tokens
                             )
+                            phase4_pin_trace_to_mark_consumed = ""
                             if pinned is not None:
                                 (
                                     pinned_blocks,
@@ -1022,6 +1043,12 @@ class Scheduler(SchedulerInterface):
                                 )
                                 inherited_offset = pinned_inherited_offset
                                 request.position_offset = inherited_offset
+                                phase4_pin_trace_to_mark_consumed = (
+                                    phase4_trace_id
+                                )
+                                phase4_pin_call_to_mark_consumed = str(
+                                    phase4_call_idx
+                                )
                                 if (
                                     os.environ.get(
                                         "KVE_TRACE_PHASE4_PREFIX_HIT", ""
@@ -1029,18 +1056,55 @@ class Scheduler(SchedulerInterface):
                                     or old_cached_tokens
                                     < expected_cached_tokens
                                 ):
-                                    logger.warning(
-                                        "[PHASE4-PIN-HIT] req=%s trace=%s "
-                                        "call=%s cached=%d->%d expected=%d "
-                                        "position_offset=%d",
-                                        request.request_id[:8],
-                                        phase4_trace_id,
-                                        phase4_call_idx,
-                                        old_cached_tokens,
-                                        num_new_local_computed_tokens,
-                                        expected_cached_tokens,
-                                        inherited_offset,
-                                    )
+                                    repeat = 1
+                                    should_log_pin_hit = True
+                                    if (
+                                        os.environ.get(
+                                            "KVE_PHASE4_PIN_HIT_RATE_LIMIT", ""
+                                        )
+                                        == "1"
+                                    ):
+                                        repeat_key = (
+                                            request.request_id,
+                                            phase4_trace_id,
+                                            str(phase4_call_idx),
+                                            old_cached_tokens,
+                                            num_new_local_computed_tokens,
+                                            expected_cached_tokens,
+                                            inherited_offset,
+                                        )
+                                        self._phase4_pin_hit_repeats[
+                                            repeat_key
+                                        ] += 1
+                                        repeat = self._phase4_pin_hit_repeats[
+                                            repeat_key
+                                        ]
+                                        should_log_pin_hit = (
+                                            repeat <= 4
+                                            or repeat & (repeat - 1) == 0
+                                            or repeat % 1000 == 0
+                                        )
+                                    if should_log_pin_hit:
+                                        logger.warning(
+                                            "[PHASE4-PIN-HIT] req=%s trace=%s "
+                                            "call=%s cached=%d->%d expected=%d "
+                                            "position_offset=%d repeat=%d "
+                                            "running=%d waiting=%d skipped=%d "
+                                            "token_budget=%d pins=%d",
+                                            request.request_id[:8],
+                                            phase4_trace_id,
+                                            phase4_call_idx,
+                                            old_cached_tokens,
+                                            num_new_local_computed_tokens,
+                                            expected_cached_tokens,
+                                            inherited_offset,
+                                            repeat,
+                                            len(self.running),
+                                            len(request_queue),
+                                            len(self.skipped_waiting),
+                                            token_budget,
+                                            len(self._phase4_pinned_blocks),
+                                        )
                             if (
                                 num_new_local_computed_tokens
                                 > expected_cached_tokens
@@ -1127,13 +1191,9 @@ class Scheduler(SchedulerInterface):
                                     inherited_offset,
                                 )
                             if delta > 0:
-                                assert (
-                                    os.environ.get(
-                                        "KVE_ASSERT_NO_PHASE4_REFILL", ""
-                                    ) != "1"
-                                ), (
+                                phase4_prefix_miss_msg = (
                                     "vLLM would re-prefill retained Phase4 "
-                                    "tokens: "
+                                    "tokens; aborting request instead: "
                                     f"req={request.request_id[:8]} "
                                     f"trace={phase4_trace_id} "
                                     f"call={phase4_call_idx} "
@@ -1145,6 +1205,25 @@ class Scheduler(SchedulerInterface):
                                     f"expected_nuf={request.num_prompt_tokens - expected_cached_tokens} "
                                     f"position_offset={inherited_offset}"
                                 )
+                                if (
+                                    os.environ.get(
+                                        "KVE_ALLOW_PHASE4_REFILL", ""
+                                    ) == "1"
+                                ):
+                                    logger.error(
+                                        "[PHASE4-PREFIX-REFILL-ALLOWED] %s",
+                                        phase4_prefix_miss_msg,
+                                    )
+                                else:
+                                    logger.error(
+                                        "[PHASE4-PREFIX-ABORT] %s",
+                                        phase4_prefix_miss_msg,
+                                    )
+                                    request_queue.pop_request()
+                                    self._abort_waiting_phase4_request(
+                                        request, phase4_prefix_miss_msg
+                                    )
+                                    continue
                             # Block-align to match inference's piecewise rule
                             # (which now uses block-aligned protected_prefix_len
                             # via _ppl). The trainer's per_call_segmented_forward
@@ -1339,6 +1418,32 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    if (
+                        phase4_pin_trace_to_mark_consumed
+                        and os.environ.get("KVE_TRACE_PHASE4_SCHED", "") == "1"
+                    ):
+                        logger.warning(
+                            "[PHASE4-PIN-ALLOC-NONE] req=%s trace=%s call=%s "
+                            "prompt=%d num_tokens=%d computed=%d local=%d "
+                            "external=%d new_tokens=%d token_budget=%d "
+                            "running=%d waiting=%d skipped=%d pins=%d "
+                            "position_offset=%d",
+                            request.request_id[:8],
+                            phase4_pin_trace_to_mark_consumed,
+                            phase4_pin_call_to_mark_consumed,
+                            request.num_prompt_tokens,
+                            request.num_tokens,
+                            num_computed_tokens,
+                            num_new_local_computed_tokens,
+                            num_external_computed_tokens,
+                            num_new_tokens,
+                            token_budget,
+                            len(self.running),
+                            len(request_queue),
+                            len(self.skipped_waiting),
+                            len(self._phase4_pinned_blocks),
+                            request.position_offset,
+                        )
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -1348,14 +1453,14 @@ class Scheduler(SchedulerInterface):
                         request.position_offset = 0
                     break
 
-                phase4_trace_id_for_pin = self._phase4_trace_id(request)
-                if phase4_trace_id_for_pin:
-                    # The new request has now touched any prefix-cache blocks
-                    # it inherited. Release the previous turn's session pin so
-                    # admission eviction can trim normally and memory does not
-                    # grow with chain length.
-                    self._release_phase4_pins(
-                        phase4_trace_id_for_pin, "consumed"
+                if phase4_pin_trace_to_mark_consumed:
+                    # Keep the previous turn's pin alive until this successor
+                    # finishes and replaces it. Releasing here is unsafe under
+                    # preemption/retry: the successor may still need to attach
+                    # the same retained KV again.
+                    self._mark_phase4_pin_consumed(
+                        phase4_pin_trace_to_mark_consumed,
+                        request.request_id,
                     )
 
                 if pending_inherit_event is not None:
@@ -1989,17 +2094,15 @@ class Scheduler(SchedulerInterface):
             # snapped past `cached_tokens` into the new_user region).
             pre_new_user_len = pre_prompt - request.num_computed_tokens
             pre_cached_tokens = request.num_computed_tokens
-            # The prefill kernel runs AFTER this method returns, so at
-            # eviction time `num_computed_tokens` reflects only the
-            # prefix-cache hits (0 for cold-cache). Pass the post-prefill
-            # position (= pre-eviction num_prompt_tokens) as the clamp
-            # ceiling so the planner's "never evict past KV that will
-            # exist" guard treats the to-be-prefilled prompt range as
-            # safe — the block_table is spliced before the kernel runs,
-            # so the kernel writes K/V only at post-eviction positions.
-            iterations = self._run_admission_eviction_loop(
-                request, effective_num_computed=pre_prompt,
-            )
+            # The prefill kernel runs AFTER this method returns. At eviction
+            # time `num_computed_tokens` is therefore the live prefix-cache
+            # hit length, and the tail past it is the freshly submitted
+            # fragment the worker still needs to prefill. Do not use the full
+            # prompt length as the eviction ceiling here: turn-boundary
+            # align-up can otherwise trim into that fresh tail, producing
+            # admission events whose evict range extends past the cache the
+            # trainer can replay.
+            iterations = self._run_admission_eviction_loop(request)
             self._pending_admission_compaction_ids.discard(req_id)
             if iterations == 0:
                 continue
@@ -2376,12 +2479,10 @@ class Scheduler(SchedulerInterface):
 
         `effective_num_computed` overrides the safety clamp ceiling
         (`evict_end` is clamped to `effective_num_computed // block_size *
-        block_size`). Default = `request.num_computed_tokens` (matches
-        mid-gen semantics: never evict KV that hasn't been written).
-        Phase-B2 inline-admission planning passes
-        `request.num_prompt_tokens` because the prefill in the current
-        step will populate KV for all prompt positions before the
-        worker consumes the plan.
+        block_size`). Default = `request.num_computed_tokens`, which is also
+        what inline admission must use: the prefill kernel has not run yet, so
+        tokens beyond the cached prefix are fresh prompt tail and must not be
+        trimmed before the worker sees them.
         """
         positions = request.turn_end_positions
         # positions only tracks non-evicted content:
@@ -2495,51 +2596,162 @@ class Scheduler(SchedulerInterface):
             return ""
         return str(trace_id)
 
-    def _phase4_pin_limit(self) -> int:
+    def _phase4_call_idx(self, request: Request) -> int | None:
+        if request.sampling_params is None:
+            return None
+        extra_args = request.sampling_params.extra_args or {}
+        raw_call_idx = extra_args.get("kve_phase4_call_idx")
+        if raw_call_idx is None:
+            return None
+        try:
+            return int(raw_call_idx)
+        except (TypeError, ValueError):
+            return None
+
+    def _abort_waiting_phase4_request(
+        self, request: Request, reason: str
+    ) -> None:
+        request.status = RequestStatus.FINISHED_ABORTED
+        request_id = request.request_id
+        self.encoder_cache_manager.free(request)
+        self.kv_cache_manager.free(request)
+        self.finished_req_ids.add(request_id)
+        if self.finished_req_ids_dict is not None:
+            self.finished_req_ids_dict[request.client_index].add(request_id)
+        self._pending_admission_compaction_ids.discard(request_id)
+        self.requests.pop(request_id, None)
+        logger.error(
+            "[PHASE4-REQUEST-ABORTED] req=%s reason=%s",
+            request_id[:8],
+            reason,
+        )
+
+    def _phase4_pin_limit(self) -> int | None:
         raw_limit = os.environ.get("KVE_PHASE4_PIN_LIMIT")
         if raw_limit is not None:
             try:
                 return max(0, int(raw_limit))
             except ValueError:
                 pass
-        return max(256, self.max_num_running_reqs)
+        return None
+
+    def _phase4_pin_ttl_seconds(self) -> float:
+        raw_ttl = os.environ.get("KVE_PHASE4_PIN_TTL_SECONDS")
+        if raw_ttl is None:
+            return 1800.0
+        try:
+            return max(0.0, float(raw_ttl))
+        except ValueError:
+            return 1800.0
 
     def _release_phase4_pins(self, trace_id: str, reason: str) -> None:
         if not trace_id:
             return
-        entries = self._phase4_pinned_blocks.pop(trace_id, None)
-        if not entries:
+        pin = self._phase4_pinned_blocks.pop(trace_id, None)
+        if pin is None:
             return
         released_blocks = 0
-        for manager, blocks in entries:
+        for manager, blocks in pin.entries:
             if blocks:
                 manager.block_pool.free_blocks(blocks)
                 released_blocks += len(blocks)
         if os.environ.get("KVE_TRACE_PHASE4_PIN") == "1":
             logger.warning(
-                "[PHASE4-PIN-RELEASE] trace=%s reason=%s blocks=%d",
+                "[PHASE4-PIN-RELEASE] trace=%s reason=%s blocks=%d "
+                "tokens=%d req=%s call=%s consumed_by=%s",
                 trace_id,
                 reason,
                 released_blocks,
+                pin.token_count,
+                pin.request_id,
+                pin.call_idx,
+                pin.consumed_by_request_id,
             )
 
+    def _release_all_phase4_pins(self, reason: str) -> None:
+        for trace_id in list(self._phase4_pinned_blocks):
+            self._release_phase4_pins(trace_id, reason)
+
+    def _mark_phase4_pin_consumed(
+        self, trace_id: str, request_id: str
+    ) -> None:
+        pin = self._phase4_pinned_blocks.get(trace_id)
+        if pin is None:
+            return
+        pin.consumed_by_request_id = request_id
+        pin.consumed_at = time.monotonic()
+        if os.environ.get("KVE_TRACE_PHASE4_PIN") == "1":
+            logger.warning(
+                "[PHASE4-PIN-CONSUMED] trace=%s req=%s pin_req=%s "
+                "pin_call=%s tokens=%d blocks=%d",
+                trace_id,
+                request_id[:8],
+                pin.request_id,
+                pin.call_idx,
+                pin.token_count,
+                pin.block_count,
+            )
+
+    def _phase4_pin_is_prunable(
+        self, pin: Phase4Pin, now: float, ttl_seconds: float
+    ) -> bool:
+        if (
+            pin.consumed_by_request_id is not None
+            and pin.consumed_by_request_id not in self.requests
+        ):
+            return True
+        if ttl_seconds <= 0:
+            return False
+        if (
+            pin.consumed_by_request_id is not None
+            and pin.consumed_by_request_id in self.requests
+        ):
+            return False
+        return now - pin.created_at >= ttl_seconds
+
     def _prune_phase4_pins(self) -> None:
+        if not self._phase4_pinned_blocks:
+            return
+        now = time.monotonic()
+        ttl_seconds = self._phase4_pin_ttl_seconds()
+        for trace_id in list(self._phase4_pin_order):
+            pin = self._phase4_pinned_blocks.get(trace_id)
+            if pin is None:
+                continue
+            if self._phase4_pin_is_prunable(pin, now, ttl_seconds):
+                self._release_phase4_pins(trace_id, "ttl")
+
         limit = self._phase4_pin_limit()
+        if limit is None or len(self._phase4_pinned_blocks) <= limit:
+            return
+
+        # Count limits are advisory for Phase4. Releasing live/unconsumed pins
+        # breaks the retained-KV invariant, so only already-prunable pins are
+        # candidates. If the budget is still saturated, allocation/backpressure
+        # must handle it instead of silently corrupting Phase4.
         while len(self._phase4_pinned_blocks) > limit:
             if not self._phase4_pin_order:
                 break
             trace_id = self._phase4_pin_order.popleft()
-            if trace_id in self._phase4_pinned_blocks:
+            pin = self._phase4_pinned_blocks.get(trace_id)
+            if pin is None:
+                continue
+            if self._phase4_pin_is_prunable(pin, now, ttl_seconds):
                 self._release_phase4_pins(trace_id, "limit")
+                continue
+            self._phase4_pin_order.append(trace_id)
+            logger.warning(
+                "[PHASE4-PIN-LIMIT-SATURATED] pins=%d limit=%d; "
+                "keeping live pins to preserve retained KV",
+                len(self._phase4_pinned_blocks),
+                limit,
+            )
+            break
 
     def _pin_phase4_request_blocks(self, request: Request) -> None:
         trace_id = self._phase4_trace_id(request)
         if not trace_id or request.status == RequestStatus.FINISHED_ABORTED:
             return
-
-        # Replacing an older pin for the same trace is expected if a request
-        # is aborted or retried. Drop it before taking the new finished state.
-        self._release_phase4_pins(trace_id, "replace")
 
         entries: list[tuple[Any, list[Any]]] = []
         total_blocks = 0
@@ -2564,7 +2776,19 @@ class Scheduler(SchedulerInterface):
 
         if not entries:
             return
-        self._phase4_pinned_blocks[trace_id] = entries
+
+        # The successor has finished successfully; replace the previous
+        # retained-state pin only now. This keeps call N's pin available for
+        # call N+1 preemption/retry until call N+1 can publish its own state.
+        self._release_phase4_pins(trace_id, "replace")
+        self._phase4_pinned_blocks[trace_id] = Phase4Pin(
+            entries=entries,
+            token_count=request.num_tokens,
+            block_count=total_blocks,
+            request_id=request.request_id[:8],
+            call_idx=self._phase4_call_idx(request),
+            created_at=time.monotonic(),
+        )
         self._phase4_pin_order.append(trace_id)
         self._prune_phase4_pins()
         if os.environ.get("KVE_TRACE_PHASE4_PIN") == "1":
@@ -2582,10 +2806,12 @@ class Scheduler(SchedulerInterface):
         if not trace_id or expected_cached_tokens <= 0:
             return None
         entries = self._phase4_pinned_blocks.get(trace_id)
-        if not entries:
+        if entries is None:
             return None
 
-        by_manager_id = {id(manager): blocks for manager, blocks in entries}
+        by_manager_id = {
+            id(manager): blocks for manager, blocks in entries.entries
+        }
         groups: list[list[Any]] = []
         min_cached_tokens = expected_cached_tokens
         for manager in self.kv_cache_manager.coordinator.single_type_managers:
@@ -3348,40 +3574,54 @@ class Scheduler(SchedulerInterface):
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
 
-                # Compaction auto-pad: when enabled, defer the actual
-                # free + worker-finish-notification by one step so the
-                # next `schedule()` iter can prefill `pad_len` filler
-                # tokens, land the trailing partial block in the prefix
-                # cache, and only then free. The output (EOS + completion
-                # tokens) is still emitted THIS step exactly as before —
-                # we just keep the request alive internally for one more
-                # forward.
+                # Compaction finish commit: when enabled, defer the actual
+                # free + worker-finish-notification by one step so the next
+                # `schedule()` iter can forward any still-uncomputed final
+                # sampled token and optional filler padding. This ensures
+                # blocks are not published to the prefix cache until their
+                # K/V has really been materialized.
+                needs_final_token_forward = (
+                    request.num_computed_tokens < request.num_tokens
+                )
+                needs_block_align_forward = (
+                    request.num_tokens % self._compaction_block_size != 0
+                    if self._compaction_block_size > 0
+                    else False
+                )
                 auto_pad_active = (
                     self._compaction_block_aligned_finish
                     and self.cache_config.enable_prefix_caching
                     and self._compaction_block_size > 0
                     and not request.padding_pending
                     and status_before_stop == RequestStatus.RUNNING
-                    and request.num_tokens % self._compaction_block_size != 0
+                    and (
+                        needs_final_token_forward
+                        or needs_block_align_forward
+                    )
                     and not request.streaming_queue
                 )
                 if auto_pad_active:
-                    pad_len = self._compaction_block_size - (
-                        request.num_tokens % self._compaction_block_size
-                    )
+                    pad_len = (
+                        self._compaction_block_size
+                        - (request.num_tokens % self._compaction_block_size)
+                    ) % self._compaction_block_size
                     pre_pad_num_tokens = request.num_tokens
-                    request.append_padding_token_ids(
-                        self._compaction_filler_token_id,
-                        pad_len,
-                    )
-                    # Surface the padding ids on this step's output. The
-                    # orchestrator forwards them to the trainer (which
-                    # appends them to its pre-trim K-cache contribution
-                    # for THIS call) and to vLLM's prefix cache lookup
-                    # for the NEXT call (which inherits these blocks).
-                    padding_token_ids_for_output = [
-                        self._compaction_filler_token_id
-                    ] * pad_len
+                    if pad_len > 0:
+                        request.append_padding_token_ids(
+                            self._compaction_filler_token_id,
+                            pad_len,
+                        )
+                        # Surface the padding ids on this step's output.
+                        # The orchestrator forwards them to the trainer
+                        # (which appends them to its pre-trim K-cache
+                        # contribution for THIS call) and to vLLM's prefix
+                        # cache lookup for the NEXT call (which inherits
+                        # these blocks).
+                        padding_token_ids_for_output = [
+                            self._compaction_filler_token_id
+                        ] * pad_len
+                    else:
+                        padding_token_ids_for_output = []
                     request._pending_auto_pad_finish_reason = finish_reason
                     request._pending_auto_pad_stop_reason = request.stop_reason
                     request._pending_auto_pad_routed_experts = routed_experts
@@ -3389,8 +3629,8 @@ class Scheduler(SchedulerInterface):
                         padding_token_ids_for_output
                     )
                     # Do not let the client observe final completion until
-                    # the internal padding forward has completed and the
-                    # padded tail is prefix-cache visible. The output
+                    # the internal tail/padding forward has completed and the
+                    # final blocks are prefix-cache visible. The output
                     # processor still consumes this step's sampled token ids
                     # and logprobs, but the OpenAI response is held open until
                     # the finalize branch emits the real finish_reason.
@@ -3425,21 +3665,22 @@ class Scheduler(SchedulerInterface):
                     logger.info(
                         "[COMPACT/auto-pad] req=%s appended %d filler "
                         "tokens (pre=%d post=%d, block=%d); next step "
-                        "will prefill the padding to land the final "
-                        "block in the prefix cache",
+                        "will forward the pending tail before publishing "
+                        "the final block in the prefix cache",
                         request.request_id[:8],
                         pad_len,
                         pre_pad_num_tokens,
                         request.num_tokens,
                         self._compaction_block_size,
                     )
-                    # Output still emitted via routed_experts /
-                    # finish_reason set above. Skip _handle_stopped_request
-                    # and _free_request — the request stays in self.running
-                    # for the next schedule() iter to prefill the padding
-                    # tokens. Don't add to stopped_running_reqs (we want
-                    # it kept). Don't add to finished_req_ids (we want
-                    # the worker to keep its input_batch entry).
+                    # Defer final output via routed_experts /
+                    # finish_reason captured above. Skip
+                    # _handle_stopped_request and _free_request — the
+                    # request stays in self.running for the next schedule()
+                    # iter to forward the pending tail. Don't add to
+                    # stopped_running_reqs (we want it kept). Don't add to
+                    # finished_req_ids (we want the worker to keep its
+                    # input_batch entry).
                 else:
                     finished = self._handle_stopped_request(request)
                     if finished:
@@ -4118,6 +4359,10 @@ class Scheduler(SchedulerInterface):
             # persistent batch in the model runner.
             self.prev_step_scheduled_req_ids.clear()
 
+        # Phase4 pins are scheduler-local references into the prefix cache. A
+        # prefix-cache reset invalidates the carried retained state, so release
+        # all pins before resetting the normal cache.
+        self._release_all_phase4_pins("reset-prefix-cache")
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
         if reset_running_requests and not reset_successful:
             raise RuntimeError(
