@@ -99,6 +99,32 @@ def _pop_contiguous_managed_context_cpu_blocks(
     return None
 
 
+def _managed_context_cpu_reload_block_demand(
+    spans: Iterable["ManagedContextSpan"],
+) -> int:
+    """Return the GPU blocks needed to reload cold CPU-offloaded spans."""
+    return sum(
+        span.kv_block_count for span in spans if span.status == "cpu_offloaded"
+    )
+
+
+def _managed_context_gpu_reload_wait_reason(
+    *,
+    reload_blocks: int,
+    extra_blocks: int,
+    free_blocks: int,
+) -> str | None:
+    """Return a retryable wait reason when reload admission would overfill GPU."""
+    required_blocks = max(0, reload_blocks) + max(0, extra_blocks)
+    if required_blocks <= max(0, free_blocks):
+        return None
+    return (
+        "managed-context CPU reload is waiting for GPU blocks: "
+        f"reload_blocks={reload_blocks} extra_blocks={extra_blocks} "
+        f"required={required_blocks} free={free_blocks}"
+    )
+
+
 @dataclass
 class Phase4Pin:
     entries: list[tuple[Any, list[Any]]]
@@ -162,6 +188,12 @@ class ManagedContextPendingLoad:
     num_tokens: int
     event_id: int
     created_at: float
+
+
+@dataclass(frozen=True)
+class ManagedContextCPULoadStart:
+    error: str | None = None
+    retryable: bool = False
 
 
 class Scheduler(SchedulerInterface):
@@ -468,6 +500,13 @@ class Scheduler(SchedulerInterface):
         )
         self._managed_context_align_positions = (
             os.environ.get("KVE_MANAGED_CONTEXT_ALIGN_POSITIONS", "1") != "0"
+        )
+        self._managed_context_scheduler_accounted_restore = (
+            os.environ.get(
+                "KVE_MANAGED_CONTEXT_SCHEDULER_ACCOUNTED_RESTORE",
+                "0",
+            )
+            == "1"
         )
         self._managed_context_archive: dict[
             tuple[str, str], ManagedContextSpan
@@ -1631,29 +1670,6 @@ class Scheduler(SchedulerInterface):
                         self._abort_waiting_phase4_request(request, reason)
                         continue
 
-                if (
-                    restore_spans
-                    and request.request_id
-                    not in self._managed_context_active_restores
-                    and self._managed_context_restore_needs_cpu_load(restore_spans)
-                ):
-                    load_error = self._start_managed_context_cpu_load(
-                        request, restore_spans
-                    )
-                    if load_error is not None:
-                        logger.error(
-                            "[MANAGED-CONTEXT-LOAD-ABORT] req=%s %s",
-                            request.request_id[:8],
-                            load_error,
-                        )
-                        request_queue.pop_request()
-                        self._abort_waiting_phase4_request(request, load_error)
-                        continue
-                    request = request_queue.pop_request()
-                    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
-                    step_skipped_waiting.prepend_request(request)
-                    continue
-
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -1755,6 +1771,64 @@ class Scheduler(SchedulerInterface):
                     if pending_inherit_event is not None:
                         request.position_offset = 0
                     break
+
+                if (
+                    restore_spans
+                    and request.request_id
+                    not in self._managed_context_active_restores
+                    and self._managed_context_restore_needs_cpu_load(restore_spans)
+                ):
+                    extra_required_gpu_blocks = 0
+                    if self._managed_context_scheduler_accounted_restore:
+                        extra_required_gpu_blocks = (
+                            self._managed_context_visible_allocation_demand(
+                                request,
+                                num_new_tokens=num_new_tokens,
+                                num_new_computed_tokens=num_new_local_computed_tokens,
+                                new_computed_blocks=new_computed_blocks,
+                                num_lookahead_tokens=effective_lookahead_tokens,
+                                num_external_computed_tokens=(
+                                    num_external_computed_tokens
+                                ),
+                                num_encoder_tokens=num_encoder_tokens,
+                            )
+                        )
+                    load_start = self._start_managed_context_cpu_load(
+                        request,
+                        restore_spans,
+                        extra_required_gpu_blocks=extra_required_gpu_blocks,
+                    )
+                    if load_start.error is not None:
+                        if load_start.retryable:
+                            if (
+                                os.environ.get("KVE_TRACE_MANAGED_CONTEXT")
+                                == "1"
+                            ):
+                                logger.warning(
+                                    "[MANAGED-CONTEXT-LOAD-DEFER] req=%s %s",
+                                    request.request_id[:8],
+                                    load_start.error,
+                                )
+                            request.position_offset = (
+                                position_offset_before_restore_align
+                            )
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+                        logger.error(
+                            "[MANAGED-CONTEXT-LOAD-ABORT] req=%s %s",
+                            request.request_id[:8],
+                            load_start.error,
+                        )
+                        request_queue.pop_request()
+                        self._abort_waiting_phase4_request(
+                            request, load_start.error
+                        )
+                        continue
+                    request = request_queue.pop_request()
+                    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 restore_position_aligned = False
                 if restore_spans:
@@ -3697,6 +3771,52 @@ class Scheduler(SchedulerInterface):
             return (), 0, []
         return restore.block_ids, restore.num_tokens, list(restore.span_ids)
 
+    def _managed_context_min_free_gpu_blocks(self) -> int:
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        if not managers:
+            return 0
+        return min(manager.block_pool.get_num_free_blocks() for manager in managers)
+
+    def _managed_context_visible_allocation_demand(
+        self,
+        request: Request,
+        *,
+        num_new_tokens: int,
+        num_new_computed_tokens: int,
+        new_computed_blocks: KVCacheBlocks,
+        num_lookahead_tokens: int,
+        num_external_computed_tokens: int,
+        num_encoder_tokens: int,
+    ) -> int:
+        """Estimate visible-request GPU block demand without mutating state."""
+        if num_new_tokens <= 0 and num_external_computed_tokens <= 0:
+            return 0
+
+        num_local_computed_tokens = (
+            request.num_computed_tokens + num_new_computed_tokens
+        )
+        raw_total_computed_tokens = (
+            num_local_computed_tokens + num_external_computed_tokens
+        )
+        total_computed_tokens = min(
+            raw_total_computed_tokens,
+            self.max_model_len,
+        )
+        num_tokens_main_model = total_computed_tokens + num_new_tokens
+        num_tokens_need_slot = min(
+            num_tokens_main_model + num_lookahead_tokens,
+            self.max_model_len,
+        )
+
+        return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=num_tokens_need_slot,
+            new_computed_blocks=new_computed_blocks.blocks,
+            num_encoder_tokens=num_encoder_tokens,
+            total_computed_tokens=raw_total_computed_tokens,
+            num_tokens_main_model=num_tokens_main_model,
+        )
+
     def _align_managed_context_restore_position(
         self, request: Request, spans: list[ManagedContextSpan]
     ) -> bool:
@@ -3924,12 +4044,16 @@ class Scheduler(SchedulerInterface):
         return any(span.status == "cpu_offloaded" for span in spans)
 
     def _start_managed_context_cpu_load(
-        self, request: Request, spans: list[ManagedContextSpan]
-    ) -> str | None:
+        self,
+        request: Request,
+        spans: list[ManagedContextSpan],
+        *,
+        extra_required_gpu_blocks: int = 0,
+    ) -> ManagedContextCPULoadStart:
         if not self._managed_context_restore_needs_cpu_load(spans):
-            return None
+            return ManagedContextCPULoadStart()
         if request.request_id in self._managed_context_pending_loads:
-            return None
+            return ManagedContextCPULoadStart()
 
         manager_to_index = {
             id(manager): i
@@ -3938,27 +4062,42 @@ class Scheduler(SchedulerInterface):
             )
         }
         if len(manager_to_index) != 1:
-            return "managed-context CPU reload currently supports one KV cache group"
+            return ManagedContextCPULoadStart(
+                "managed-context CPU reload currently supports one KV cache group"
+            )
 
         restored_entries_by_span: dict[str, list[tuple[Any, list[Any]]]] = {}
         gpu_block_ids: list[int] = []
         cpu_block_ids: list[int] = []
         groups: list[list[Any]] = [[] for _ in manager_to_index]
-        load_block_count = sum(
-            span.kv_block_count for span in spans if span.status == "cpu_offloaded"
+        load_block_count = _managed_context_cpu_reload_block_demand(spans)
+        self._managed_context_free_hot_gpu_for_blocks(
+            load_block_count + max(0, extra_required_gpu_blocks),
+            protected={self._managed_context_span_key(span) for span in spans},
         )
+        if self._managed_context_scheduler_accounted_restore:
+            wait_reason = _managed_context_gpu_reload_wait_reason(
+                reload_blocks=load_block_count,
+                extra_blocks=extra_required_gpu_blocks,
+                free_blocks=self._managed_context_min_free_gpu_blocks(),
+            )
+            if wait_reason is not None:
+                return ManagedContextCPULoadStart(
+                    wait_reason,
+                    retryable=True,
+                )
         self._managed_context_hot_gpu_stats.misses += sum(
             1 for span in spans if span.status == "cpu_offloaded"
         )
-        self._managed_context_free_hot_gpu_for_blocks(
-            load_block_count,
-            protected={self._managed_context_span_key(span) for span in spans},
-        )
 
-        def _fail(message: str) -> str:
+        def _fail(
+            message: str,
+            *,
+            retryable: bool = False,
+        ) -> ManagedContextCPULoadStart:
             for entries in restored_entries_by_span.values():
                 self._release_managed_context_entries(entries)
-            return message
+            return ManagedContextCPULoadStart(message, retryable=retryable)
 
         try:
             for span in sorted(
@@ -3993,11 +4132,12 @@ class Scheduler(SchedulerInterface):
                 restored_entries_by_span[span.span_id] = span_entries
         except ValueError as exc:
             return _fail(
-                f"insufficient GPU blocks for managed-context CPU reload: {exc}"
+                f"insufficient GPU blocks for managed-context CPU reload: {exc}",
+                retryable=self._managed_context_scheduler_accounted_restore,
             )
 
         if not gpu_block_ids:
-            return None
+            return ManagedContextCPULoadStart()
 
         event_id = self._next_managed_context_transfer_event_id()
         self._managed_context_load_events_to_submit[event_id] = (
@@ -4040,7 +4180,7 @@ class Scheduler(SchedulerInterface):
                     for span in spans
                 },
             )
-        return None
+        return ManagedContextCPULoadStart()
 
     def _complete_managed_context_pending_load(self, request: Request) -> None:
         pending = self._managed_context_pending_loads.pop(
