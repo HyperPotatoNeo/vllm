@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -1620,11 +1621,28 @@ class OpenAIServingChat(OpenAIServing):
                     position_offset_after=e.position_offset_after,
                     num_prompt_tokens=e.num_prompt_tokens,
                     evict_start=e.evict_start,
+                    evicted_token_ids=(
+                        list(getattr(e, "evicted_token_ids", []) or [])
+                        if os.environ.get(
+                            "KVE_OPENAI_INCLUDE_EVICTED_TOKEN_IDS", "0"
+                        )
+                        == "1"
+                        else []
+                    ),
+                    last_turn_evicted=int(
+                        getattr(e, "last_turn_evicted", -1)
+                    ),
+                    num_turns_evicted_after=int(
+                        getattr(e, "num_turns_evicted_after", 0)
+                    ),
                     kept_indices=list(e.kept_indices),
                     kept_token_ids=list(e.kept_token_ids),
                     new_user_fragment_len=int(
                         getattr(e, "new_user_fragment_len", 0) or 0
                     ),
+                    archived_span_ids=[
+                        str(x) for x in getattr(e, "archived_span_ids", []) or []
+                    ],
                 )
                 for e in compaction_events
             ]

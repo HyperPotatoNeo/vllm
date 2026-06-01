@@ -66,6 +66,14 @@ class NewRequestData:
     # admission bump the offset to clear survivor logical positions for new K.
     protected_prefix_len: int = 0
 
+    # Managed context: hidden original-position KV blocks restored for this
+    # request. These blocks are prepended only to the worker-side block table;
+    # they are not prompt_token_ids and must not make the worker skip visible
+    # prompt prefill.
+    hidden_kv_block_ids: tuple[list[int], ...] = field(default_factory=tuple)
+    hidden_kv_num_tokens: int = 0
+    hidden_kv_span_ids: list[str] = field(default_factory=list)
+
     @classmethod
     def from_request(
         cls,
@@ -73,6 +81,9 @@ class NewRequestData:
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
         protected_prefix_len: int = 0,
+        hidden_kv_block_ids: tuple[list[int], ...] = (),
+        hidden_kv_num_tokens: int = 0,
+        hidden_kv_span_ids: list[str] | None = None,
     ) -> "NewRequestData":
         return cls(
             req_id=request.request_id,
@@ -87,6 +98,9 @@ class NewRequestData:
             prefill_token_ids=prefill_token_ids,
             position_offset=request.position_offset,
             protected_prefix_len=protected_prefix_len,
+            hidden_kv_block_ids=hidden_kv_block_ids,
+            hidden_kv_num_tokens=hidden_kv_num_tokens,
+            hidden_kv_span_ids=list(hidden_kv_span_ids or []),
         )
 
     def __repr__(self) -> str:
@@ -216,6 +230,22 @@ class CachedRequestData:
 
 
 @dataclass
+class ManagedContextCopyEvent:
+    event_id: int
+    gpu_block_ids: list[int]
+    cpu_block_ids: list[int]
+
+
+@dataclass
+class ManagedContextTransferMetadata:
+    store_events: list[ManagedContextCopyEvent] = field(default_factory=list)
+    load_events: list[ManagedContextCopyEvent] = field(default_factory=list)
+
+    def is_empty(self) -> bool:
+        return not self.store_events and not self.load_events
+
+
+@dataclass
 class SchedulerOutput:
     # list of the requests that are scheduled for the first time.
     # We cache the request's data in each worker process, so that we don't
@@ -272,6 +302,11 @@ class SchedulerOutput:
 
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
+
+    # Managed context CPU archive/reload transfer metadata. This is distinct
+    # from the generic KV connector because ownership is span-ID based rather
+    # than prefix/hash based.
+    managed_context_transfer_metadata: ManagedContextTransferMetadata | None = None
 
     # Block IDs freshly allocated from the pool during this scheduling step.
     # The worker zeros the corresponding GPU memory before the blocks are used,

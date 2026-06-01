@@ -106,6 +106,9 @@ class CompactionEventPayload(OpenAIBaseModel):
     position_offset_after: int
     num_prompt_tokens: int = 0
     evict_start: int = 0
+    evicted_token_ids: list[int] = Field(default_factory=list)
+    last_turn_evicted: int = -1
+    num_turns_evicted_after: int = 0
     # Indices (pre-event coords) of tokens that physically survive this
     # eviction. Length = pre-event token count - tokens_evicted. The
     # orchestrator uses kept_token_ids (below) to assemble the next
@@ -119,6 +122,9 @@ class CompactionEventPayload(OpenAIBaseModel):
     # Used by the trainer's segmented_forward mirror to split each
     # admission boundary into pre- and post-fragment segments.
     new_user_fragment_len: int = 0
+    # Managed-context extension: scheduler-local IDs for archived KV spans
+    # captured during this eviction. Empty unless managed context is enabled.
+    archived_span_ids: list[str] = Field(default_factory=list)
 
 
 class ChatCompletionResponse(OpenAIBaseModel):

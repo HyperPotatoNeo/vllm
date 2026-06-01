@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -126,7 +127,10 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import (
+    ManagedContextTransferMetadata,
+    NewRequestData,
+)
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -149,11 +153,13 @@ from vllm.v1.outputs import (
     KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
+    ManagedContextTransferOutput,
     ModelRunnerOutput,
     PoolerOutput,
     SamplerOutput,
     make_empty_encoder_model_runner_output,
 )
+from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
@@ -369,6 +375,351 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
         return self._model_runner_output
 
 
+ManagedContextBlockRange: TypeAlias = tuple[int, int, int]
+
+
+@dataclass
+class ManagedContextTransferEventState:
+    event_id: int
+    event: torch.Event
+    submitted_at: float
+    direction: str
+    num_blocks: int
+    num_cache_tensors: int
+    num_ranges: int
+    num_copy_calls: int
+    num_block_copy_calls: int
+    num_bytes: int
+
+
+def _coalesce_managed_context_block_ranges(
+    src_blocks: Sequence[int],
+    dst_blocks: Sequence[int],
+) -> list[ManagedContextBlockRange]:
+    """Group paired block IDs into maximal contiguous source/destination runs."""
+    if len(src_blocks) != len(dst_blocks):
+        raise ValueError(
+            "managed-context copy block ID length mismatch: "
+            f"src={len(src_blocks)} dst={len(dst_blocks)}"
+        )
+    if not src_blocks:
+        return []
+
+    ranges: list[ManagedContextBlockRange] = []
+    src_start = int(src_blocks[0])
+    dst_start = int(dst_blocks[0])
+    prev_src = src_start
+    prev_dst = dst_start
+    length = 1
+
+    for raw_src, raw_dst in zip(src_blocks[1:], dst_blocks[1:]):
+        src = int(raw_src)
+        dst = int(raw_dst)
+        if src == prev_src + 1 and dst == prev_dst + 1:
+            length += 1
+        else:
+            ranges.append((src_start, dst_start, length))
+            src_start = src
+            dst_start = dst
+            length = 1
+        prev_src = src
+        prev_dst = dst
+
+    ranges.append((src_start, dst_start, length))
+    return ranges
+
+
+class ManagedContextCPUTransferWorker:
+    """Worker-side async copies for managed-context CPU archive spans."""
+
+    def __init__(self, num_cpu_blocks: int):
+        self.num_cpu_blocks = num_cpu_blocks
+        self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
+        self.cpu_kv_caches: dict[str, torch.Tensor] | None = None
+        self.device: torch.device | None = None
+        self.load_stream: torch.cuda.Stream | None = None
+        self.store_stream: torch.cuda.Stream | None = None
+        self._load_events: list[ManagedContextTransferEventState] = []
+        self._store_events: list[ManagedContextTransferEventState] = []
+        self._load_hwm = -1
+        self._store_hwm = -1
+        self._pending_load_event_ids: set[int] = set()
+        self._pending_store_event_ids: set[int] = set()
+
+    def register_kv_caches(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        kv_cache_config: KVCacheConfig,
+    ) -> None:
+        if not kv_caches:
+            logger.warning("[MANAGED-CONTEXT-CPU] no KV caches registered")
+            return
+
+        def _repr_tensor(value: torch.Tensor | list[torch.Tensor]) -> torch.Tensor:
+            assert isinstance(value, torch.Tensor | list)
+            return value if isinstance(value, torch.Tensor) else value[0]
+
+        any_tensor = _repr_tensor(next(iter(kv_caches.values())))
+        self.device = any_tensor.device
+        num_gpu_blocks = kv_cache_config.num_blocks
+
+        seen_ptrs: dict[int, tuple[str, torch.Tensor]] = {}
+        for name, value in kv_caches.items():
+            tensor = _repr_tensor(value)
+            ptr = tensor.untyped_storage().data_ptr()
+            if ptr not in seen_ptrs:
+                seen_ptrs[ptr] = (name, tensor)
+
+        unique_gpu_caches: dict[str, torch.Tensor] = {}
+        for name, tensor in seen_ptrs.values():
+            storage = tensor.untyped_storage()
+            raw = torch.empty(0, dtype=torch.int8, device=self.device).set_(
+                storage, 0, (storage.nbytes(),)
+            )
+            element_size = tensor.element_size()
+            page_size_bytes = storage.nbytes() // num_gpu_blocks
+            outer_dims = [
+                dim
+                for dim in range(tensor.ndim)
+                if tensor.stride(dim) * element_size > page_size_bytes
+            ]
+            if not outer_dims:
+                unique_gpu_caches[name] = raw.view(num_gpu_blocks, -1)
+            else:
+                segment_stride = tensor.stride(outer_dims[0]) * element_size
+                for idx in range(tensor.shape[outer_dims[0]]):
+                    offset = idx * segment_stride
+                    segment = raw[offset : offset + segment_stride]
+                    unique_gpu_caches[f"{name}.{idx}"] = segment.view(
+                        num_gpu_blocks, -1
+                    )
+
+        pin_memory = is_pin_memory_available()
+        if not pin_memory:
+            logger.warning(
+                "[MANAGED-CONTEXT-CPU] pinned memory unavailable; transfers may be slow"
+            )
+
+        self.gpu_kv_caches = unique_gpu_caches
+        self.cpu_kv_caches = {}
+        for name, gpu_tensor in unique_gpu_caches.items():
+            cpu_shape = (self.num_cpu_blocks,) + gpu_tensor.shape[1:]
+            tensor = torch.zeros(cpu_shape, dtype=gpu_tensor.dtype, device="cpu")
+            if pin_memory:
+                pin_tensor(tensor)
+            self.cpu_kv_caches[name] = tensor
+
+        low_pri, _ = torch.cuda.Stream.priority_range()
+        self.load_stream = torch.cuda.Stream(priority=low_pri)
+        self.store_stream = torch.cuda.Stream(priority=low_pri)
+        total_bytes_per_block = sum(
+            tensor.stride(0) * tensor.element_size()
+            for tensor in unique_gpu_caches.values()
+        )
+        logger.warning(
+            "[MANAGED-CONTEXT-CPU] registered %d cache tensors, cpu_blocks=%d "
+            "capacity=%.2f GiB",
+            len(unique_gpu_caches),
+            self.num_cpu_blocks,
+            (self.num_cpu_blocks * total_bytes_per_block) / (1024**3),
+        )
+
+    def submit_and_poll(
+        self, metadata: ManagedContextTransferMetadata | None
+    ) -> ManagedContextTransferOutput | None:
+        if self.gpu_kv_caches is None or self.cpu_kv_caches is None:
+            if metadata and not metadata.is_empty():
+                raise RuntimeError(
+                    "managed-context CPU transfer requested before KV cache registration"
+                )
+            return None
+
+        if metadata is not None:
+            for event in metadata.load_events:
+                self._pending_load_event_ids.add(event.event_id)
+                self._launch_copy(
+                    event.cpu_block_ids,
+                    event.gpu_block_ids,
+                    is_store=False,
+                    event_idx=event.event_id,
+                )
+            for event in metadata.store_events:
+                self._pending_store_event_ids.add(event.event_id)
+                self._launch_copy(
+                    event.gpu_block_ids,
+                    event.cpu_block_ids,
+                    is_store=True,
+                    event_idx=event.event_id,
+                )
+
+        completed_loads: list[int] = []
+        completed_stores: list[int] = []
+        if self._pending_load_event_ids:
+            load_hwm = self._poll_stream_events(is_store=False)
+            for event_id in [
+                event_id
+                for event_id in self._pending_load_event_ids
+                if event_id <= load_hwm
+            ]:
+                self._pending_load_event_ids.discard(event_id)
+                completed_loads.append(event_id)
+        if self._pending_store_event_ids:
+            store_hwm = self._poll_stream_events(is_store=True)
+            for event_id in [
+                event_id
+                for event_id in self._pending_store_event_ids
+                if event_id <= store_hwm
+            ]:
+                self._pending_store_event_ids.discard(event_id)
+                completed_stores.append(event_id)
+
+        output = ManagedContextTransferOutput(
+            completed_store_event_ids=completed_stores,
+            completed_load_event_ids=completed_loads,
+        )
+        return None if output.is_empty() else output
+
+    def _launch_copy(
+        self,
+        src_blocks: list[int],
+        dst_blocks: list[int],
+        *,
+        is_store: bool,
+        event_idx: int,
+    ) -> None:
+        try:
+            ranges = _coalesce_managed_context_block_ranges(src_blocks, dst_blocks)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        stream = self.store_stream if is_store else self.load_stream
+        events = self._store_events if is_store else self._load_events
+        assert stream is not None
+        assert self.gpu_kv_caches is not None and self.cpu_kv_caches is not None
+        src_caches = self.gpu_kv_caches if is_store else self.cpu_kv_caches
+        dst_caches = self.cpu_kv_caches if is_store else self.gpu_kv_caches
+        num_bytes = 0
+        submit_start = time.perf_counter()
+        with torch.cuda.stream(stream):
+            for name, src_cache in src_caches.items():
+                dst_cache = dst_caches[name]
+                for src_start, dst_start, length in ranges:
+                    if length == 1:
+                        dst_cache[dst_start].copy_(
+                            src_cache[src_start],
+                            non_blocking=True,
+                        )
+                    else:
+                        dst_cache[dst_start : dst_start + length].copy_(
+                            src_cache[src_start : src_start + length],
+                            non_blocking=True,
+                        )
+                    num_bytes += (
+                        int(length) * int(src_cache.stride(0))
+                        * int(src_cache.element_size())
+                    )
+            event = torch.Event()
+            event.record(stream)
+        state = ManagedContextTransferEventState(
+            event_id=event_idx,
+            event=event,
+            submitted_at=submit_start,
+            direction="D2H" if is_store else "H2D",
+            num_blocks=len(src_blocks),
+            num_cache_tensors=len(src_caches),
+            num_ranges=len(ranges),
+            num_copy_calls=len(src_caches) * len(ranges),
+            num_block_copy_calls=len(src_caches) * len(src_blocks),
+            num_bytes=num_bytes,
+        )
+        if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+            logger.warning(
+                "[MANAGED-CONTEXT-CPU-%s-SUBMIT] event=%d blocks=%d "
+                "cache_tensors=%d ranges=%d copy_calls=%d "
+                "per_block_copy_calls=%d bytes=%d submit_ms=%.3f",
+                state.direction,
+                state.event_id,
+                state.num_blocks,
+                state.num_cache_tensors,
+                state.num_ranges,
+                state.num_copy_calls,
+                state.num_block_copy_calls,
+                state.num_bytes,
+                (time.perf_counter() - submit_start) * 1000.0,
+            )
+        events.append(state)
+
+    def _poll_stream_events(self, *, is_store: bool) -> int:
+        events = self._store_events if is_store else self._load_events
+        hwm = self._store_hwm if is_store else self._load_hwm
+        while events:
+            state = events[0]
+            if not state.event.query():
+                break
+            hwm = state.event_id
+            events.pop(0)
+            if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+                elapsed_s = time.perf_counter() - state.submitted_at
+                gib_per_s = (
+                    (state.num_bytes / (1024**3)) / elapsed_s
+                    if elapsed_s > 0.0
+                    else 0.0
+                )
+                logger.warning(
+                    "[MANAGED-CONTEXT-CPU-%s-DONE] event=%d blocks=%d "
+                    "ranges=%d copy_calls=%d bytes=%d elapsed_ms=%.3f "
+                    "effective_gib_s=%.3f",
+                    state.direction,
+                    state.event_id,
+                    state.num_blocks,
+                    state.num_ranges,
+                    state.num_copy_calls,
+                    state.num_bytes,
+                    elapsed_s * 1000.0,
+                    gib_per_s,
+                )
+        if is_store:
+            self._store_hwm = hwm
+        else:
+            self._load_hwm = hwm
+        return hwm
+
+    def shutdown(self) -> None:
+        for state in list(self._load_events):
+            state.event.synchronize()
+            self._load_hwm = max(self._load_hwm, state.event_id)
+        self._load_events.clear()
+        for state in list(self._store_events):
+            state.event.synchronize()
+            self._store_hwm = max(self._store_hwm, state.event_id)
+        self._store_events.clear()
+
+    def __del__(self) -> None:
+        try:
+            self.shutdown()
+        except Exception:
+            pass
+
+
+def _merge_managed_context_transfer_outputs(
+    first: ManagedContextTransferOutput | None,
+    second: ManagedContextTransferOutput | None,
+) -> ManagedContextTransferOutput | None:
+    if first is None:
+        return second
+    if second is None:
+        return first
+    merged = ManagedContextTransferOutput(
+        completed_store_event_ids=(
+            first.completed_store_event_ids + second.completed_store_event_ids
+        ),
+        completed_load_event_ids=(
+            first.completed_load_event_ids + second.completed_load_event_ids
+        ),
+    )
+    return None if merged.is_empty() else merged
+
+
 class ExecuteModelState(NamedTuple):
     """Ephemeral cached state transferred between execute_model() and
     sample_tokens(), after execute_model() returns None."""
@@ -383,6 +734,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    managed_context_transfer_output: ManagedContextTransferOutput | None
 
 
 class GPUModelRunner(
@@ -490,6 +842,25 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        try:
+            managed_context_cpu_blocks = int(
+                os.environ.get("KVE_MANAGED_CONTEXT_CPU_OFFLOAD_MAX_BLOCKS", "0")
+                or "0"
+            )
+        except ValueError:
+            managed_context_cpu_blocks = 0
+        self.managed_context_cpu_transfer_worker = (
+            ManagedContextCPUTransferWorker(managed_context_cpu_blocks)
+            if (
+                os.environ.get("KVE_MANAGED_CONTEXT_ARCHIVE_DEVICE", "gpu")
+                .strip()
+                .lower()
+                == "cpu"
+                or os.environ.get("KVE_MANAGED_CONTEXT_CPU_OFFLOAD", "0") == "1"
+            )
+            and managed_context_cpu_blocks > 0
+            else None
+        )
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -689,6 +1060,9 @@ class GPUModelRunner(
         # compaction-ignorant beyond reading position_offsets through
         # the standard CachedRequestData rebuild flow.
         self.position_offsets_gpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.int64, device=self.device
+        )
+        self.hidden_kv_num_tokens_gpu = torch.zeros(
             self.max_num_reqs, dtype=torch.int64, device=self.device
         )
         # 2-piece position fix (plans/piecewise_position_offset.md): per-request
@@ -1166,6 +1540,15 @@ class GPUModelRunner(
                 to_update = model.pooler.get_pooling_updates(task)
                 to_update.apply(pooling_params)
 
+            hidden_block_ids = new_req_data.hidden_kv_block_ids
+            if hidden_block_ids:
+                block_ids = tuple(
+                    list(hidden_block_ids[i]) + list(new_req_data.block_ids[i])
+                    for i in range(len(new_req_data.block_ids))
+                )
+            else:
+                block_ids = new_req_data.block_ids
+
             req_state = CachedRequestState(
                 req_id=req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
@@ -1174,7 +1557,7 @@ class GPUModelRunner(
                 sampling_params=sampling_params,
                 pooling_params=pooling_params,
                 generator=generator,
-                block_ids=new_req_data.block_ids,
+                block_ids=block_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
@@ -1189,6 +1572,7 @@ class GPUModelRunner(
                 # skew at the prefill/decode boundary.
                 position_offset=new_req_data.position_offset,
                 protected_prefix_len=new_req_data.protected_prefix_len,
+                hidden_kv_num_tokens=new_req_data.hidden_kv_num_tokens,
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -2062,13 +2446,25 @@ class GPUModelRunner(
         self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
         self.num_scheduled_tokens.copy_to_gpu(num_reqs)
         num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
-        # Physical positions (for slot_mapping: block_idx = pos // block_size).
-        physical_positions = (
+        # Visible positions are positions in the submitted compact prompt.
+        # Managed-context hidden KV is not part of prompt_token_ids, so token
+        # selection and RoPE stay in this visible coordinate frame.
+        visible_positions = (
             self.num_computed_tokens[req_indices_gpu].to(torch.int64)
             + self.query_pos.gpu[:total_num_scheduled_tokens]
         )
+        self.hidden_kv_num_tokens_gpu[:num_reqs].copy_(
+            self.input_batch.hidden_kv_num_tokens_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
+        per_token_hidden_kv = self.hidden_kv_num_tokens_gpu[req_indices_gpu]
+        # Physical positions are worker block-table positions. Hidden KV blocks
+        # are prepended to the row, so current visible tokens write after them.
+        physical_positions = visible_positions + per_token_hidden_kv
         self.seq_lens[:num_reqs] = (
-            self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
+            self.hidden_kv_num_tokens_gpu[:num_reqs].to(torch.int32)
+            + self.num_computed_tokens[:num_reqs]
+            + num_scheduled_tokens_gpu
         )
         self.seq_lens[num_reqs:].fill_(0)
 
@@ -2096,20 +2492,117 @@ class GPUModelRunner(
         )
         per_token_ppl = self.protected_prefix_lens_gpu[req_indices_gpu]
         per_token_offset = self.position_offsets_gpu[req_indices_gpu]
-        is_post_sys = (physical_positions >= per_token_ppl).to(torch.int64)
+        is_post_sys = (visible_positions >= per_token_ppl).to(torch.int64)
         self.positions[:total_num_scheduled_tokens] = (
-            physical_positions
+            visible_positions
             + per_token_offset * is_post_sys
         )
+
+        import os as _os
+        if (
+            _os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1"
+            and torch.any(self.hidden_kv_num_tokens_gpu[:num_reqs] > 0)
+        ):
+            try:
+                _visible_cpu = visible_positions.detach().cpu().tolist()
+                _physical_cpu = physical_positions.detach().cpu().tolist()
+                _logical_cpu = self.positions[
+                    :total_num_scheduled_tokens
+                ].detach().cpu().tolist()
+                _slot_cpu = (
+                    self.input_batch.block_table[0]
+                    .slot_mapping.gpu[:total_num_scheduled_tokens]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                _hidden_cpu = (
+                    self.hidden_kv_num_tokens_gpu[:num_reqs]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                _seq_cpu = self.seq_lens[:num_reqs].detach().cpu().tolist()
+                _offset_cpu = (
+                    self.position_offsets_gpu[:num_reqs]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                _ppl_cpu = (
+                    self.protected_prefix_lens_gpu[:num_reqs]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                _req_idx_cpu = req_indices_gpu.detach().cpu().tolist()
+                _bt = self.input_batch.block_table[0]
+                _block_size = _bt.block_size
+                for _req_i in range(num_reqs):
+                    if _hidden_cpu[_req_i] <= 0:
+                        continue
+                    _start = int(self.query_start_loc.np[_req_i])
+                    _end = int(self.query_start_loc.np[_req_i + 1])
+                    _num_blocks = int(_bt.num_blocks_per_row[_req_i])
+                    _row_blocks = _bt.block_table.np[
+                        _req_i, : min(_num_blocks, 16)
+                    ].tolist()
+                    _hidden_capacity = (
+                        (_hidden_cpu[_req_i] + _block_size - 1)
+                        // _block_size
+                    ) * _block_size
+                    logger.warning(
+                        "[MANAGED-CONTEXT-RUNNER] req=%s idx=%d "
+                        "hidden_tokens=%d hidden_block_capacity=%d "
+                        "seq_len=%d visible_seq_len=%d num_computed=%d "
+                        "scheduled=%d prompt_len=%d position_offset=%d "
+                        "protected_prefix_len=%d block_size=%d row_blocks_head=%s "
+                        "first_token=(visible=%s physical=%s logical=%s slot=%s) "
+                        "last_token=(visible=%s physical=%s logical=%s slot=%s)",
+                        self.input_batch.req_ids[_req_i][:8],
+                        _req_i,
+                        _hidden_cpu[_req_i],
+                        _hidden_capacity,
+                        _seq_cpu[_req_i],
+                        int(self.optimistic_seq_lens_cpu[_req_i].item()),
+                        int(self.input_batch.num_computed_tokens_cpu[_req_i]),
+                        int(num_scheduled_tokens[_req_i]),
+                        int(self.input_batch.num_prompt_tokens[_req_i]),
+                        _offset_cpu[_req_i],
+                        _ppl_cpu[_req_i],
+                        _block_size,
+                        _row_blocks,
+                        _visible_cpu[_start] if _start < _end else None,
+                        _physical_cpu[_start] if _start < _end else None,
+                        _logical_cpu[_start] if _start < _end else None,
+                        _slot_cpu[_start] if _start < _end else None,
+                        _visible_cpu[_end - 1] if _start < _end else None,
+                        _physical_cpu[_end - 1] if _start < _end else None,
+                        _logical_cpu[_end - 1] if _start < _end else None,
+                        _slot_cpu[_end - 1] if _start < _end else None,
+                    )
+                for _tok_i in range(min(total_num_scheduled_tokens, 24)):
+                    logger.warning(
+                        "[MANAGED-CONTEXT-RUNNER-TOKEN] t=%d req_idx=%d "
+                        "visible=%s physical=%s logical=%s slot=%s",
+                        _tok_i,
+                        _req_idx_cpu[_tok_i],
+                        _visible_cpu[_tok_i],
+                        _physical_cpu[_tok_i],
+                        _logical_cpu[_tok_i],
+                        _slot_cpu[_tok_i],
+                    )
+            except Exception as _e:
+                logger.warning("[MANAGED-CONTEXT-RUNNER] trace failed: %s", _e)
 
         # [POS-TRACE] dump per-token positions so we can verify RoPE
         # positions are monotonically increasing across the request
         # lifetime (especially across decode steps after admission
         # compaction). Gated on env var KV_EVICTION_POS_TRACE=1 to
         # avoid spamming the log.
-        import os as _os
         if _os.environ.get("KV_EVICTION_POS_TRACE", "0") == "1":
             try:
+                _visible_cpu = visible_positions.detach().cpu().tolist()
                 _physical_cpu = physical_positions.detach().cpu().tolist()
                 _offsets_cpu = (
                     self.position_offsets_gpu[req_indices_gpu]
@@ -2133,13 +2626,16 @@ class GPUModelRunner(
                     _num_computed, _num_offset_per_req,
                 )
                 logger.info(
-                    "[POS-TRACE] per-token (req_idx, physical, offset, logical):"
+                    "[POS-TRACE] per-token (req_idx, visible, physical, "
+                    "offset, logical):"
                 )
                 for _i in range(min(total_num_scheduled_tokens, 32)):
                     logger.info(
-                        "[POS-TRACE]   t%d: req=%d phys=%d offset=%d logical=%d",
+                        "[POS-TRACE]   t%d: req=%d visible=%d phys=%d "
+                        "offset=%d logical=%d",
                         _i,
                         _req_idx_cpu[_i],
+                        _visible_cpu[_i],
                         _physical_cpu[_i],
                         _offsets_cpu[_i],
                         _logical_cpu[_i],
@@ -2266,13 +2762,22 @@ class GPUModelRunner(
         if ubatch_slices is not None:
             attn_metadata = [dict() for _ in range(len(ubatch_slices))]
 
+        visible_seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs_padded]
+        hidden_seq_lens_cpu = (
+            self.input_batch.hidden_kv_num_tokens_cpu_tensor[:num_reqs_padded]
+        )
+        if torch.any(hidden_seq_lens_cpu[:num_reqs]):
+            attn_seq_lens_cpu = visible_seq_lens_cpu + hidden_seq_lens_cpu
+        else:
+            attn_seq_lens_cpu = visible_seq_lens_cpu
+
         if for_cudagraph_capture:
             # For some attention backends (e.g. FA) with sliding window models we need
             # to make sure the backend see a max_seq_len that is larger to the sliding
             # window size when capturing to make sure the correct kernel is selected.
             max_seq_len = self.max_model_len
         else:
-            max_seq_len = self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max().item()
+            max_seq_len = attn_seq_lens_cpu[:num_reqs].max().item()
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
@@ -2308,7 +2813,7 @@ class GPUModelRunner(
         num_prompt_tokens_cpu = self.input_batch.num_prompt_tokens_cpu_tensor[
             :num_reqs_padded
         ]
-        seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs_padded]
+        seq_lens_cpu = attn_seq_lens_cpu
 
         # is_prefilling: True if request is still in prefill phase.
         # Used by mamba backends to distinguish actual decodes from
@@ -2338,7 +2843,7 @@ class GPUModelRunner(
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
-                self.optimistic_seq_lens_cpu[:num_reqs],
+                attn_seq_lens_cpu[:num_reqs],
                 self.dcp_world_size,
                 self.dcp_rank,
                 self.parallel_config.cp_kv_cache_interleave_size,
@@ -3264,6 +3769,7 @@ class GPUModelRunner(
         num_scheduled_tokens: int,
         num_scheduled_tokens_np: np.ndarray,
         kv_connector_output: KVConnectorOutput | None,
+        managed_context_transfer_output: ManagedContextTransferOutput | None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         num_reqs = self.input_batch.num_reqs
         assert num_reqs == len(self.input_batch.pooling_params), (
@@ -3301,6 +3807,7 @@ class GPUModelRunner(
             req_ids=self.input_batch.req_ids.copy(),
             req_id_to_index=self.input_batch.req_id_to_index.copy(),
             kv_connector_output=kv_connector_output,
+            managed_context_transfer_output=managed_context_transfer_output,
         )
 
         if raw_pooler_output is None or not any(finished_mask):
@@ -3952,6 +4459,7 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        managed_context_transfer_output: ManagedContextTransferOutput | None = None
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
@@ -3963,6 +4471,23 @@ class GPUModelRunner(
             # state. No worker-side compaction dispatch is needed —
             # `execute_model` runs a single normal forward.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            managed_context_metadata = (
+                scheduler_output.managed_context_transfer_metadata
+            )
+            if self.managed_context_cpu_transfer_worker is not None:
+                managed_context_transfer_output = (
+                    self.managed_context_cpu_transfer_worker.submit_and_poll(
+                        managed_context_metadata
+                    )
+                )
+            elif (
+                managed_context_metadata is not None
+                and not managed_context_metadata.is_empty()
+            ):
+                raise RuntimeError(
+                    "managed-context CPU transfer metadata received, but "
+                    "KVE_MANAGED_CONTEXT_CPU_OFFLOAD_MAX_BLOCKS is not enabled"
+                )
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -3987,8 +4512,23 @@ class GPUModelRunner(
                     self._dummy_run(1)
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                    if managed_context_transfer_output is None:
+                        return EMPTY_MODEL_RUNNER_OUTPUT
+                    return ModelRunnerOutput(
+                        req_ids=[],
+                        req_id_to_index={},
+                        managed_context_transfer_output=managed_context_transfer_output,
+                    )
+                output = self.kv_connector_no_forward(
+                    scheduler_output, self.vllm_config
+                )
+                if managed_context_transfer_output is not None:
+                    if output is EMPTY_MODEL_RUNNER_OUTPUT:
+                        output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
+                    output.managed_context_transfer_output = (
+                        managed_context_transfer_output
+                    )
+                return output
 
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
@@ -4208,11 +4748,21 @@ class GPUModelRunner(
 
                 if self.is_pooling_model:
                     # Return the pooling output.
+                    if self.managed_context_cpu_transfer_worker is not None:
+                        managed_context_transfer_output = (
+                            _merge_managed_context_transfer_outputs(
+                                managed_context_transfer_output,
+                                self.managed_context_cpu_transfer_worker.submit_and_poll(
+                                    None
+                                ),
+                            )
+                        )
                     return self._pool(
                         hidden_states,
                         num_scheduled_tokens,
                         num_scheduled_tokens_np,
                         kv_connector_output,
+                        managed_context_transfer_output,
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
@@ -4247,6 +4797,14 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+        if self.managed_context_cpu_transfer_worker is not None:
+            managed_context_transfer_output = (
+                _merge_managed_context_transfer_outputs(
+                    managed_context_transfer_output,
+                    self.managed_context_cpu_transfer_worker.submit_and_poll(None),
+                )
+            )
+
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
@@ -4258,6 +4816,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            managed_context_transfer_output,
         )
         self.kv_connector_output = kv_connector_output
 
@@ -4275,19 +4834,39 @@ class GPUModelRunner(
         if self.execute_model_state is None:
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
+            managed_context_transfer_output = None
+            if self.managed_context_cpu_transfer_worker is not None:
+                managed_context_transfer_output = (
+                    self.managed_context_cpu_transfer_worker.submit_and_poll(None)
+                )
             # receive sampled token ids from the last PP rank.
             if self.use_async_scheduling and get_pp_group().world_size > 1:
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
             if not kv_connector_output:
+                if managed_context_transfer_output is not None:
+                    return ModelRunnerOutput(
+                        req_ids=[],
+                        req_id_to_index={},
+                        managed_context_transfer_output=(
+                            managed_context_transfer_output
+                        ),
+                    )
                 return None  # type: ignore[return-value]
 
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             if kv_connector_output.is_empty():
-                return EMPTY_MODEL_RUNNER_OUTPUT
+                if managed_context_transfer_output is None:
+                    return EMPTY_MODEL_RUNNER_OUTPUT
+                output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
+                output.managed_context_transfer_output = (
+                    managed_context_transfer_output
+                )
+                return output
 
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
+            output.managed_context_transfer_output = managed_context_transfer_output
             return output
 
         # Unpack ephemeral state.
@@ -4302,6 +4881,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            managed_context_transfer_output,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -4454,6 +5034,13 @@ class GPUModelRunner(
         # self.kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+        if self.managed_context_cpu_transfer_worker is not None:
+            managed_context_transfer_output = (
+                _merge_managed_context_transfer_outputs(
+                    managed_context_transfer_output,
+                    self.managed_context_cpu_transfer_worker.submit_and_poll(None),
+                )
+            )
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
@@ -4473,6 +5060,7 @@ class GPUModelRunner(
                 ec_connector_output=ec_connector_output
                 if self.supports_mm_inputs
                 else None,
+                managed_context_transfer_output=managed_context_transfer_output,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
             )
@@ -6946,6 +7534,10 @@ class GPUModelRunner(
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )
+        if self.managed_context_cpu_transfer_worker is not None:
+            self.managed_context_cpu_transfer_worker.register_kv_caches(
+                kv_caches, kv_cache_config
+            )
 
         if (
             self.speculative_config

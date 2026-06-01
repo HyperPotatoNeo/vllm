@@ -98,3 +98,8 @@ class CompactionEvent(
     # the boundary. Default 0 for wire compat (omit_defaults) and for
     # mid-gen events that don't expose a fragment boundary.
     new_user_fragment_len: int = 0
+
+    # Managed-context extension: scheduler-local IDs for archived KV spans
+    # captured during this eviction. Empty unless KVE_MANAGED_CONTEXT=1 and
+    # the request is Phase4/turn-compaction eligible.
+    archived_span_ids: list[str] = msgspec.field(default_factory=list)

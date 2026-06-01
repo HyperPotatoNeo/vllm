@@ -60,6 +60,11 @@ class CachedRequestState:
     # applied to Q only when physical >= protected_prefix_len.
     protected_prefix_len: int = 0
 
+    # Managed context: hidden restored KV prefix length. This affects only
+    # worker-side block-table slot positions and attention seq_lens; token
+    # selection and RoPE positions remain based on the visible prompt stream.
+    hidden_kv_num_tokens: int = 0
+
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             self.prompt_token_ids, self.prompt_embeds
@@ -155,6 +160,16 @@ class InputBatch:
             pin_memory=pin_memory,
         )
         self.num_computed_tokens_cpu = self.num_computed_tokens_cpu_tensor.numpy()
+
+        self.hidden_kv_num_tokens_cpu_tensor = torch.zeros(
+            (max_num_reqs,),
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=pin_memory,
+        )
+        self.hidden_kv_num_tokens_cpu = (
+            self.hidden_kv_num_tokens_cpu_tensor.numpy()
+        )
 
         # KV cache compaction: position offsets for RoPE correction.
         self.position_offsets_cpu_tensor = torch.zeros(
@@ -384,6 +399,7 @@ class InputBatch:
         self.num_tokens_no_spec[req_index] = request.num_tokens
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
+        self.hidden_kv_num_tokens_cpu[req_index] = request.hidden_kv_num_tokens
         self.position_offsets_cpu[req_index] = request.position_offset
         self.protected_prefix_lens_cpu[req_index] = request.protected_prefix_len
         self.block_table.add_row(request.block_ids, req_index)
@@ -603,6 +619,10 @@ class InputBatch:
             self.num_computed_tokens_cpu[i2],
             self.num_computed_tokens_cpu[i1],
         )
+        self.hidden_kv_num_tokens_cpu[i1], self.hidden_kv_num_tokens_cpu[i2] = (
+            self.hidden_kv_num_tokens_cpu[i2],
+            self.hidden_kv_num_tokens_cpu[i1],
+        )
 
         # NOTE: the following is unsafe
         # self.token_ids_cpu[i1, ...], self.token_ids_cpu[i2, ...], =\
@@ -759,6 +779,9 @@ class InputBatch:
             self.num_computed_tokens_cpu[empty_index] = self.num_computed_tokens_cpu[
                 last_req_index
             ]
+            self.hidden_kv_num_tokens_cpu[empty_index] = (
+                self.hidden_kv_num_tokens_cpu[last_req_index]
+            )
             self.position_offsets_cpu[empty_index] = self.position_offsets_cpu[
                 last_req_index
             ]

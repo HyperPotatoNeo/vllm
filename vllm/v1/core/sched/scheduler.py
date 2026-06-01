@@ -43,6 +43,8 @@ from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
+    ManagedContextCopyEvent,
+    ManagedContextTransferMetadata,
     NewRequestData,
     SchedulerOutput,
 )
@@ -56,7 +58,12 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutp
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    DraftTokenIds,
+    KVConnectorOutput,
+    ManagedContextTransferOutput,
+    ModelRunnerOutput,
+)
 from vllm.v1.core.compaction.manager import CompactingKVCacheManager
 from vllm.v1.core.compaction.types import CompactionEvent
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -66,6 +73,30 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _pop_contiguous_managed_context_cpu_blocks(
+    free_block_ids: deque[int],
+    num_blocks: int,
+) -> list[int] | None:
+    """Pop a contiguous increasing run of CPU archive block IDs if available."""
+    if num_blocks <= 0 or len(free_block_ids) < num_blocks:
+        return None
+
+    free_set = {int(block_id) for block_id in free_block_ids}
+    for start in sorted(free_set):
+        run = list(range(start, start + num_blocks))
+        if all(block_id in free_set for block_id in run):
+            chosen = set(run)
+            remaining = deque(
+                int(block_id)
+                for block_id in free_block_ids
+                if int(block_id) not in chosen
+            )
+            free_block_ids.clear()
+            free_block_ids.extend(remaining)
+            return run
+    return None
 
 
 @dataclass
@@ -78,6 +109,59 @@ class Phase4Pin:
     created_at: float
     consumed_by_request_id: str | None = None
     consumed_at: float | None = None
+
+
+@dataclass
+class ManagedContextSpan:
+    span_id: str
+    trace_id: str
+    request_id: str
+    absolute_turn_start: int
+    absolute_turn_end: int
+    token_ids: list[int]
+    entries: list[tuple[Any, list[Any]]]
+    kv_block_count: int
+    logical_start_by_group: list[list[int]]
+    position_offset_frame: int
+    evict_start: int
+    evict_end: int
+    created_at: float
+    status: str = "gpu_pinned"
+    cpu_block_ids_by_group: tuple[list[int], ...] = ()
+    offload_event_id: int | None = None
+    last_error: str | None = None
+    pending_load_count: int = 0
+
+
+@dataclass
+class ManagedContextHotGPUStats:
+    budget_blocks: int
+    resident_blocks: int = 0
+    hits: int = 0
+    misses: int = 0
+    evictions: int = 0
+    promotions: int = 0
+
+
+@dataclass
+class ManagedContextActiveRestore:
+    span_ids: list[str]
+    entries: list[tuple[Any, list[Any]]]
+    block_ids: tuple[list[int], ...]
+    num_tokens: int
+    created_at: float
+
+
+@dataclass
+class ManagedContextPendingLoad:
+    request_id: str
+    span_ids: list[str]
+    spans: list[ManagedContextSpan]
+    restored_entries_by_span: dict[str, list[tuple[Any, list[Any]]]]
+    block_ids: tuple[list[int], ...]
+    num_tokens: int
+    event_id: int
+    created_at: float
 
 
 class Scheduler(SchedulerInterface):
@@ -361,9 +445,171 @@ class Scheduler(SchedulerInterface):
         self._phase4_pin_hit_repeats: defaultdict[
             tuple[str, str, str, int, int, int, int], int
         ] = defaultdict(int)
-
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        # Managed context is an opt-in diagnostic path layered on turn-mode
+        # compaction. It pins evicted spans under Phase4 trace IDs so a later
+        # request can validate explicit restore controls without changing the
+        # default eviction/free behavior.
+        self._managed_context_enabled = (
+            os.environ.get("KVE_MANAGED_CONTEXT", "0") == "1"
+        )
+        self._managed_context_recall_max_spans = self._env_int(
+            "KVE_MANAGED_CONTEXT_RECALL_MAX_SPANS", 0
+        )
+        self._managed_context_recall_max_kv_blocks = self._env_optional_int(
+            "KVE_MANAGED_CONTEXT_RECALL_MAX_KV_BLOCKS"
+        )
+        self._managed_context_archive_max_blocks = self._env_optional_int(
+            "KVE_MANAGED_CONTEXT_ARCHIVE_MAX_BLOCKS"
+        )
+        self._managed_context_archive_ttl_seconds = self._env_float(
+            "KVE_MANAGED_CONTEXT_ARCHIVE_TTL_SECONDS", 1800.0
+        )
+        self._managed_context_align_positions = (
+            os.environ.get("KVE_MANAGED_CONTEXT_ALIGN_POSITIONS", "1") != "0"
+        )
+        self._managed_context_archive: dict[
+            tuple[str, str], ManagedContextSpan
+        ] = {}
+        self._managed_context_archive_order: deque[tuple[str, str]] = deque()
+        self._managed_context_next_span_by_trace: defaultdict[str, int] = (
+            defaultdict(int)
+        )
+        self._managed_context_active_restores: dict[
+            str, ManagedContextActiveRestore
+        ] = {}
+        self._managed_context_archive_device = os.environ.get(
+            "KVE_MANAGED_CONTEXT_ARCHIVE_DEVICE", "gpu"
+        ).strip().lower()
+        raw_cpu_offload_policy = os.environ.get(
+            "KVE_MANAGED_CONTEXT_CPU_OFFLOAD_POLICY", ""
+        ).strip().lower()
+        explicit_cpu_archive_devices = {
+            "cpu_explicit",
+            "cpu-explicit",
+            "cpu_deferred",
+            "cpu-deferred",
+        }
+        if not raw_cpu_offload_policy:
+            raw_cpu_offload_policy = (
+                "explicit"
+                if self._managed_context_archive_device
+                in explicit_cpu_archive_devices
+                else "immediate"
+            )
+        if raw_cpu_offload_policy not in ("immediate", "explicit"):
+            logger.warning(
+                "[MANAGED-CONTEXT] unknown CPU offload policy %r; using "
+                "immediate",
+                raw_cpu_offload_policy,
+            )
+            raw_cpu_offload_policy = "immediate"
+        self._managed_context_cpu_offload_policy = raw_cpu_offload_policy
+        self._managed_context_cpu_archive_enabled = (
+            self._managed_context_archive_device
+            in ("cpu", *explicit_cpu_archive_devices)
+            or os.environ.get("KVE_MANAGED_CONTEXT_CPU_OFFLOAD", "0") == "1"
+        )
+        self._managed_context_cpu_offload_immediate = (
+            self._managed_context_cpu_archive_enabled
+            and self._managed_context_cpu_offload_policy == "immediate"
+        )
+        self._managed_context_cpu_max_blocks = self._env_int(
+            "KVE_MANAGED_CONTEXT_CPU_OFFLOAD_MAX_BLOCKS", 0
+        )
+        self._managed_context_cpu_free_block_ids: deque[int] = deque(
+            range(max(0, self._managed_context_cpu_max_blocks))
+        )
+        self._managed_context_next_transfer_event_id = 0
+        self._managed_context_store_events_to_submit: dict[
+            int, ManagedContextCopyEvent
+        ] = {}
+        self._managed_context_load_events_to_submit: dict[
+            int, ManagedContextCopyEvent
+        ] = {}
+        self._managed_context_store_event_to_span: dict[
+            int, ManagedContextSpan
+        ] = {}
+        self._managed_context_load_event_to_request_id: dict[int, str] = {}
+        self._managed_context_pending_loads: dict[
+            str, ManagedContextPendingLoad
+        ] = {}
+        self._managed_context_finished_load_req_ids: set[str] = set()
+        self._managed_context_hot_gpu_order: deque[tuple[str, str]] = deque()
+        raw_hot_gpu_budget = self._env_optional_int(
+            "KVE_MANAGED_CONTEXT_GPU_HOT_BLOCK_BUDGET"
+        )
+        if raw_hot_gpu_budget is None:
+            # Default-on hot cache for CPU-restored spans. The auto budget holds
+            # roughly one full model window worth of restored KV blocks, capped
+            # by the CPU archive capacity. Set the env var to 0 to force cold
+            # CPU reload behavior.
+            auto_hot_gpu_budget = max(1, self.max_model_len // self.block_size)
+            raw_hot_gpu_budget = min(
+                auto_hot_gpu_budget,
+                max(0, self._managed_context_cpu_max_blocks),
+            )
+        if not self._managed_context_cpu_archive_enabled:
+            raw_hot_gpu_budget = 0
+        self._managed_context_hot_gpu_stats = ManagedContextHotGPUStats(
+            budget_blocks=max(0, raw_hot_gpu_budget)
+        )
+        if self._managed_context_enabled and (
+            not self._compaction_enabled
+            or self._compaction_max_turns <= 0
+            or not self.cache_config.enable_prefix_caching
+            or self.use_v2_model_runner
+            or self._managed_context_recall_max_spans <= 0
+        ):
+            logger.warning(
+                "[MANAGED-CONTEXT] disabled: requires turn compaction, "
+                "prefix caching, legacy GPU model runner, and "
+                "KVE_MANAGED_CONTEXT_RECALL_MAX_SPANS>0"
+            )
+            self._managed_context_enabled = False
+        if self._managed_context_cpu_archive_enabled:
+            if not self._managed_context_enabled:
+                self._managed_context_cpu_archive_enabled = False
+            elif self._managed_context_cpu_max_blocks <= 0:
+                logger.warning(
+                    "[MANAGED-CONTEXT] CPU archive disabled: set "
+                    "KVE_MANAGED_CONTEXT_CPU_OFFLOAD_MAX_BLOCKS>0"
+                )
+                self._managed_context_cpu_archive_enabled = False
+            elif len(self.kv_cache_manager.coordinator.single_type_managers) != 1:
+                logger.warning(
+                    "[MANAGED-CONTEXT] CPU archive disabled: currently supports "
+                    "one KV cache group"
+                )
+                self._managed_context_cpu_archive_enabled = False
+            elif self.connector is not None:
+                logger.warning(
+                    "[MANAGED-CONTEXT] CPU archive disabled: generic KV "
+                    "connector is configured"
+                )
+                self._managed_context_cpu_archive_enabled = False
+            elif (
+                self.parallel_config.pipeline_parallel_size != 1
+                or self.parallel_config.tensor_parallel_size != 1
+            ):
+                logger.warning(
+                    "[MANAGED-CONTEXT] CPU archive disabled: async managed "
+                    "context CPU reload currently supports single-rank "
+                    "PP/TP only"
+                )
+                self._managed_context_cpu_archive_enabled = False
+            else:
+                logger.warning(
+                    "[MANAGED-CONTEXT] CPU archive enabled: async transfers, "
+                    "max_cpu_blocks=%d hot_gpu_blocks=%d policy=%s",
+                    self._managed_context_cpu_max_blocks,
+                    self._managed_context_hot_gpu_stats.budget_blocks,
+                    self._managed_context_cpu_offload_policy,
+                )
+        if not self._managed_context_cpu_archive_enabled:
+            self._managed_context_hot_gpu_stats.budget_blocks = 0
+            self._managed_context_cpu_offload_immediate = False
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -549,8 +795,23 @@ class Scheduler(SchedulerInterface):
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
+            _hidden_kv_tokens = self._managed_context_active_restores.get(
+                request.request_id
+            )
+            hidden_kv_num_tokens = (
+                _hidden_kv_tokens.num_tokens
+                if _hidden_kv_tokens is not None
+                else 0
+            )
             num_new_tokens = min(
-                num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
+                num_new_tokens,
+                max(
+                    0,
+                    self.max_model_len
+                    - 1
+                    - hidden_kv_num_tokens
+                    - request.num_computed_tokens,
+                ),
             )
 
             # Schedule encoder inputs.
@@ -726,6 +987,32 @@ class Scheduler(SchedulerInterface):
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
+                restore_spans, restore_error = (
+                    self._validate_managed_context_restore_request(request)
+                )
+                if restore_error is not None:
+                    request_queue.pop_request()
+                    self._abort_waiting_phase4_request(request, restore_error)
+                    continue
+                offload_spans, offload_error = (
+                    self._validate_managed_context_offload_request(request)
+                )
+                if offload_error is not None:
+                    request_queue.pop_request()
+                    self._abort_waiting_phase4_request(request, offload_error)
+                    continue
+                if offload_spans:
+                    offload_error = self._start_managed_context_cpu_offloads(
+                        offload_spans,
+                        "request",
+                    )
+                    if offload_error is not None:
+                        logger.warning(
+                            "[MANAGED-CONTEXT-OFFLOAD-SKIP] req=%s %s",
+                            request_id[:8],
+                            offload_error,
+                        )
+
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
                     request.status
@@ -734,6 +1021,25 @@ class Scheduler(SchedulerInterface):
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request_id,
+                        )
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
+                if (
+                    restore_spans
+                    and self._managed_context_cpu_archive_enabled
+                    and any(span.status == "offload_pending" for span in restore_spans)
+                ):
+                    if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+                        logger.warning(
+                            "[MANAGED-CONTEXT-RESTORE-WAIT-STORE] req=%s spans=%s",
+                            request_id[:8],
+                            [
+                                span.span_id
+                                for span in restore_spans
+                                if span.status == "offload_pending"
+                            ],
                         )
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
@@ -760,6 +1066,7 @@ class Scheduler(SchedulerInterface):
                 pending_inherit_event: CompactionEvent | None = None
                 phase4_pin_trace_to_mark_consumed = ""
                 phase4_pin_call_to_mark_consumed = ""
+                position_offset_before_restore_align = request.position_offset
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
@@ -1303,6 +1610,50 @@ class Scheduler(SchedulerInterface):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
+                if restore_spans:
+                    min_visible_prefix = self._worker_protected_prefix_len(
+                        request
+                    )
+                    if num_computed_tokens < min_visible_prefix:
+                        reason = (
+                            "managed-context restore requires the visible "
+                            "system prefix to be cached before hidden KV is "
+                            "attached: "
+                            f"cached={num_computed_tokens} "
+                            f"required={min_visible_prefix}"
+                        )
+                        logger.error(
+                            "[MANAGED-CONTEXT-PREFIX-ABORT] req=%s %s",
+                            request.request_id[:8],
+                            reason,
+                        )
+                        request_queue.pop_request()
+                        self._abort_waiting_phase4_request(request, reason)
+                        continue
+
+                if (
+                    restore_spans
+                    and request.request_id
+                    not in self._managed_context_active_restores
+                    and self._managed_context_restore_needs_cpu_load(restore_spans)
+                ):
+                    load_error = self._start_managed_context_cpu_load(
+                        request, restore_spans
+                    )
+                    if load_error is not None:
+                        logger.error(
+                            "[MANAGED-CONTEXT-LOAD-ABORT] req=%s %s",
+                            request.request_id[:8],
+                            load_error,
+                        )
+                        request_queue.pop_request()
+                        self._abort_waiting_phase4_request(request, load_error)
+                        continue
+                    request = request_queue.pop_request()
+                    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -1405,6 +1756,21 @@ class Scheduler(SchedulerInterface):
                         request.position_offset = 0
                     break
 
+                restore_position_aligned = False
+                if restore_spans:
+                    restore_position_aligned = (
+                        self._align_managed_context_restore_position(
+                            request, restore_spans
+                        )
+                    )
+                    if (
+                        restore_position_aligned
+                        and pending_inherit_event is not None
+                    ):
+                        pending_inherit_event.position_offset_after = (
+                            request.position_offset
+                        )
+
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -1451,6 +1817,10 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.free(request)
                     if pending_inherit_event is not None:
                         request.position_offset = 0
+                    elif restore_position_aligned:
+                        request.position_offset = (
+                            position_offset_before_restore_align
+                        )
                     break
 
                 if phase4_pin_trace_to_mark_consumed:
@@ -1520,6 +1890,8 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens = num_computed_tokens
                     continue
 
+                if request.request_id not in self._managed_context_active_restores:
+                    self._activate_managed_context_restore(request, restore_spans)
                 self.running.append(request)
                 if self.log_stats:
                     request.record_event(
@@ -1622,6 +1994,9 @@ class Scheduler(SchedulerInterface):
         def _ppl(req: Request) -> int:
             return self._worker_protected_prefix_len(req)
 
+        def _hidden(req: Request) -> tuple[tuple[list[int], ...], int, list[str]]:
+            return self._managed_context_active_hidden_kv(req.request_id)
+
         if self.use_v2_model_runner:
             scheduled_new_reqs = scheduled_new_reqs + scheduled_resumed_reqs
             scheduled_resumed_reqs = []
@@ -1631,6 +2006,9 @@ class Scheduler(SchedulerInterface):
                     req_to_new_blocks[req.request_id].get_block_ids(),
                     req._all_token_ids,
                     protected_prefix_len=_ppl(req),
+                    hidden_kv_block_ids=_hidden(req)[0],
+                    hidden_kv_num_tokens=_hidden(req)[1],
+                    hidden_kv_span_ids=_hidden(req)[2],
                 )
                 for req in scheduled_new_reqs
             ]
@@ -1640,6 +2018,9 @@ class Scheduler(SchedulerInterface):
                     req,
                     req_to_new_blocks[req.request_id].get_block_ids(),
                     protected_prefix_len=_ppl(req),
+                    hidden_kv_block_ids=_hidden(req)[0],
+                    hidden_kv_num_tokens=_hidden(req)[1],
+                    hidden_kv_span_ids=_hidden(req)[2],
                 )
                 for req in scheduled_new_reqs
             ]
@@ -1752,6 +2133,9 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=new_block_ids_to_zero,
             no_sample_req_ids=no_sample_req_ids,
         )
+        scheduler_output.managed_context_transfer_metadata = (
+            self._drain_managed_context_transfer_metadata()
+        )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1793,6 +2177,20 @@ class Scheduler(SchedulerInterface):
                 "Attempted to preempt compacted request %s "
                 "(position_offset=%d) — aborting request instead.",
                 request.request_id, request.position_offset,
+            )
+            self.kv_cache_manager.free(request)
+            self.encoder_cache_manager.free(request)
+            request.status = RequestStatus.FINISHED_ABORTED
+            self.finished_req_ids.add(request.request_id)
+            return
+        if request.request_id in self._managed_context_active_restores:
+            logger.warning(
+                "Attempted to preempt managed-context restore request %s; "
+                "aborting request instead.",
+                request.request_id,
+            )
+            self._release_managed_context_active_restore(
+                request.request_id, "preempt-abort"
             )
             self.kv_cache_manager.free(request)
             self.encoder_cache_manager.free(request)
@@ -2223,6 +2621,7 @@ class Scheduler(SchedulerInterface):
         explicit_block_range: tuple[int, int] | None = None
         last_turn_evicted = -1
         stride_used = 0
+        archived_span_ids: list[str] = []
         if self._compaction_max_turns > 0:
             plan = self._plan_turn_evict_range(
                 request, block_size,
@@ -2235,6 +2634,15 @@ class Scheduler(SchedulerInterface):
                 evict_start // block_size, evict_end // block_size
             )
             total_evicted = evict_end - evict_start
+            archived_span_ids = self._archive_managed_context_span(
+                request,
+                compaction_mgr=compaction_mgr,
+                evict_start=evict_start,
+                evict_end=evict_end,
+                explicit_block_range=explicit_block_range,
+                last_turn_evicted=last_turn_evicted,
+                stride_used=stride_used,
+            )
             tokens_evicted = compaction_mgr.compact_request(
                 request.request_id,
                 effective_prompt,
@@ -2243,6 +2651,11 @@ class Scheduler(SchedulerInterface):
             if tokens_evicted != total_evicted:
                 # Manager refused (out-of-bounds guard tripped). Should be
                 # impossible given _plan_turn_evict_range's checks.
+                trace_id = self._managed_context_trace_id(request)
+                for span_id in archived_span_ids:
+                    self._release_managed_context_span(
+                        (trace_id, span_id), "compact-refused"
+                    )
                 return 0
         else:
             tokens_evicted = compaction_mgr.compact_request(
@@ -2442,6 +2855,7 @@ class Scheduler(SchedulerInterface):
             kept_indices=kept_indices,
             kept_token_ids=kept_token_ids,
             new_user_fragment_len=new_user_fragment_len,
+            archived_span_ids=archived_span_ids,
         )
         request.compaction_events.append(event)
         if os.environ.get("KV_EVICTION_BUG_TRACE") == "1":
@@ -2613,6 +3027,7 @@ class Scheduler(SchedulerInterface):
     ) -> None:
         request.status = RequestStatus.FINISHED_ABORTED
         request_id = request.request_id
+        self._release_managed_context_active_restore(request_id, "abort")
         self.encoder_cache_manager.free(request)
         self.kv_cache_manager.free(request)
         self.finished_req_ids.add(request_id)
@@ -2634,6 +3049,37 @@ class Scheduler(SchedulerInterface):
             except ValueError:
                 pass
         return None
+
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _env_optional_int(name: str) -> int | None:
+        raw = os.environ.get(name)
+        if raw is None or raw == "":
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            return None
+        return value if value >= 0 else None
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            return default
 
     def _phase4_pin_ttl_seconds(self) -> float:
         raw_ttl = os.environ.get("KVE_PHASE4_PIN_TTL_SECONDS")
@@ -2799,6 +3245,1076 @@ class Scheduler(SchedulerInterface):
                 request.num_tokens,
                 total_blocks,
             )
+
+    def _managed_context_trace_id(self, request: Request) -> str:
+        if not self._managed_context_enabled:
+            return ""
+        return self._phase4_trace_id(request)
+
+    def _next_managed_context_transfer_event_id(self) -> int:
+        event_id = self._managed_context_next_transfer_event_id
+        self._managed_context_next_transfer_event_id += 1
+        return event_id
+
+    def _managed_context_gpu_block_ids(
+        self, entries: list[tuple[Any, list[Any]]]
+    ) -> list[int]:
+        return [
+            int(block.block_id)
+            for _manager, blocks in entries
+            for block in blocks
+        ]
+
+    def _managed_context_free_cpu_block_ids(
+        self, cpu_block_ids_by_group: tuple[list[int], ...]
+    ) -> None:
+        for cpu_ids in cpu_block_ids_by_group:
+            self._managed_context_cpu_free_block_ids.extend(cpu_ids)
+
+    def _managed_context_free_span_cpu_blocks(
+        self, span: ManagedContextSpan
+    ) -> None:
+        if not span.cpu_block_ids_by_group:
+            return
+        self._managed_context_free_cpu_block_ids(span.cpu_block_ids_by_group)
+        span.cpu_block_ids_by_group = ()
+
+    def _release_managed_context_entries(
+        self, entries: list[tuple[Any, list[Any]]]
+    ) -> int:
+        released_blocks = 0
+        for manager, blocks in entries:
+            if blocks:
+                manager.block_pool.free_blocks(blocks)
+                released_blocks += len(blocks)
+        return released_blocks
+
+    def _release_managed_context_span_gpu_entries(
+        self, span: ManagedContextSpan
+    ) -> int:
+        released_blocks = self._release_managed_context_entries(span.entries)
+        span.entries = []
+        return released_blocks
+
+    @staticmethod
+    def _managed_context_span_key(
+        span: ManagedContextSpan,
+    ) -> tuple[str, str]:
+        return (span.trace_id, span.span_id)
+
+    def _managed_context_remove_hot_gpu_key(
+        self,
+        key: tuple[str, str],
+    ) -> None:
+        try:
+            self._managed_context_hot_gpu_order.remove(key)
+        except ValueError:
+            pass
+
+    def _managed_context_touch_hot_gpu_span(
+        self,
+        span: ManagedContextSpan,
+    ) -> None:
+        key = self._managed_context_span_key(span)
+        self._managed_context_remove_hot_gpu_key(key)
+        self._managed_context_hot_gpu_order.append(key)
+
+    def _release_managed_context_hot_gpu_span(
+        self,
+        span: ManagedContextSpan,
+        reason: str,
+        *,
+        expire: bool = False,
+    ) -> int:
+        key = self._managed_context_span_key(span)
+        self._managed_context_remove_hot_gpu_key(key)
+        released_blocks = self._release_managed_context_span_gpu_entries(span)
+        if released_blocks:
+            stats = self._managed_context_hot_gpu_stats
+            stats.resident_blocks = max(0, stats.resident_blocks - released_blocks)
+            stats.evictions += 1
+        if span.status == "cpu_hot":
+            span.status = "expired" if expire else "cpu_offloaded"
+        if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1" and released_blocks:
+            logger.warning(
+                "[MANAGED-CONTEXT-HOT-GPU-RELEASE] trace=%s span=%s "
+                "reason=%s blocks=%d resident=%d budget=%d status=%s",
+                span.trace_id,
+                span.span_id,
+                reason,
+                released_blocks,
+                self._managed_context_hot_gpu_stats.resident_blocks,
+                self._managed_context_hot_gpu_stats.budget_blocks,
+                span.status,
+            )
+        return released_blocks
+
+    def _managed_context_evict_hot_gpu_blocks(
+        self,
+        needed_blocks: int,
+        *,
+        protected: set[tuple[str, str]] | None = None,
+        reason: str,
+    ) -> None:
+        protected = protected or set()
+        stats = self._managed_context_hot_gpu_stats
+        if stats.budget_blocks <= 0:
+            return
+        while (
+            stats.resident_blocks + max(0, needed_blocks) > stats.budget_blocks
+            and self._managed_context_hot_gpu_order
+        ):
+            key = self._managed_context_hot_gpu_order.popleft()
+            if key in protected:
+                self._managed_context_hot_gpu_order.append(key)
+                if all(item in protected for item in self._managed_context_hot_gpu_order):
+                    break
+                continue
+            span = self._managed_context_archive.get(key)
+            if span is None or span.status != "cpu_hot":
+                continue
+            self._release_managed_context_hot_gpu_span(span, reason)
+
+    def _managed_context_free_hot_gpu_for_blocks(
+        self,
+        needed_blocks: int,
+        *,
+        protected: set[tuple[str, str]] | None = None,
+    ) -> None:
+        protected = protected or set()
+        if needed_blocks <= 0:
+            return
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        if not managers:
+            return
+        while self._managed_context_hot_gpu_order:
+            free_blocks = min(
+                manager.block_pool.get_num_free_blocks() for manager in managers
+            )
+            if free_blocks >= needed_blocks:
+                return
+            key = self._managed_context_hot_gpu_order.popleft()
+            if key in protected:
+                self._managed_context_hot_gpu_order.append(key)
+                if all(item in protected for item in self._managed_context_hot_gpu_order):
+                    return
+                continue
+            span = self._managed_context_archive.get(key)
+            if span is None or span.status != "cpu_hot":
+                continue
+            self._release_managed_context_hot_gpu_span(
+                span, "gpu-free-block-pressure"
+            )
+
+    def _promote_managed_context_hot_gpu_span(
+        self,
+        span: ManagedContextSpan,
+        entries: list[tuple[Any, list[Any]]],
+    ) -> bool:
+        stats = self._managed_context_hot_gpu_stats
+        if (
+            stats.budget_blocks <= 0
+            or span.status != "cpu_offloaded"
+            or not span.cpu_block_ids_by_group
+            or not entries
+        ):
+            return False
+        block_count = sum(len(blocks) for _manager, blocks in entries)
+        if block_count <= 0 or block_count > stats.budget_blocks:
+            return False
+
+        key = self._managed_context_span_key(span)
+        self._managed_context_evict_hot_gpu_blocks(
+            block_count,
+            protected={key},
+            reason="hot-gpu-budget",
+        )
+        if stats.resident_blocks + block_count > stats.budget_blocks:
+            return False
+
+        span.entries = entries
+        span.status = "cpu_hot"
+        self._managed_context_remove_hot_gpu_key(key)
+        self._managed_context_hot_gpu_order.append(key)
+        stats.resident_blocks += block_count
+        stats.promotions += 1
+        if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+            logger.warning(
+                "[MANAGED-CONTEXT-HOT-GPU-PROMOTE] trace=%s span=%s "
+                "blocks=%d resident=%d budget=%d",
+                span.trace_id,
+                span.span_id,
+                block_count,
+                stats.resident_blocks,
+                stats.budget_blocks,
+            )
+        return True
+
+    def _release_managed_context_pending_load_span_refs(
+        self, pending: ManagedContextPendingLoad
+    ) -> None:
+        for span in pending.spans:
+            if span.span_id not in pending.restored_entries_by_span:
+                continue
+            span.pending_load_count = max(0, span.pending_load_count - 1)
+            if span.status == "expired" and span.pending_load_count == 0:
+                self._managed_context_free_span_cpu_blocks(span)
+
+    def _alloc_managed_context_cpu_blocks(
+        self,
+        num_blocks: int,
+        *,
+        protected: set[tuple[str, str]] | None = None,
+    ) -> list[int] | None:
+        if (
+            not self._managed_context_cpu_archive_enabled
+            or num_blocks <= 0
+            or num_blocks > self._managed_context_cpu_max_blocks
+        ):
+            return None
+
+        protected = protected or set()
+        while len(self._managed_context_cpu_free_block_ids) < num_blocks:
+            if not self._managed_context_archive_order:
+                return None
+            key = self._managed_context_archive_order.popleft()
+            if key in protected:
+                self._managed_context_archive_order.append(key)
+                if all(
+                    item in protected
+                    for item in self._managed_context_archive_order
+                ):
+                    return None
+                continue
+            if key in self._managed_context_archive:
+                self._release_managed_context_span(key, "cpu-block-limit")
+
+        if len(self._managed_context_cpu_free_block_ids) < num_blocks:
+            return None
+        contiguous = _pop_contiguous_managed_context_cpu_blocks(
+            self._managed_context_cpu_free_block_ids,
+            num_blocks,
+        )
+        if contiguous is not None:
+            return contiguous
+        return [
+            int(self._managed_context_cpu_free_block_ids.popleft())
+            for _ in range(num_blocks)
+        ]
+
+    def _start_managed_context_cpu_offload(
+        self,
+        span: ManagedContextSpan,
+        reason: str,
+    ) -> str | None:
+        if not self._managed_context_cpu_archive_enabled:
+            return "managed-context CPU archive is disabled"
+        key = self._managed_context_span_key(span)
+        if span.status == "cpu_offloaded" or span.status == "offload_pending":
+            return None
+        if span.status == "cpu_hot":
+            self._release_managed_context_hot_gpu_span(span, reason)
+            return None
+        if span.status != "gpu_pinned":
+            return f"span {span.span_id!r} cannot be offloaded from {span.status}"
+        if not span.entries:
+            return f"span {span.span_id!r} has no GPU blocks to offload"
+
+        cpu_block_ids = self._alloc_managed_context_cpu_blocks(
+            span.kv_block_count,
+            protected={key},
+        )
+        if cpu_block_ids is None:
+            return (
+                f"span {span.span_id!r} needs {span.kv_block_count} CPU "
+                f"blocks, exceeds available managed-context CPU capacity "
+                f"{self._managed_context_cpu_max_blocks}"
+            )
+
+        cpu_by_group: list[list[int]] = []
+        offset = 0
+        for logical_starts in span.logical_start_by_group:
+            count = len(logical_starts)
+            cpu_by_group.append(cpu_block_ids[offset : offset + count])
+            offset += count
+        if offset != len(cpu_block_ids):
+            self._managed_context_free_cpu_block_ids((cpu_block_ids,))
+            return f"span {span.span_id!r} has inconsistent block metadata"
+
+        event_id = self._next_managed_context_transfer_event_id()
+        span.status = "offload_pending"
+        span.cpu_block_ids_by_group = tuple(cpu_by_group)
+        span.offload_event_id = event_id
+        self._managed_context_store_events_to_submit[event_id] = (
+            ManagedContextCopyEvent(
+                event_id=event_id,
+                gpu_block_ids=self._managed_context_gpu_block_ids(span.entries),
+                cpu_block_ids=cpu_block_ids,
+            )
+        )
+        self._managed_context_store_event_to_span[event_id] = span
+        if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+            logger.warning(
+                "[MANAGED-CONTEXT-OFFLOAD-SUBMIT] trace=%s span=%s event=%d "
+                "reason=%s gpu_blocks=%s cpu_blocks=%s",
+                span.trace_id,
+                span.span_id,
+                event_id,
+                reason,
+                self._managed_context_gpu_block_ids(span.entries),
+                cpu_block_ids,
+            )
+        return None
+
+    def _drain_managed_context_transfer_metadata(
+        self,
+    ) -> ManagedContextTransferMetadata | None:
+        if (
+            not self._managed_context_store_events_to_submit
+            and not self._managed_context_load_events_to_submit
+        ):
+            return None
+        metadata = ManagedContextTransferMetadata(
+            store_events=list(self._managed_context_store_events_to_submit.values()),
+            load_events=list(self._managed_context_load_events_to_submit.values()),
+        )
+        self._managed_context_store_events_to_submit.clear()
+        self._managed_context_load_events_to_submit.clear()
+        return None if metadata.is_empty() else metadata
+
+    def _release_managed_context_span(
+        self, key: tuple[str, str], reason: str
+    ) -> None:
+        span = self._managed_context_archive.pop(key, None)
+        if span is None:
+            return
+        released_blocks = 0
+        event_id = span.offload_event_id
+        if span.status == "cpu_hot":
+            released_blocks += self._release_managed_context_hot_gpu_span(
+                span, reason, expire=True
+            )
+            if span.pending_load_count == 0:
+                self._managed_context_free_span_cpu_blocks(span)
+        elif span.status == "offload_pending" and event_id is not None:
+            if event_id in self._managed_context_store_events_to_submit:
+                self._managed_context_store_events_to_submit.pop(event_id, None)
+                self._managed_context_store_event_to_span.pop(event_id, None)
+                released_blocks += self._release_managed_context_span_gpu_entries(
+                    span
+                )
+                self._managed_context_free_span_cpu_blocks(span)
+            else:
+                # The worker may still be reading the source GPU blocks. Keep
+                # them alive until the completion event comes back.
+                span.status = "expired"
+        else:
+            released_blocks += self._release_managed_context_span_gpu_entries(
+                span
+            )
+            if span.pending_load_count == 0:
+                self._managed_context_free_span_cpu_blocks(span)
+        span.status = "expired"
+        if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+            logger.warning(
+                "[MANAGED-CONTEXT-RELEASE] trace=%s span=%s reason=%s "
+                "blocks=%d tokens=%d turns=%d..%d",
+                span.trace_id,
+                span.span_id,
+                reason,
+                released_blocks,
+                len(span.token_ids),
+                span.absolute_turn_start,
+                span.absolute_turn_end,
+            )
+
+    def _release_all_managed_context_spans(self, reason: str) -> None:
+        for key in list(self._managed_context_archive):
+            self._release_managed_context_span(key, reason)
+        self._managed_context_archive_order.clear()
+
+    def _release_managed_context_active_restore(
+        self, request_id: str, reason: str
+    ) -> None:
+        restore = self._managed_context_active_restores.pop(request_id, None)
+        if restore is None:
+            return
+        released_blocks = 0
+        for manager, blocks in restore.entries:
+            if blocks:
+                manager.block_pool.free_blocks(blocks)
+                released_blocks += len(blocks)
+        if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+            logger.warning(
+                "[MANAGED-CONTEXT-RESTORE-RELEASE] req=%s reason=%s "
+                "spans=%s blocks=%d hidden_tokens=%d",
+                request_id[:8],
+                reason,
+                restore.span_ids,
+                released_blocks,
+                restore.num_tokens,
+            )
+
+    def _release_managed_context_pending_load(
+        self, request_id: str, reason: str, *, only_if_safe: bool = True
+    ) -> bool:
+        pending = self._managed_context_pending_loads.get(request_id)
+        if pending is None:
+            return True
+
+        event_id = pending.event_id
+        event_not_submitted = event_id in self._managed_context_load_events_to_submit
+        event_finished = request_id in self._managed_context_finished_load_req_ids
+        if only_if_safe and not event_not_submitted and not event_finished:
+            return False
+
+        self._managed_context_pending_loads.pop(request_id, None)
+        self._managed_context_load_events_to_submit.pop(event_id, None)
+        self._managed_context_load_event_to_request_id.pop(event_id, None)
+        self._managed_context_finished_load_req_ids.discard(request_id)
+
+        self._release_managed_context_pending_load_span_refs(pending)
+        released_blocks = 0
+        for entries in pending.restored_entries_by_span.values():
+            released_blocks += self._release_managed_context_entries(entries)
+        if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+            logger.warning(
+                "[MANAGED-CONTEXT-LOAD-RELEASE] req=%s reason=%s "
+                "spans=%s blocks=%d event=%d",
+                request_id[:8],
+                reason,
+                pending.span_ids,
+                released_blocks,
+                event_id,
+            )
+        return True
+
+    def _managed_context_active_hidden_kv(
+        self, request_id: str
+    ) -> tuple[tuple[list[int], ...], int, list[str]]:
+        restore = self._managed_context_active_restores.get(request_id)
+        if restore is None:
+            return (), 0, []
+        return restore.block_ids, restore.num_tokens, list(restore.span_ids)
+
+    def _align_managed_context_restore_position(
+        self, request: Request, spans: list[ManagedContextSpan]
+    ) -> bool:
+        """Seed the retry request's RoPE frame after restored hidden KV.
+
+        Managed-context restore mirrors Phase4's retained-KV invariant: cached
+        K/V keeps the original RoPE frame, and newly written retry K/V must be
+        positioned after the retained/restored frame. The scheduler must do
+        this before allocate_slots so freshly allocated blocks get logical_start
+        metadata matching the positions the worker will use.
+        """
+        if not spans or not self._managed_context_align_positions:
+            return False
+
+        max_hidden_logical_end = -1
+        for span in spans:
+            for logical_starts in span.logical_start_by_group:
+                for logical_start in logical_starts:
+                    if logical_start >= 0:
+                        max_hidden_logical_end = max(
+                            max_hidden_logical_end,
+                            int(logical_start) + self.block_size,
+                        )
+        if max_hidden_logical_end < 0:
+            return False
+
+        protected_prefix_len = self._worker_protected_prefix_len(request)
+        required_offset = max(
+            0,
+            max_hidden_logical_end - protected_prefix_len,
+        )
+        if required_offset <= request.position_offset:
+            return False
+
+        old_offset = request.position_offset
+        request.position_offset = required_offset
+        if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+            logger.warning(
+                "[MANAGED-CONTEXT-ALIGN] req=%s position_offset %d -> %d "
+                "hidden_logical_end=%d protected_prefix_len=%d spans=%s",
+                request.request_id[:8],
+                old_offset,
+                required_offset,
+                max_hidden_logical_end,
+                protected_prefix_len,
+                [span.span_id for span in spans],
+            )
+        return True
+
+    def _managed_context_total_archive_blocks(self) -> int:
+        return sum(
+            span.kv_block_count
+            for span in self._managed_context_archive.values()
+            if span.status in ("gpu_pinned", "offload_pending", "cpu_hot")
+        )
+
+    def _prune_managed_context_archive(self) -> None:
+        if not self._managed_context_archive:
+            return
+
+        ttl_seconds = max(0.0, self._managed_context_archive_ttl_seconds)
+        now = time.monotonic()
+        for key in list(self._managed_context_archive_order):
+            span = self._managed_context_archive.get(key)
+            if span is None:
+                continue
+            if ttl_seconds > 0 and now - span.created_at >= ttl_seconds:
+                self._release_managed_context_span(key, "ttl")
+
+        max_blocks = self._managed_context_archive_max_blocks
+        if max_blocks is None:
+            return
+        while (
+            self._managed_context_archive
+            and self._managed_context_total_archive_blocks() > max_blocks
+        ):
+            if not self._managed_context_archive_order:
+                break
+            key = self._managed_context_archive_order.popleft()
+            if key in self._managed_context_archive:
+                self._release_managed_context_span(key, "block-limit")
+
+    def _archive_managed_context_span(
+        self,
+        request: Request,
+        *,
+        compaction_mgr: CompactingKVCacheManager,
+        evict_start: int,
+        evict_end: int,
+        explicit_block_range: tuple[int, int] | None,
+        last_turn_evicted: int,
+        stride_used: int,
+    ) -> list[str]:
+        """Pin the blocks that turn-mode compaction is about to evict.
+
+        The archive owns exactly one extra ref per captured block. The normal
+        compaction path still deletes the blocks from the active request and
+        decrements the request's refs as before.
+        """
+        if (
+            not self._managed_context_enabled
+            or explicit_block_range is None
+            or evict_end <= evict_start
+        ):
+            return []
+        trace_id = self._managed_context_trace_id(request)
+        if not trace_id:
+            return []
+
+        start_block, end_block = explicit_block_range
+        if start_block == end_block:
+            return []
+
+        collected: list[tuple[Any, list[Any], list[int]]] = []
+        total_blocks = 0
+        for manager in (compaction_mgr,):
+            req_blocks = manager.req_to_blocks.get(request.request_id)
+            if not req_blocks or end_block > len(req_blocks):
+                return []
+            blocks = [
+                block
+                for block in req_blocks[start_block:end_block]
+                if not block.is_null
+            ]
+            if not blocks:
+                continue
+            collected.append(
+                (manager, blocks, [int(block.logical_start) for block in blocks])
+            )
+            total_blocks += len(blocks)
+
+        if not collected:
+            return []
+        max_blocks = self._managed_context_archive_max_blocks
+        if max_blocks is not None and total_blocks > max_blocks:
+            logger.warning(
+                "[MANAGED-CONTEXT-SKIP] req=%s trace=%s evict=[%d,%d) "
+                "blocks=%d exceeds archive_max_blocks=%d",
+                request.request_id[:8],
+                trace_id,
+                evict_start,
+                evict_end,
+                total_blocks,
+                max_blocks,
+            )
+            return []
+
+        entries: list[tuple[Any, list[Any]]] = []
+        logical_start_by_group: list[list[int]] = []
+        for manager, blocks, logical_starts in collected:
+            manager.block_pool.touch(blocks)
+            entries.append((manager, blocks))
+            logical_start_by_group.append(logical_starts)
+
+        next_id = self._managed_context_next_span_by_trace[trace_id] + 1
+        self._managed_context_next_span_by_trace[trace_id] = next_id
+        span_id = f"T{next_id:04d}"
+        key = (trace_id, span_id)
+        if last_turn_evicted >= 0 and stride_used > 0:
+            absolute_turn_start = max(0, last_turn_evicted - stride_used + 1)
+            absolute_turn_end = last_turn_evicted
+        else:
+            absolute_turn_start = -1
+            absolute_turn_end = -1
+        span = ManagedContextSpan(
+            span_id=span_id,
+            trace_id=trace_id,
+            request_id=request.request_id[:8],
+            absolute_turn_start=absolute_turn_start,
+            absolute_turn_end=absolute_turn_end,
+            token_ids=list(request._all_token_ids[evict_start:evict_end]),
+            entries=entries,
+            kv_block_count=total_blocks,
+            logical_start_by_group=logical_start_by_group,
+            position_offset_frame=int(request.position_offset),
+            evict_start=evict_start,
+            evict_end=evict_end,
+            created_at=time.monotonic(),
+        )
+        self._managed_context_archive[key] = span
+        self._managed_context_archive_order.append(key)
+        if self._managed_context_cpu_offload_immediate:
+            offload_error = self._start_managed_context_cpu_offload(
+                span,
+                "archive-immediate",
+            )
+            if offload_error is not None:
+                logger.warning(
+                    "[MANAGED-CONTEXT-CPU-SKIP] req=%s trace=%s span=%s "
+                    "%s; keeping GPU-pinned",
+                    request.request_id[:8],
+                    trace_id,
+                    span_id,
+                    offload_error,
+                )
+        self._prune_managed_context_archive()
+        if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+            archive_block_ids = [
+                [int(block.block_id) for block in blocks]
+                for _manager, blocks in entries
+            ]
+            logger.warning(
+                "[MANAGED-CONTEXT-ARCHIVE] trace=%s span=%s req=%s "
+                "evict=[%d,%d) turns=%d..%d blocks=%d tokens=%d "
+                "block_ids=%s logical_starts=%s token_head=%s token_tail=%s",
+                trace_id,
+                span_id,
+                request.request_id[:8],
+                evict_start,
+                evict_end,
+                absolute_turn_start,
+                absolute_turn_end,
+                total_blocks,
+                len(span.token_ids),
+                archive_block_ids,
+                logical_start_by_group,
+                span.token_ids[:8],
+                span.token_ids[-8:],
+            )
+        return [span_id] if key in self._managed_context_archive else []
+
+    def _managed_context_restore_needs_cpu_load(
+        self, spans: list[ManagedContextSpan]
+    ) -> bool:
+        return any(span.status == "cpu_offloaded" for span in spans)
+
+    def _start_managed_context_cpu_load(
+        self, request: Request, spans: list[ManagedContextSpan]
+    ) -> str | None:
+        if not self._managed_context_restore_needs_cpu_load(spans):
+            return None
+        if request.request_id in self._managed_context_pending_loads:
+            return None
+
+        manager_to_index = {
+            id(manager): i
+            for i, manager in enumerate(
+                self.kv_cache_manager.coordinator.single_type_managers
+            )
+        }
+        if len(manager_to_index) != 1:
+            return "managed-context CPU reload currently supports one KV cache group"
+
+        restored_entries_by_span: dict[str, list[tuple[Any, list[Any]]]] = {}
+        gpu_block_ids: list[int] = []
+        cpu_block_ids: list[int] = []
+        groups: list[list[Any]] = [[] for _ in manager_to_index]
+        load_block_count = sum(
+            span.kv_block_count for span in spans if span.status == "cpu_offloaded"
+        )
+        self._managed_context_hot_gpu_stats.misses += sum(
+            1 for span in spans if span.status == "cpu_offloaded"
+        )
+        self._managed_context_free_hot_gpu_for_blocks(
+            load_block_count,
+            protected={self._managed_context_span_key(span) for span in spans},
+        )
+
+        def _fail(message: str) -> str:
+            for entries in restored_entries_by_span.values():
+                self._release_managed_context_entries(entries)
+            return message
+
+        try:
+            for span in sorted(
+                spans, key=lambda s: (s.absolute_turn_start, s.span_id)
+            ):
+                if span.status != "cpu_offloaded":
+                    continue
+                if not span.cpu_block_ids_by_group:
+                    return _fail(f"span {span.span_id!r} has no CPU archive slots")
+                span_entries: list[tuple[Any, list[Any]]] = []
+                for manager in self.kv_cache_manager.coordinator.single_type_managers:
+                    idx = manager_to_index[id(manager)]
+                    try:
+                        span_cpu_ids = span.cpu_block_ids_by_group[idx]
+                        logical_starts = span.logical_start_by_group[idx]
+                    except IndexError:
+                        return _fail(
+                            f"span {span.span_id!r} has incomplete CPU "
+                            "position metadata"
+                        )
+                    if len(span_cpu_ids) != len(logical_starts):
+                        return _fail(
+                            f"span {span.span_id!r} CPU block metadata mismatch"
+                        )
+                    blocks = manager.block_pool.get_new_blocks(len(span_cpu_ids))
+                    for block, logical_start in zip(blocks, logical_starts):
+                        block.logical_start = int(logical_start)
+                    span_entries.append((manager, blocks))
+                    groups[idx].extend(blocks)
+                    gpu_block_ids.extend(int(block.block_id) for block in blocks)
+                    cpu_block_ids.extend(int(block_id) for block_id in span_cpu_ids)
+                restored_entries_by_span[span.span_id] = span_entries
+        except ValueError as exc:
+            return _fail(
+                f"insufficient GPU blocks for managed-context CPU reload: {exc}"
+            )
+
+        if not gpu_block_ids:
+            return None
+
+        event_id = self._next_managed_context_transfer_event_id()
+        self._managed_context_load_events_to_submit[event_id] = (
+            ManagedContextCopyEvent(
+                event_id=event_id,
+                gpu_block_ids=gpu_block_ids,
+                cpu_block_ids=cpu_block_ids,
+            )
+        )
+        self._managed_context_load_event_to_request_id[event_id] = request.request_id
+        pending = ManagedContextPendingLoad(
+            request_id=request.request_id,
+            span_ids=[span.span_id for span in spans],
+            spans=list(spans),
+            restored_entries_by_span=restored_entries_by_span,
+            block_ids=tuple(
+                [int(block.block_id) for block in group] for group in groups
+            ),
+            num_tokens=sum(len(span.token_ids) for span in spans),
+            event_id=event_id,
+            created_at=time.monotonic(),
+        )
+        self._managed_context_pending_loads[request.request_id] = pending
+        for span in spans:
+            if span.span_id in restored_entries_by_span:
+                span.pending_load_count += 1
+        if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+            logger.warning(
+                "[MANAGED-CONTEXT-LOAD-SUBMIT] req=%s spans=%s event=%d "
+                "gpu_blocks=%s cpu_blocks=%s logical_starts=%s",
+                request.request_id[:8],
+                [span.span_id for span in spans],
+                event_id,
+                gpu_block_ids,
+                cpu_block_ids,
+                {
+                    span.span_id: [
+                        list(group) for group in span.logical_start_by_group
+                    ]
+                    for span in spans
+                },
+            )
+        return None
+
+    def _complete_managed_context_pending_load(self, request: Request) -> None:
+        pending = self._managed_context_pending_loads.pop(
+            request.request_id, None
+        )
+        if pending is None:
+            return
+        self._managed_context_finished_load_req_ids.discard(request.request_id)
+        self._managed_context_load_event_to_request_id.pop(pending.event_id, None)
+        self._release_managed_context_pending_load_span_refs(pending)
+        active_entries_by_span: dict[str, list[tuple[Any, list[Any]]]] = {}
+        promoted_span_ids: set[str] = set()
+        for span in pending.spans:
+            entries = pending.restored_entries_by_span.get(span.span_id)
+            if entries is None:
+                continue
+            if self._promote_managed_context_hot_gpu_span(span, entries):
+                promoted_span_ids.add(span.span_id)
+            else:
+                active_entries_by_span[span.span_id] = entries
+        self._activate_managed_context_restore(
+            request,
+            pending.spans,
+            restored_entries_by_span=active_entries_by_span,
+            skip_hot_hit_span_ids=promoted_span_ids,
+        )
+
+    def _activate_managed_context_restore(
+        self,
+        request: Request,
+        spans: list[ManagedContextSpan],
+        restored_entries_by_span: dict[
+            str, list[tuple[Any, list[Any]]]
+        ] | None = None,
+        skip_hot_hit_span_ids: set[str] | None = None,
+    ) -> None:
+        if not spans:
+            return
+        restored_entries_by_span = restored_entries_by_span or {}
+        skip_hot_hit_span_ids = skip_hot_hit_span_ids or set()
+        manager_to_index = {
+            id(manager): i
+            for i, manager in enumerate(
+                self.kv_cache_manager.coordinator.single_type_managers
+            )
+        }
+        if len(manager_to_index) != 1:
+            raise RuntimeError(
+                "managed-context restore currently supports one KV cache group"
+            )
+        groups: list[list[Any]] = [[] for _ in manager_to_index]
+        span_ids: list[str] = []
+        num_tokens = 0
+        for span in sorted(spans, key=lambda s: (s.absolute_turn_start, s.span_id)):
+            span_ids.append(span.span_id)
+            num_tokens += len(span.token_ids)
+            entries = restored_entries_by_span.get(span.span_id, span.entries)
+            should_touch = span.span_id not in restored_entries_by_span
+            for manager, blocks in entries:
+                idx = manager_to_index.get(id(manager))
+                if idx is None:
+                    raise RuntimeError(
+                        f"managed-context span {span.span_id} belongs to an "
+                        "unknown KV cache manager"
+                    )
+                if should_touch:
+                    manager.block_pool.touch(blocks)
+                groups[idx].extend(blocks)
+            if span.status == "cpu_hot" and should_touch:
+                self._managed_context_touch_hot_gpu_span(span)
+                if span.span_id not in skip_hot_hit_span_ids:
+                    self._managed_context_hot_gpu_stats.hits += 1
+                    if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+                        logger.warning(
+                            "[MANAGED-CONTEXT-HOT-GPU-HIT] trace=%s span=%s "
+                            "resident=%d budget=%d hits=%d misses=%d",
+                            span.trace_id,
+                            span.span_id,
+                            self._managed_context_hot_gpu_stats.resident_blocks,
+                            self._managed_context_hot_gpu_stats.budget_blocks,
+                            self._managed_context_hot_gpu_stats.hits,
+                            self._managed_context_hot_gpu_stats.misses,
+                        )
+
+        entries: list[tuple[Any, list[Any]]] = []
+        for manager in self.kv_cache_manager.coordinator.single_type_managers:
+            idx = manager_to_index[id(manager)]
+            blocks = groups[idx]
+            if not blocks:
+                continue
+            entries.append((manager, blocks))
+
+        block_ids = tuple(
+            [int(block.block_id) for block in group] for group in groups
+        )
+        self._release_managed_context_active_restore(
+            request.request_id, "replace"
+        )
+        self._managed_context_active_restores[request.request_id] = (
+            ManagedContextActiveRestore(
+                span_ids=span_ids,
+                entries=entries,
+                block_ids=block_ids,
+                num_tokens=num_tokens,
+                created_at=time.monotonic(),
+            )
+        )
+        if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+            span_block_ids: dict[str, list[list[int]]] = {}
+            span_logical_starts: dict[str, list[list[int]]] = {}
+            span_token_heads: dict[str, list[int]] = {}
+            span_token_tails: dict[str, list[int]] = {}
+            for span in spans:
+                entries = restored_entries_by_span.get(span.span_id, span.entries)
+                span_block_ids[span.span_id] = [
+                    [int(block.block_id) for block in blocks]
+                    for _manager, blocks in entries
+                ]
+                span_logical_starts[span.span_id] = [
+                    list(group) for group in span.logical_start_by_group
+                ]
+                span_token_heads[span.span_id] = span.token_ids[:8]
+                span_token_tails[span.span_id] = span.token_ids[-8:]
+            logger.warning(
+                "[MANAGED-CONTEXT-RESTORE-ACTIVE] req=%s spans=%s "
+                "hidden_tokens=%d blocks=%d block_ids=%s "
+                "span_block_ids=%s span_logical_starts=%s "
+                "span_token_heads=%s span_token_tails=%s",
+                request.request_id[:8],
+                span_ids,
+                num_tokens,
+                sum(len(group) for group in groups),
+                block_ids,
+                span_block_ids,
+                span_logical_starts,
+                span_token_heads,
+                span_token_tails,
+            )
+
+    def _managed_context_extra_span_ids(
+        self,
+        request: Request,
+        key: str,
+        *,
+        max_spans: int,
+    ) -> list[str] | None:
+        if request.sampling_params is None:
+            return []
+        extra_args = request.sampling_params.extra_args or {}
+        raw = extra_args.get(key)
+        if raw is None:
+            return []
+        if not isinstance(raw, (list, tuple)):
+            return None
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in raw:
+            if not isinstance(item, str) or not item:
+                return None
+            if item in seen:
+                continue
+            seen.add(item)
+            out.append(item)
+        if len(out) > max_spans:
+            return None
+        return out
+
+    def _managed_context_restore_span_ids(
+        self, request: Request
+    ) -> list[str] | None:
+        return self._managed_context_extra_span_ids(
+            request,
+            "kve_restore_span_ids",
+            max_spans=self._managed_context_recall_max_spans,
+        )
+
+    def _managed_context_offload_span_ids(
+        self, request: Request
+    ) -> list[str] | None:
+        return self._managed_context_extra_span_ids(
+            request,
+            "kve_offload_span_ids",
+            max_spans=self._managed_context_recall_max_spans,
+        )
+
+    def _validate_managed_context_offload_request(
+        self, request: Request
+    ) -> tuple[list[ManagedContextSpan], str | None]:
+        span_ids = self._managed_context_offload_span_ids(request)
+        if span_ids == []:
+            return [], None
+        if span_ids is None:
+            return [], "malformed or over-budget kve_offload_span_ids"
+        if not self._managed_context_enabled:
+            return [], "managed context is disabled"
+        if not self._managed_context_cpu_archive_enabled:
+            return [], "managed-context CPU archive is disabled"
+        trace_id = self._managed_context_trace_id(request)
+        if not trace_id:
+            return [], "offload requires a valid Phase4 trace id"
+        self._prune_managed_context_archive()
+        spans: list[ManagedContextSpan] = []
+        for span_id in span_ids:
+            span = self._managed_context_archive.get((trace_id, span_id))
+            if span is None or span.status not in (
+                "gpu_pinned",
+                "offload_pending",
+                "cpu_offloaded",
+                "cpu_hot",
+            ):
+                return [], f"span {span_id!r} is not available for this trace"
+            spans.append(span)
+        return spans, None
+
+    def _start_managed_context_cpu_offloads(
+        self,
+        spans: list[ManagedContextSpan],
+        reason: str,
+    ) -> str | None:
+        for span in spans:
+            error = self._start_managed_context_cpu_offload(span, reason)
+            if error is not None:
+                return error
+        return None
+
+    def _validate_managed_context_restore_request(
+        self, request: Request
+    ) -> tuple[list[ManagedContextSpan], str | None]:
+        span_ids = self._managed_context_restore_span_ids(request)
+        if span_ids == []:
+            return [], None
+        if span_ids is None:
+            return [], "malformed or over-budget kve_restore_span_ids"
+        if not self._managed_context_enabled:
+            return [], "managed context is disabled"
+        trace_id = self._managed_context_trace_id(request)
+        if not trace_id:
+            return [], "restore requires a valid Phase4 trace id"
+        if len(self.kv_cache_manager.coordinator.single_type_managers) != 1:
+            return [], "managed-context restore currently supports one KV cache group"
+        self._prune_managed_context_archive()
+        spans: list[ManagedContextSpan] = []
+        total_blocks = 0
+        total_tokens = 0
+        for span_id in span_ids:
+            span = self._managed_context_archive.get((trace_id, span_id))
+            if span is None or span.status not in (
+                "gpu_pinned",
+                "offload_pending",
+                "cpu_offloaded",
+                "cpu_hot",
+            ):
+                return [], f"span {span_id!r} is not available for this trace"
+            if span.status == "offload_pending" and not span.entries:
+                return [], f"span {span_id!r} is still offloading"
+            if span.status == "cpu_offloaded" and not span.cpu_block_ids_by_group:
+                return [], f"span {span_id!r} has no CPU archive slots"
+            if span.status == "cpu_hot" and not span.entries:
+                return [], f"span {span_id!r} has no hot GPU blocks"
+            spans.append(span)
+            total_blocks += span.kv_block_count
+            total_tokens += len(span.token_ids)
+        max_blocks = self._managed_context_recall_max_kv_blocks
+        if max_blocks is not None and total_blocks > max_blocks:
+            return [], (
+                f"restore needs {total_blocks} KV blocks, exceeds "
+                f"KVE_MANAGED_CONTEXT_RECALL_MAX_KV_BLOCKS={max_blocks}"
+            )
+        if request.num_tokens + total_tokens > self.max_model_len:
+            return [], (
+                f"restore would exceed max_model_len: visible={request.num_tokens} "
+                f"hidden={total_tokens} max={self.max_model_len}"
+            )
+        return spans, None
 
     def _phase4_pinned_cache_blocks(
         self, trace_id: str, expected_cached_tokens: int
@@ -3236,6 +4752,14 @@ class Scheduler(SchedulerInterface):
                         req_id
                     )
                 )
+                hidden_block_ids, _, _ = self._managed_context_active_hidden_kv(
+                    req_id
+                )
+                if hidden_block_ids:
+                    full_block_ids = tuple(
+                        list(hidden_block_ids[i]) + list(full_block_ids[i])
+                        for i in range(len(full_block_ids))
+                    )
                 new_block_ids.append(full_block_ids)
                 req.needs_rebuild = False
             else:
@@ -3469,6 +4993,9 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
+        managed_context_transfer_output = (
+            model_runner_output.managed_context_transfer_output
+        )
         cudagraph_stats = model_runner_output.cudagraph_stats
 
         perf_stats: PerfStats | None = None
@@ -3493,6 +5020,11 @@ class Scheduler(SchedulerInterface):
             failed_kv_load_req_ids = self._handle_invalid_blocks(
                 kv_connector_output.invalid_block_ids,
                 num_scheduled_tokens,
+            )
+
+        if managed_context_transfer_output:
+            self._update_from_managed_context_transfer_finished(
+                managed_context_transfer_output
             )
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
@@ -4238,11 +5770,33 @@ class Scheduler(SchedulerInterface):
         for request in valid_requests:
             delay_free_blocks = False
             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
-                delay_free_blocks = (
-                    request.request_id not in self.finished_recving_kv_req_ids
-                )
-                self.finished_recving_kv_req_ids.discard(request.request_id)
-                self.failed_recving_kv_req_ids.discard(request.request_id)
+                if request.request_id in self._managed_context_pending_loads:
+                    pending = self._managed_context_pending_loads[
+                        request.request_id
+                    ]
+                    event_not_submitted = (
+                        pending.event_id
+                        in self._managed_context_load_events_to_submit
+                    )
+                    event_finished = (
+                        request.request_id
+                        in self._managed_context_finished_load_req_ids
+                    )
+                    delay_free_blocks = (
+                        not event_not_submitted and not event_finished
+                    )
+                    if not delay_free_blocks:
+                        self._release_managed_context_pending_load(
+                            request.request_id,
+                            "finish-waiting-request",
+                            only_if_safe=False,
+                        )
+                else:
+                    delay_free_blocks = (
+                        request.request_id not in self.finished_recving_kv_req_ids
+                    )
+                    self.finished_recving_kv_req_ids.discard(request.request_id)
+                    self.failed_recving_kv_req_ids.discard(request.request_id)
 
             request.status = finished_status
             self._free_request(request, delay_free_blocks=delay_free_blocks)
@@ -4264,11 +5818,21 @@ class Scheduler(SchedulerInterface):
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:
             self._free_blocks(request)
+        else:
+            self._release_managed_context_active_restore(
+                request_id, "delay-free-request"
+            )
 
         return kv_xfer_params
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        self._release_managed_context_pending_load(
+            request.request_id, "request-finished", only_if_safe=False
+        )
+        self._release_managed_context_active_restore(
+            request.request_id, "request-finished"
+        )
         # KV compaction: ensure any block that became full on the request's
         # final decode step gets registered in the prefix-cache pool before
         # its blocks are freed. Otherwise the last block — whose state
@@ -4359,9 +5923,41 @@ class Scheduler(SchedulerInterface):
             # persistent batch in the model runner.
             self.prev_step_scheduled_req_ids.clear()
 
+        if self._managed_context_active_restores and not reset_running_requests:
+            logger.warning(
+                "[MANAGED-CONTEXT] refusing prefix-cache reset with active "
+                "restored requests: %s",
+                list(self._managed_context_active_restores),
+            )
+            return False
+        if self._managed_context_pending_loads:
+            logger.warning(
+                "[MANAGED-CONTEXT] refusing prefix-cache reset with pending "
+                "CPU reloads: %s",
+                list(self._managed_context_pending_loads),
+            )
+            return False
+        in_flight_store_events = [
+            event_id
+            for event_id in self._managed_context_store_event_to_span
+            if event_id not in self._managed_context_store_events_to_submit
+        ]
+        if in_flight_store_events:
+            logger.warning(
+                "[MANAGED-CONTEXT] refusing prefix-cache reset with pending "
+                "CPU archive stores: %s",
+                in_flight_store_events,
+            )
+            return False
+
         # Phase4 pins are scheduler-local references into the prefix cache. A
         # prefix-cache reset invalidates the carried retained state, so release
         # all pins before resetting the normal cache.
+        for request_id in list(self._managed_context_active_restores):
+            self._release_managed_context_active_restore(
+                request_id, "reset-prefix-cache"
+            )
+        self._release_all_managed_context_spans("reset-prefix-cache")
         self._release_all_phase4_pins("reset-prefix-cache")
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
         if reset_running_requests and not reset_successful:
@@ -4551,6 +6147,19 @@ class Scheduler(SchedulerInterface):
         Try to promote a blocked waiting request back to schedulable states.
         """
         if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            if request.request_id in self._managed_context_pending_loads:
+                if (
+                    request.request_id
+                    not in self._managed_context_finished_load_req_ids
+                ):
+                    return False
+                self._complete_managed_context_pending_load(request)
+                if request.num_preemptions:
+                    request.status = RequestStatus.PREEMPTED
+                else:
+                    request.status = RequestStatus.WAITING
+                return True
+
             # finished_recving_kv_req_ids is populated during
             # update_from_output(), based on worker-side connector signals
             # in KVConnectorOutput.finished_recving
@@ -4578,6 +6187,54 @@ class Scheduler(SchedulerInterface):
             "Unexpected blocked waiting status in promotion: "
             f"{request.status.name} for request {request.request_id}"
         )
+
+    def _update_from_managed_context_transfer_finished(
+        self, output: ManagedContextTransferOutput
+    ) -> None:
+        for event_id in output.completed_store_event_ids:
+            span = self._managed_context_store_event_to_span.pop(event_id, None)
+            if span is None:
+                continue
+            released_blocks = self._release_managed_context_span_gpu_entries(span)
+            span.offload_event_id = None
+            if span.status == "expired":
+                self._managed_context_free_span_cpu_blocks(span)
+            else:
+                span.status = "cpu_offloaded"
+            if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+                logger.warning(
+                    "[MANAGED-CONTEXT-STORE-DONE] trace=%s span=%s event=%d "
+                    "released_gpu_blocks=%d status=%s cpu_blocks=%s",
+                    span.trace_id,
+                    span.span_id,
+                    event_id,
+                    released_blocks,
+                    span.status,
+                    span.cpu_block_ids_by_group,
+                )
+
+        for event_id in output.completed_load_event_ids:
+            request_id = self._managed_context_load_event_to_request_id.pop(
+                event_id, None
+            )
+            if request_id is None:
+                continue
+            self._managed_context_finished_load_req_ids.add(request_id)
+            request = self.requests.get(request_id)
+            if request is None:
+                self._release_managed_context_pending_load(
+                    request_id, "load-done-missing-request", only_if_safe=False
+                )
+                continue
+            if RequestStatus.is_finished(request.status):
+                self._free_blocks(request)
+            elif request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+                    logger.warning(
+                        "[MANAGED-CONTEXT-LOAD-DONE] req=%s event=%d",
+                        request_id[:8],
+                        event_id,
+                    )
 
     def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
         """
