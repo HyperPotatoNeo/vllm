@@ -575,6 +575,9 @@ class Scheduler(SchedulerInterface):
             str, ManagedContextPendingLoad
         ] = {}
         self._managed_context_finished_load_req_ids: set[str] = set()
+        self._managed_context_restore_reservations: dict[
+            str, set[tuple[str, str]]
+        ] = {}
         self._managed_context_hot_gpu_order: deque[tuple[str, str]] = deque()
         raw_hot_gpu_budget = self._env_optional_int(
             "KVE_MANAGED_CONTEXT_GPU_HOT_BLOCK_BUDGET"
@@ -1809,6 +1812,10 @@ class Scheduler(SchedulerInterface):
                                     request.request_id[:8],
                                     load_start.error,
                                 )
+                            self._reserve_managed_context_restore_spans(
+                                request.request_id,
+                                restore_spans,
+                            )
                             request.position_offset = (
                                 position_offset_before_restore_align
                             )
@@ -1825,6 +1832,10 @@ class Scheduler(SchedulerInterface):
                             request, load_start.error
                         )
                         continue
+                    self._release_managed_context_restore_reservation(
+                        request.request_id,
+                        "load-started",
+                    )
                     request = request_queue.pop_request()
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     step_skipped_waiting.prepend_request(request)
@@ -3101,6 +3112,7 @@ class Scheduler(SchedulerInterface):
     ) -> None:
         request.status = RequestStatus.FINISHED_ABORTED
         request_id = request.request_id
+        self._release_managed_context_restore_reservation(request_id, "abort")
         self._release_managed_context_active_restore(request_id, "abort")
         self.encoder_cache_manager.free(request)
         self.kv_cache_manager.free(request)
@@ -3376,6 +3388,45 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[str, str]:
         return (span.trace_id, span.span_id)
 
+    def _reserve_managed_context_restore_spans(
+        self,
+        request_id: str,
+        spans: list[ManagedContextSpan],
+    ) -> None:
+        keys = {self._managed_context_span_key(span) for span in spans}
+        if keys:
+            self._managed_context_restore_reservations[request_id] = keys
+
+    def _release_managed_context_restore_reservation(
+        self,
+        request_id: str,
+        reason: str,
+    ) -> None:
+        keys = self._managed_context_restore_reservations.pop(request_id, None)
+        if (
+            keys
+            and os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1"
+        ):
+            logger.warning(
+                "[MANAGED-CONTEXT-RESTORE-RESERVE-RELEASE] req=%s "
+                "reason=%s spans=%s",
+                request_id[:8],
+                reason,
+                sorted(f"{trace}:{span}" for trace, span in keys),
+            )
+
+    def _managed_context_cpu_archive_protected_keys(
+        self,
+        extra: set[tuple[str, str]] | None = None,
+    ) -> set[tuple[str, str]]:
+        protected = set(extra or ())
+        for keys in self._managed_context_restore_reservations.values():
+            protected.update(keys)
+        for key, span in self._managed_context_archive.items():
+            if span.pending_load_count > 0:
+                protected.add(key)
+        return protected
+
     def _managed_context_remove_hot_gpu_key(
         self,
         key: tuple[str, str],
@@ -3547,7 +3598,7 @@ class Scheduler(SchedulerInterface):
         ):
             return None
 
-        protected = protected or set()
+        protected = self._managed_context_cpu_archive_protected_keys(protected)
         while len(self._managed_context_cpu_free_block_ids) < num_blocks:
             if not self._managed_context_archive_order:
                 return None
@@ -3703,6 +3754,7 @@ class Scheduler(SchedulerInterface):
             )
 
     def _release_all_managed_context_spans(self, reason: str) -> None:
+        self._managed_context_restore_reservations.clear()
         for key in list(self._managed_context_archive):
             self._release_managed_context_span(key, reason)
         self._managed_context_archive_order.clear()
@@ -5951,6 +6003,9 @@ class Scheduler(SchedulerInterface):
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        self._release_managed_context_restore_reservation(
+            request_id, "free-request"
+        )
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
@@ -5967,6 +6022,9 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        self._release_managed_context_restore_reservation(
+            request.request_id, "request-finished"
+        )
         self._release_managed_context_pending_load(
             request.request_id, "request-finished", only_if_safe=False
         )
