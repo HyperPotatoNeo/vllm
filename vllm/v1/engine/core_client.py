@@ -661,12 +661,16 @@ class MPClient(EngineCoreClient):
             if not _self or not _self._finalizer.alive or _self.resources.engine_dead:
                 return
             _self.resources.engine_dead = True
-            proc_name = next(
-                proc.name for proc in engine_processes if proc.sentinel == died[0]
+            dead_proc = next(
+                proc for proc in engine_processes if proc.sentinel == died[0]
             )
+            dead_proc.join(timeout=0)
             logger.error(
-                "Engine core proc %s died unexpectedly, shutting down client.",
-                proc_name,
+                "Engine core proc %s pid=%s exitcode=%s died unexpectedly, "
+                "shutting down client.",
+                dead_proc.name,
+                dead_proc.pid,
+                dead_proc.exitcode,
             )
             _self.shutdown()
             # Note: For MPClient, we don't have a failure callback mechanism

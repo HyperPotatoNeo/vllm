@@ -179,6 +179,15 @@ class ManagedContextActiveRestore:
 
 
 @dataclass
+class ManagedContextDeferredRestore:
+    span_ids: list[str]
+    spans: list[ManagedContextSpan]
+    restored_entries_by_span: dict[str, list[tuple[Any, list[Any]]]]
+    skip_hot_hit_span_ids: set[str]
+    created_at: float
+
+
+@dataclass
 class ManagedContextPendingLoad:
     request_id: str
     span_ids: list[str]
@@ -216,6 +225,7 @@ class Scheduler(SchedulerInterface):
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
         self.observability_config = vllm_config.observability_config
+        self._validate_compaction_mode_config()
         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
         if self.observability_config.kv_cache_metrics:
             self.kv_metrics_collector = KVCacheMetricsCollector(
@@ -231,6 +241,9 @@ class Scheduler(SchedulerInterface):
         self.finished_req_ids_dict: dict[int, set[str]] | None = (
             defaultdict(set) if include_finished_set else None
         )
+        self._pending_engine_core_outputs: dict[
+            int, list[EngineCoreOutput]
+        ] = defaultdict(list)
         self.prev_step_scheduled_req_ids: set[str] = set()
         self._kve_sched_sig_step = 0
 
@@ -260,7 +273,10 @@ class Scheduler(SchedulerInterface):
             # compaction invalidates. Checking here (before connector
             # construction) avoids loading the lmcache package at all and
             # gives a clear error before any side effects.
-            if self.cache_config.compaction_window_size > 0:
+            if (
+                self.cache_config.compaction_window_size > 0
+                or self.cache_config.compaction_max_turns > 0
+            ):
                 kv_connector_name = (
                     self.vllm_config.kv_transfer_config.kv_connector or ""
                 ).lower()
@@ -387,6 +403,7 @@ class Scheduler(SchedulerInterface):
             metrics_collector=self.kv_metrics_collector,
             compaction_window_size=self.cache_config.compaction_window_size,
             compaction_stride=self.cache_config.compaction_stride,
+            compaction_max_turns=self.cache_config.compaction_max_turns,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -517,6 +534,9 @@ class Scheduler(SchedulerInterface):
         )
         self._managed_context_active_restores: dict[
             str, ManagedContextActiveRestore
+        ] = {}
+        self._managed_context_deferred_restores: dict[
+            str, ManagedContextDeferredRestore
         ] = {}
         self._managed_context_archive_device = os.environ.get(
             "KVE_MANAGED_CONTEXT_ARCHIVE_DEVICE", "gpu"
@@ -703,6 +723,237 @@ class Scheduler(SchedulerInterface):
             )
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+        self._kve_liveness_diag_last_ts = 0.0
+
+    def _validate_compaction_mode_config(self) -> None:
+        window_enabled = self.cache_config.compaction_window_size > 0
+        turn_enabled = self.cache_config.compaction_max_turns > 0
+        assert not (window_enabled and turn_enabled), (
+            "KV cache compaction modes are mutually exclusive: set either "
+            "compaction_window_size/compaction_stride for token-window FIFO "
+            "eviction, or compaction_max_turns for turn-mode eviction, not "
+            "both."
+        )
+        if not window_enabled:
+            assert self.cache_config.compaction_stride == 0, (
+                "compaction_stride requires compaction_window_size > 0; "
+                "leave compaction_stride at 0 for turn-mode eviction"
+            )
+
+    @staticmethod
+    def _kve_diag_enabled() -> bool:
+        return os.environ.get("KVE_SCHED_LIVENESS_DIAG", "0") == "1"
+
+    @staticmethod
+    def _kve_blocks_from_entries(entries: list[tuple[Any, list[Any]]]) -> int:
+        return sum(len(blocks) for _, blocks in entries if blocks)
+
+    def _kve_request_visible_block_count(self, request: Request) -> int:
+        try:
+            block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
+        except Exception:  # pragma: no cover - best-effort diagnostics only.
+            return -1
+        return sum(len(group) for group in block_ids)
+
+    def _kve_managed_context_diag_summary(self) -> dict[str, Any]:
+        archive_by_status: defaultdict[str, int] = defaultdict(int)
+        archive_blocks_by_status: defaultdict[str, int] = defaultdict(int)
+        for span in self._managed_context_archive.values():
+            archive_by_status[span.status] += 1
+            archive_blocks_by_status[span.status] += span.kv_block_count
+
+        active_restore_blocks = sum(
+            self._kve_blocks_from_entries(restore.entries)
+            for restore in self._managed_context_active_restores.values()
+        )
+        deferred_restore_blocks = sum(
+            sum(
+                self._kve_blocks_from_entries(entries)
+                for entries in deferred.restored_entries_by_span.values()
+            )
+            for deferred in self._managed_context_deferred_restores.values()
+        )
+        pending_load_blocks = sum(
+            self._kve_blocks_from_entries(
+                [
+                    entry
+                    for entries in pending.restored_entries_by_span.values()
+                    for entry in entries
+                ]
+            )
+            for pending in self._managed_context_pending_loads.values()
+        )
+        return {
+            "archive_spans": dict(sorted(archive_by_status.items())),
+            "archive_blocks": dict(sorted(archive_blocks_by_status.items())),
+            "active_restores": len(self._managed_context_active_restores),
+            "active_restore_blocks": active_restore_blocks,
+            "deferred_restores": len(self._managed_context_deferred_restores),
+            "deferred_restore_blocks": deferred_restore_blocks,
+            "pending_loads": len(self._managed_context_pending_loads),
+            "pending_load_blocks": pending_load_blocks,
+            "restore_reservations": len(
+                self._managed_context_restore_reservations
+            ),
+            "phase4_pins": len(self._phase4_pinned_blocks),
+            "phase4_pin_blocks": sum(
+                pin.block_count for pin in self._phase4_pinned_blocks.values()
+            ),
+            "cpu_free_blocks": len(self._managed_context_cpu_free_block_ids),
+            "cpu_max_blocks": self._managed_context_cpu_max_blocks,
+            "hot_gpu": {
+                "budget": self._managed_context_hot_gpu_stats.budget_blocks,
+                "resident": self._managed_context_hot_gpu_stats.resident_blocks,
+                "hits": self._managed_context_hot_gpu_stats.hits,
+                "misses": self._managed_context_hot_gpu_stats.misses,
+                "evictions": self._managed_context_hot_gpu_stats.evictions,
+                "promotions": self._managed_context_hot_gpu_stats.promotions,
+            },
+        }
+
+    def _kve_gpu_block_pool_diag_summary(self) -> list[dict[str, int]]:
+        summaries: list[dict[str, int]] = []
+        for group_idx, manager in enumerate(
+            self.kv_cache_manager.coordinator.single_type_managers
+        ):
+            block_pool = manager.block_pool
+            summaries.append(
+                {
+                    "group": group_idx,
+                    "total": block_pool.num_gpu_blocks,
+                    "free": block_pool.get_num_free_blocks(),
+                    "used": block_pool.num_gpu_blocks
+                    - block_pool.get_num_free_blocks(),
+                    "cached_hashes": len(
+                        block_pool.cached_block_hash_to_block._cache
+                    ),
+                    "cached_this_step": len(block_pool.cached_block_ids_this_step),
+                }
+            )
+        return summaries
+
+    def _kve_request_diag_line(self, request: Request) -> str:
+        request_id = request.request_id
+        status = getattr(request.status, "name", str(request.status))
+        active = self._managed_context_active_restores.get(request_id)
+        deferred = self._managed_context_deferred_restores.get(request_id)
+        pending = self._managed_context_pending_loads.get(request_id)
+        active_blocks = (
+            self._kve_blocks_from_entries(active.entries)
+            if active is not None
+            else 0
+        )
+        deferred_blocks = (
+            sum(
+                self._kve_blocks_from_entries(entries)
+                for entries in deferred.restored_entries_by_span.values()
+            )
+            if deferred is not None
+            else 0
+        )
+        pending_blocks = (
+            sum(
+                self._kve_blocks_from_entries(entries)
+                for entries in pending.restored_entries_by_span.values()
+            )
+            if pending is not None
+            else 0
+        )
+        reserved = self._managed_context_restore_reservations.get(request_id)
+        return (
+            f"{request_id[:8]} status={status} pos={request.position_offset} "
+            f"computed={request.num_computed_tokens}/{request.num_tokens} "
+            f"prompt={request.num_prompt_tokens} "
+            f"visible_blocks={self._kve_request_visible_block_count(request)} "
+            f"pad={int(bool(request.padding_pending))} "
+            f"active={active_blocks} deferred={deferred_blocks} "
+            f"pending={pending_blocks} reserved={len(reserved or ())}"
+        )
+
+    def _kve_request_diag_samples(
+        self,
+        requests: Iterable[Request],
+        *,
+        limit: int = 8,
+    ) -> list[str]:
+        samples: list[str] = []
+        for request in requests:
+            samples.append(self._kve_request_diag_line(request))
+            if len(samples) >= limit:
+                break
+        return samples
+
+    def _kve_log_compacted_preempt_abort(
+        self,
+        request: Request,
+        *,
+        phase: str,
+    ) -> None:
+        if not self._kve_diag_enabled():
+            return
+        logger.warning(
+            "[SCHED-COMPACT-PREEMPT-DIAG] phase=%s req=%s pools=%s "
+            "managed=%s request=%s running=%d waiting=%d skipped=%d "
+            "finished_pending=%d",
+            phase,
+            request.request_id[:8],
+            self._kve_gpu_block_pool_diag_summary(),
+            self._kve_managed_context_diag_summary(),
+            self._kve_request_diag_line(request),
+            len(self.running),
+            len(self.waiting),
+            len(self.skipped_waiting),
+            len(self.finished_req_ids),
+        )
+
+    def _kve_maybe_log_scheduler_liveness(
+        self,
+        *,
+        total_num_scheduled_tokens: int,
+        token_budget: int,
+        preempted_reqs: list[Request],
+        scheduled_running_reqs: list[Request],
+        scheduled_new_reqs: list[Request],
+        scheduled_resumed_reqs: list[Request],
+    ) -> None:
+        if not self._kve_diag_enabled():
+            return
+        waiting_count = len(self.waiting) + len(self.skipped_waiting)
+        stall_like = (
+            total_num_scheduled_tokens == 0
+            and not self.running
+            and waiting_count > 0
+        )
+        always = os.environ.get("KVE_SCHED_LIVENESS_ALWAYS", "0") == "1"
+        if not stall_like and not always:
+            return
+        interval = self._env_float("KVE_SCHED_LIVENESS_INTERVAL_SECONDS", 5.0)
+        now = time.monotonic()
+        if now - self._kve_liveness_diag_last_ts < interval:
+            return
+        self._kve_liveness_diag_last_ts = now
+        logger.warning(
+            "[SCHED-LIVENESS] stall_like=%s total_sched_tokens=%d "
+            "token_budget=%d running=%d waiting=%d skipped=%d "
+            "scheduled_running=%d scheduled_new=%d scheduled_resumed=%d "
+            "preempted=%d pools=%s managed=%s running_samples=%s "
+            "waiting_samples=%s skipped_samples=%s",
+            stall_like,
+            total_num_scheduled_tokens,
+            token_budget,
+            len(self.running),
+            len(self.waiting),
+            len(self.skipped_waiting),
+            len(scheduled_running_reqs),
+            len(scheduled_new_reqs),
+            len(scheduled_resumed_reqs),
+            len(preempted_reqs),
+            self._kve_gpu_block_pool_diag_summary(),
+            self._kve_managed_context_diag_summary(),
+            self._kve_request_diag_samples(self.running),
+            self._kve_request_diag_samples(self.waiting),
+            self._kve_request_diag_samples(self.skipped_waiting),
+        )
 
     def _mamba_block_aligned_split(
         self,
@@ -796,6 +1047,7 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        self._prune_phase4_pins()
         self.kv_cache_manager.new_step_starts()
 
         # First, schedule the RUNNING requests.
@@ -809,6 +1061,10 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            self._activate_deferred_managed_context_restore_if_ready(request)
+            if request.is_finished():
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -854,6 +1110,13 @@ class Scheduler(SchedulerInterface):
                     - hidden_kv_num_tokens
                     - request.num_computed_tokens,
                 ),
+            )
+            num_new_tokens = (
+                self._cap_managed_context_deferred_prefill_tokens(
+                    request,
+                    num_computed_tokens=request.num_computed_tokens,
+                    num_new_tokens=num_new_tokens,
+                )
             )
 
             # Schedule encoder inputs.
@@ -911,6 +1174,11 @@ class Scheduler(SchedulerInterface):
                         break
 
                     # The request cannot be scheduled.
+                    if self._release_phase4_pressure_pin(
+                        "running-alloc-pressure"
+                    ):
+                        continue
+
                     # Preempt the lowest-priority request.
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
@@ -940,7 +1208,8 @@ class Scheduler(SchedulerInterface):
                         preempted_req = self.running.pop()
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
-                    preempted_reqs.append(preempted_req)
+                    if not preempted_req.is_finished():
+                        preempted_reqs.append(preempted_req)
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
                         break
@@ -1109,6 +1378,13 @@ class Scheduler(SchedulerInterface):
                 phase4_pin_trace_to_mark_consumed = ""
                 phase4_pin_call_to_mark_consumed = ""
                 position_offset_before_restore_align = request.position_offset
+
+                def clear_pending_phase4_pin_consumed() -> None:
+                    if phase4_pin_trace_to_mark_consumed:
+                        self._clear_phase4_pin_consumed(
+                            phase4_pin_trace_to_mark_consumed,
+                            request.request_id,
+                        )
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
@@ -1398,6 +1674,14 @@ class Scheduler(SchedulerInterface):
                                 phase4_pin_call_to_mark_consumed = str(
                                     phase4_call_idx
                                 )
+                                # Managed CPU restore can defer before
+                                # allocate_slots(). At the prefix hit point the
+                                # request has already started depending on this
+                                # retained KV, so mark it consumed here.
+                                self._mark_phase4_pin_consumed(
+                                    phase4_pin_trace_to_mark_consumed,
+                                    request.request_id,
+                                )
                                 if (
                                     os.environ.get(
                                         "KVE_TRACE_PHASE4_PREFIX_HIT", ""
@@ -1569,6 +1853,7 @@ class Scheduler(SchedulerInterface):
                                         phase4_prefix_miss_msg,
                                     )
                                     request_queue.pop_request()
+                                    clear_pending_phase4_pin_consumed()
                                     self._abort_waiting_phase4_request(
                                         request, phase4_prefix_miss_msg
                                     )
@@ -1626,6 +1911,7 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
+                            clear_pending_phase4_pin_consumed()
                             if pending_inherit_event is not None:
                                 request.position_offset = 0
                             request_queue.pop_request()
@@ -1670,8 +1956,14 @@ class Scheduler(SchedulerInterface):
                             reason,
                         )
                         request_queue.pop_request()
+                        clear_pending_phase4_pin_consumed()
                         self._abort_waiting_phase4_request(request, reason)
                         continue
+                restore_defer_until_prefill = (
+                    bool(restore_spans)
+                    and self._managed_context_defer_restore_until_prefill(request)
+                    and num_computed_tokens < request.num_prompt_tokens
+                )
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
@@ -1699,11 +1991,19 @@ class Scheduler(SchedulerInterface):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        clear_pending_phase4_pin_consumed()
                         if pending_inherit_event is not None:
                             request.position_offset = 0
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
+                    num_new_tokens = (
+                        self._cap_managed_context_deferred_prefill_tokens(
+                            request,
+                            num_computed_tokens=num_computed_tokens,
+                            num_new_tokens=num_new_tokens,
+                        )
+                    )
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -1722,6 +2022,7 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
+                            clear_pending_phase4_pin_consumed()
                             if pending_inherit_event is not None:
                                 request.position_offset = 0
                             break
@@ -1734,6 +2035,7 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens,
                     )
                     if num_new_tokens == 0:
+                        clear_pending_phase4_pin_consumed()
                         if pending_inherit_event is not None:
                             request.position_offset = 0
                         break
@@ -1771,6 +2073,7 @@ class Scheduler(SchedulerInterface):
                 ):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    clear_pending_phase4_pin_consumed()
                     if pending_inherit_event is not None:
                         request.position_offset = 0
                     break
@@ -1779,6 +2082,8 @@ class Scheduler(SchedulerInterface):
                     restore_spans
                     and request.request_id
                     not in self._managed_context_active_restores
+                    and request.request_id
+                    not in self._managed_context_deferred_restores
                     and self._managed_context_restore_needs_cpu_load(restore_spans)
                 ):
                     extra_required_gpu_blocks = 0
@@ -1816,9 +2121,30 @@ class Scheduler(SchedulerInterface):
                                 request.request_id,
                                 restore_spans,
                             )
-                            request.position_offset = (
-                                position_offset_before_restore_align
-                            )
+                            if request.num_computed_tokens == 0:
+                                if (
+                                    request.position_offset != 0
+                                    and os.environ.get(
+                                        "KVE_TRACE_MANAGED_CONTEXT"
+                                    )
+                                    == "1"
+                                ):
+                                    logger.warning(
+                                        "[MANAGED-CONTEXT-LOAD-RESET-POS] "
+                                        "req=%s reason=load-defer "
+                                        "position_offset=%d->0 "
+                                        "cached=%d inherited=%d",
+                                        request.request_id[:8],
+                                        request.position_offset,
+                                        num_new_local_computed_tokens,
+                                        inherited_offset,
+                                    )
+                                request.position_offset = 0
+                            else:
+                                request.position_offset = (
+                                    position_offset_before_restore_align
+                                )
+                            clear_pending_phase4_pin_consumed()
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
@@ -1828,6 +2154,7 @@ class Scheduler(SchedulerInterface):
                             load_start.error,
                         )
                         request_queue.pop_request()
+                        clear_pending_phase4_pin_consumed()
                         self._abort_waiting_phase4_request(
                             request, load_start.error
                         )
@@ -1837,23 +2164,64 @@ class Scheduler(SchedulerInterface):
                         "load-started",
                     )
                     request = request_queue.pop_request()
+                    clear_pending_phase4_pin_consumed()
+                    if request.num_computed_tokens == 0:
+                        if (
+                            request.position_offset != 0
+                            and os.environ.get("KVE_TRACE_MANAGED_CONTEXT")
+                            == "1"
+                        ):
+                            logger.warning(
+                                "[MANAGED-CONTEXT-LOAD-RESET-POS] req=%s "
+                                "reason=load-started position_offset=%d->0 "
+                                "cached=%d inherited=%d",
+                                request.request_id[:8],
+                                request.position_offset,
+                                num_new_local_computed_tokens,
+                                inherited_offset,
+                            )
+                        request.position_offset = 0
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     step_skipped_waiting.prepend_request(request)
                     continue
 
                 restore_position_aligned = False
                 if restore_spans:
-                    restore_position_aligned = (
-                        self._align_managed_context_restore_position(
-                            request, restore_spans
+                    if not restore_defer_until_prefill:
+                        restore_position_aligned = (
+                            self._align_managed_context_restore_position(
+                                request, restore_spans
+                            )
                         )
-                    )
+                        if (
+                            restore_position_aligned
+                            and pending_inherit_event is not None
+                        ):
+                            pending_inherit_event.position_offset_after = (
+                                request.position_offset
+                            )
+                    elif os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+                        logger.warning(
+                            "[MANAGED-CONTEXT-ALIGN-SKIP] req=%s "
+                            "reason=defer-until-prefill "
+                            "position_offset=%d spans=%s",
+                            request.request_id[:8],
+                            request.position_offset,
+                            [span.span_id for span in restore_spans],
+                        )
                     if (
-                        restore_position_aligned
-                        and pending_inherit_event is not None
+                        restore_defer_until_prefill
+                        and request.request_id
+                        not in self._managed_context_deferred_restores
                     ):
-                        pending_inherit_event.position_offset_after = (
-                            request.position_offset
+                        self._set_managed_context_deferred_restore(
+                            request,
+                            restore_spans,
+                        )
+                    if restore_defer_until_prefill:
+                        self._activate_deferred_managed_context_restore_if_ready(
+                            request,
+                            computed_tokens=num_computed_tokens,
                         )
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
@@ -1895,6 +2263,11 @@ class Scheduler(SchedulerInterface):
                             len(self._phase4_pinned_blocks),
                             request.position_offset,
                         )
+                    if phase4_pin_trace_to_mark_consumed:
+                        self._clear_phase4_pin_consumed(
+                            phase4_pin_trace_to_mark_consumed,
+                            request.request_id,
+                        )
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -1906,17 +2279,14 @@ class Scheduler(SchedulerInterface):
                         request.position_offset = (
                             position_offset_before_restore_align
                         )
+                    if (
+                        not self.running
+                        and self._release_phase4_pressure_pin(
+                            "waiting-alloc-pressure"
+                        )
+                    ):
+                        continue
                     break
-
-                if phase4_pin_trace_to_mark_consumed:
-                    # Keep the previous turn's pin alive until this successor
-                    # finishes and replaces it. Releasing here is unsafe under
-                    # preemption/retry: the successor may still need to attach
-                    # the same retained KV again.
-                    self._mark_phase4_pin_consumed(
-                        phase4_pin_trace_to_mark_consumed,
-                        request.request_id,
-                    )
 
                 if pending_inherit_event is not None:
                     request.compaction_events.append(pending_inherit_event)
@@ -1975,7 +2345,11 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens = num_computed_tokens
                     continue
 
-                if request.request_id not in self._managed_context_active_restores:
+                if (
+                    request.request_id
+                    not in self._managed_context_active_restores
+                    and not restore_defer_until_prefill
+                ):
                     self._activate_managed_context_restore(request, restore_spans)
                 self.running.append(request)
                 if self.log_stats:
@@ -2062,13 +2436,39 @@ class Scheduler(SchedulerInterface):
         # attention when in-step eviction fired this step — the common
         # prefix computed against post-eviction block_tables may not
         # match what the kernel reads given the just-spliced layout.
+        # Also skip it for active managed-context restores: the scheduler-side
+        # KV manager only knows about the visible request blocks, while the
+        # worker prepends hidden restored blocks to the block-table row. A
+        # visible-only common-prefix length would index the wrong physical
+        # prefix in that spliced worker row.
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
         with record_function_or_nullcontext("schedule: get_num_common_prefix_blocks"):
-            if self.running and not any_inline_evicted:
+            has_active_managed_context_restore = any(
+                req.request_id in self._managed_context_active_restores
+                for req in self.running
+            )
+            if (
+                self.running
+                and not any_inline_evicted
+                and not has_active_managed_context_restore
+            ):
                 any_request_id = self.running[0].request_id
                 num_common_prefix_blocks = (
                     self.kv_cache_manager.get_num_common_prefix_blocks(any_request_id)
                 )
+
+        self._maybe_release_phase4_stall_pressure_pin(
+            total_num_scheduled_tokens=total_num_scheduled_tokens
+        )
+
+        self._kve_maybe_log_scheduler_liveness(
+            total_num_scheduled_tokens=total_num_scheduled_tokens,
+            token_budget=token_budget,
+            preempted_reqs=preempted_reqs,
+            scheduled_running_reqs=scheduled_running_reqs,
+            scheduled_new_reqs=scheduled_new_reqs,
+            scheduled_resumed_reqs=scheduled_resumed_reqs,
+        )
 
         # Construct the scheduler output.
         # Compute protected_prefix_len per request for the 2-piece
@@ -2263,24 +2663,24 @@ class Scheduler(SchedulerInterface):
                 "(position_offset=%d) — aborting request instead.",
                 request.request_id, request.position_offset,
             )
-            self.kv_cache_manager.free(request)
-            self.encoder_cache_manager.free(request)
-            request.status = RequestStatus.FINISHED_ABORTED
-            self.finished_req_ids.add(request.request_id)
+            request.status = RequestStatus.FINISHED_ERROR
+            self._kve_log_compacted_preempt_abort(request, phase="before-free")
+            self._free_request(request)
+            self._kve_log_compacted_preempt_abort(request, phase="after-free")
+            self._queue_finished_request_output(request)
             return
-        if request.request_id in self._managed_context_active_restores:
+        if (
+            request.request_id in self._managed_context_active_restores
+            or request.request_id in self._managed_context_deferred_restores
+        ):
             logger.warning(
                 "Attempted to preempt managed-context restore request %s; "
                 "aborting request instead.",
                 request.request_id,
             )
-            self._release_managed_context_active_restore(
-                request.request_id, "preempt-abort"
-            )
-            self.kv_cache_manager.free(request)
-            self.encoder_cache_manager.free(request)
-            request.status = RequestStatus.FINISHED_ABORTED
-            self.finished_req_ids.add(request.request_id)
+            request.status = RequestStatus.FINISHED_ERROR
+            self._free_request(request)
+            self._queue_finished_request_output(request)
             return
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
@@ -3110,21 +3510,51 @@ class Scheduler(SchedulerInterface):
     def _abort_waiting_phase4_request(
         self, request: Request, reason: str
     ) -> None:
-        request.status = RequestStatus.FINISHED_ABORTED
+        extra_args = (
+            request.sampling_params.extra_args
+            if request.sampling_params is not None
+            else {}
+        ) or {}
+        trace_id = extra_args.get("kve_phase4_trace_id", "")
+        call_idx = extra_args.get("kve_phase4_call_idx", None)
+        restore_span_ids = extra_args.get("kve_restore_span_ids", None)
+        offload_span_ids = extra_args.get("kve_offload_span_ids", None)
+        request.status = RequestStatus.FINISHED_ERROR
         request_id = request.request_id
-        self._release_managed_context_restore_reservation(request_id, "abort")
-        self._release_managed_context_active_restore(request_id, "abort")
-        self.encoder_cache_manager.free(request)
-        self.kv_cache_manager.free(request)
-        self.finished_req_ids.add(request_id)
-        if self.finished_req_ids_dict is not None:
-            self.finished_req_ids_dict[request.client_index].add(request_id)
+        self._clear_phase4_pin_consumed(trace_id, request_id)
         self._pending_admission_compaction_ids.discard(request_id)
-        self.requests.pop(request_id, None)
+        self._free_request(request)
         logger.error(
-            "[PHASE4-REQUEST-ABORTED] req=%s reason=%s",
+            "[PHASE4-REQUEST-ABORTED] req=%s trace=%s call=%s "
+            "restore=%s offload=%s reason=%s",
             request_id[:8],
+            trace_id,
+            call_idx,
+            restore_span_ids,
+            offload_span_ids,
             reason,
+        )
+        self._queue_finished_request_output(request)
+
+    def _queue_finished_request_output(self, request: Request) -> None:
+        compaction_events = (
+            list(request.compaction_events)
+            if request.compaction_events
+            else None
+        )
+        self._pending_engine_core_outputs[request.client_index].append(
+            EngineCoreOutput(
+                request_id=request.request_id,
+                new_token_ids=[],
+                finish_reason=request.get_finished_reason(),
+                stop_reason=request.stop_reason,
+                events=request.take_events(),
+                trace_headers=request.trace_headers,
+                num_cached_tokens=max(0, request.num_cached_tokens),
+                num_external_computed_tokens=request.num_external_computed_tokens,
+                num_nans_in_logits=request.num_nans_in_logits,
+                compaction_events=compaction_events,
+            )
         )
 
     def _phase4_pin_limit(self) -> int | None:
@@ -3176,7 +3606,18 @@ class Scheduler(SchedulerInterface):
         except ValueError:
             return 1800.0
 
-    def _release_phase4_pins(self, trace_id: str, reason: str) -> None:
+    def _phase4_consumed_pin_grace_seconds(self) -> float:
+        raw_grace = os.environ.get("KVE_PHASE4_CONSUMED_PIN_GRACE_SECONDS")
+        if raw_grace is None:
+            return 2.0
+        try:
+            return max(0.0, float(raw_grace))
+        except ValueError:
+            return 2.0
+
+    def _release_phase4_pins(
+        self, trace_id: str, reason: str, *, evict_prefix: bool = False
+    ) -> None:
         if not trace_id:
             return
         pin = self._phase4_pinned_blocks.pop(trace_id, None)
@@ -3186,11 +3627,19 @@ class Scheduler(SchedulerInterface):
         for manager, blocks in pin.entries:
             if blocks:
                 manager.block_pool.free_blocks(blocks)
+                if evict_prefix:
+                    manager.block_pool.evict_blocks(
+                        {
+                            block.block_id
+                            for block in blocks
+                            if block.block_hash is not None
+                        }
+                    )
                 released_blocks += len(blocks)
-        if os.environ.get("KVE_TRACE_PHASE4_PIN") == "1":
+        if evict_prefix or os.environ.get("KVE_TRACE_PHASE4_PIN") == "1":
             logger.warning(
                 "[PHASE4-PIN-RELEASE] trace=%s reason=%s blocks=%d "
-                "tokens=%d req=%s call=%s consumed_by=%s",
+                "tokens=%d req=%s call=%s consumed_by=%s evict_prefix=%s",
                 trace_id,
                 reason,
                 released_blocks,
@@ -3198,6 +3647,7 @@ class Scheduler(SchedulerInterface):
                 pin.request_id,
                 pin.call_idx,
                 pin.consumed_by_request_id,
+                evict_prefix,
             )
 
     def _release_all_phase4_pins(self, reason: str) -> None:
@@ -3224,25 +3674,88 @@ class Scheduler(SchedulerInterface):
                 pin.block_count,
             )
 
-    def _phase4_pin_is_prunable(
-        self, pin: Phase4Pin, now: float, ttl_seconds: float
+    def _clear_phase4_pin_consumed(
+        self, trace_id: str, request_id: str
+    ) -> None:
+        pin = self._phase4_pinned_blocks.get(trace_id)
+        if pin is None or pin.consumed_by_request_id != request_id:
+            return
+        pin.consumed_by_request_id = None
+        pin.consumed_at = None
+        if os.environ.get("KVE_TRACE_PHASE4_PIN") == "1":
+            logger.warning(
+                "[PHASE4-PIN-UNCONSUMED] trace=%s req=%s pin_req=%s "
+                "pin_call=%s tokens=%d blocks=%d",
+                trace_id,
+                request_id[:8],
+                pin.request_id,
+                pin.call_idx,
+                pin.token_count,
+                pin.block_count,
+            )
+
+    def _phase4_has_queued_successor(
+        self, trace_id: str, pin: Phase4Pin
     ) -> bool:
-        if (
-            pin.consumed_by_request_id is not None
-            and pin.consumed_by_request_id not in self.requests
+        if not trace_id:
+            return False
+        for request_queue in (
+            getattr(self, "waiting", ()),
+            getattr(self, "skipped_waiting", ()),
         ):
+            for request in request_queue:
+                if self._phase4_trace_id(request) != trace_id:
+                    continue
+                expected_cached_tokens = self._phase4_expected_cached_tokens(
+                    request
+                )
+                if (
+                    expected_cached_tokens is not None
+                    and expected_cached_tokens <= pin.token_count
+                ):
+                    return True
+        return False
+
+    def _phase4_pin_is_prunable(
+        self,
+        trace_id: str,
+        pin: Phase4Pin,
+        now: float,
+        ttl_seconds: float,
+    ) -> bool:
+        if pin.consumed_by_request_id is not None:
+            # A managed-context retry can arrive immediately after the first
+            # pass consumes the Phase4 pin. Keep it while the consumer is
+            # still live. After that, keep a short grace window for client-side
+            # retry creation and then keep only actual queued same-trace demand.
+            if pin.consumed_by_request_id in self.requests:
+                return False
+            grace_seconds = self._phase4_consumed_pin_grace_seconds()
+            consumed_at = pin.consumed_at or pin.created_at
+            if grace_seconds > 0 and now - consumed_at < grace_seconds:
+                return False
+            if self._phase4_has_queued_successor(trace_id, pin):
+                return ttl_seconds > 0 and now - pin.created_at >= ttl_seconds
             return True
         if ttl_seconds <= 0:
             return False
-        if (
-            pin.consumed_by_request_id is not None
-            and pin.consumed_by_request_id in self.requests
-        ):
-            return False
         return now - pin.created_at >= ttl_seconds
+
+    def _compact_phase4_pin_order(self) -> None:
+        if not self._phase4_pin_order:
+            return
+        seen: set[str] = set()
+        compacted: deque[str] = deque()
+        for trace_id in reversed(self._phase4_pin_order):
+            if trace_id in seen or trace_id not in self._phase4_pinned_blocks:
+                continue
+            seen.add(trace_id)
+            compacted.appendleft(trace_id)
+        self._phase4_pin_order = compacted
 
     def _prune_phase4_pins(self) -> None:
         if not self._phase4_pinned_blocks:
+            self._phase4_pin_order.clear()
             return
         now = time.monotonic()
         ttl_seconds = self._phase4_pin_ttl_seconds()
@@ -3250,9 +3763,12 @@ class Scheduler(SchedulerInterface):
             pin = self._phase4_pinned_blocks.get(trace_id)
             if pin is None:
                 continue
-            if self._phase4_pin_is_prunable(pin, now, ttl_seconds):
+            if self._phase4_pin_is_prunable(
+                trace_id, pin, now, ttl_seconds
+            ):
                 self._release_phase4_pins(trace_id, "ttl")
 
+        self._compact_phase4_pin_order()
         limit = self._phase4_pin_limit()
         if limit is None or len(self._phase4_pinned_blocks) <= limit:
             return
@@ -3268,7 +3784,9 @@ class Scheduler(SchedulerInterface):
             pin = self._phase4_pinned_blocks.get(trace_id)
             if pin is None:
                 continue
-            if self._phase4_pin_is_prunable(pin, now, ttl_seconds):
+            if self._phase4_pin_is_prunable(
+                trace_id, pin, now, ttl_seconds
+            ):
                 self._release_phase4_pins(trace_id, "limit")
                 continue
             self._phase4_pin_order.append(trace_id)
@@ -3279,6 +3797,63 @@ class Scheduler(SchedulerInterface):
                 limit,
             )
             break
+
+    def _release_phase4_pressure_pin(self, reason: str) -> bool:
+        if not self._phase4_pinned_blocks:
+            return False
+        self._compact_phase4_pin_order()
+        now = time.monotonic()
+        grace_seconds = self._phase4_consumed_pin_grace_seconds()
+        for trace_id in list(self._phase4_pin_order):
+            pin = self._phase4_pinned_blocks.get(trace_id)
+            if pin is None:
+                continue
+            if pin.consumed_by_request_id in {
+                request.request_id for request in self.running
+            }:
+                continue
+            if self._phase4_has_queued_successor(trace_id, pin):
+                continue
+            consumed_at = pin.consumed_at or pin.created_at
+            if (
+                pin.consumed_by_request_id is not None
+                and grace_seconds > 0
+                and now - consumed_at < grace_seconds
+            ):
+                continue
+            self._release_phase4_pins(
+                trace_id, reason, evict_prefix=True
+            )
+            return True
+        return False
+
+    def _maybe_release_phase4_stall_pressure_pin(
+        self, *, total_num_scheduled_tokens: int
+    ) -> bool:
+        if (
+            total_num_scheduled_tokens != 0
+            or self.running
+            or not (self.waiting or self.skipped_waiting)
+        ):
+            return False
+        before_pools = self._kve_gpu_block_pool_diag_summary()
+        before_managed = self._kve_managed_context_diag_summary()
+        released = self._release_phase4_pressure_pin(
+            "scheduler-stall-pressure"
+        )
+        if released:
+            logger.warning(
+                "[PHASE4-PIN-STALL-PRESSURE] released=1 waiting=%d "
+                "skipped=%d pools_before=%s managed_before=%s "
+                "pools_after=%s managed_after=%s",
+                len(self.waiting),
+                len(self.skipped_waiting),
+                before_pools,
+                before_managed,
+                self._kve_gpu_block_pool_diag_summary(),
+                self._kve_managed_context_diag_summary(),
+            )
+        return released
 
     def _pin_phase4_request_blocks(self, request: Request) -> None:
         trace_id = self._phase4_trace_id(request)
@@ -3781,6 +4356,205 @@ class Scheduler(SchedulerInterface):
                 restore.num_tokens,
             )
 
+    def _managed_context_defer_restore_until_prefill(
+        self, request: Request
+    ) -> bool:
+        if request.sampling_params is None:
+            request.managed_context_defer_restore_until_prefill = False
+            return False
+        extra_args = request.sampling_params.extra_args or {}
+        raw = extra_args.get("kve_restore_defer_until_prefill")
+        if raw is None:
+            # Restored hidden KVs are older context. Visible prompt tokens
+            # added by the current request must be prefetched without being
+            # able to attend to those restored blocks.
+            enabled = "kve_restore_span_ids" in extra_args
+        elif isinstance(raw, str):
+            enabled = raw.lower() in ("1", "true", "yes", "on")
+        else:
+            enabled = bool(raw)
+        request.managed_context_defer_restore_until_prefill = enabled
+        return enabled
+
+    def _managed_context_deferred_restore_ready_tokens(
+        self, request: Request
+    ) -> int:
+        """Visible tokens to prefill before activating hidden restore.
+
+        By default, the final visible prompt token runs with restored hidden
+        K/V so its logits produce the first answer token in the restored
+        context. Callers can set ``kve_restore_after_visible_tokens`` to attach
+        hidden K/V earlier, for example immediately after the visible retrieve
+        JSON and before the restored-memory answer-control suffix.
+        """
+        if request.sampling_params is not None:
+            extra_args = request.sampling_params.extra_args or {}
+            raw_ready = extra_args.get("kve_restore_after_visible_tokens")
+            if raw_ready is not None:
+                try:
+                    ready_tokens = int(raw_ready)
+                except (TypeError, ValueError):
+                    ready_tokens = request.num_prompt_tokens - 1
+                return max(
+                    0,
+                    min(ready_tokens, max(0, request.num_prompt_tokens - 1)),
+                )
+        return max(0, request.num_prompt_tokens - 1)
+
+    def _cap_managed_context_deferred_prefill_tokens(
+        self,
+        request: Request,
+        *,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+    ) -> int:
+        if (
+            num_new_tokens <= 0
+            or request.request_id in self._managed_context_active_restores
+            or not self._managed_context_defer_restore_until_prefill(request)
+        ):
+            return num_new_tokens
+        ready_tokens = self._managed_context_deferred_restore_ready_tokens(
+            request
+        )
+        if ready_tokens <= 0 or num_computed_tokens >= ready_tokens:
+            return num_new_tokens
+        if num_computed_tokens + num_new_tokens <= ready_tokens:
+            return num_new_tokens
+        capped = ready_tokens - num_computed_tokens
+        if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+            logger.warning(
+                "[MANAGED-CONTEXT-PREFILL-HOLDBACK] req=%s "
+                "scheduled=%d->%d computed=%d prompt=%d",
+                request.request_id[:8],
+                num_new_tokens,
+                capped,
+                num_computed_tokens,
+                request.num_prompt_tokens,
+            )
+        return max(0, capped)
+
+    def _set_managed_context_deferred_restore(
+        self,
+        request: Request,
+        spans: list[ManagedContextSpan],
+        *,
+        restored_entries_by_span: dict[
+            str, list[tuple[Any, list[Any]]]
+        ] | None = None,
+        skip_hot_hit_span_ids: set[str] | None = None,
+    ) -> None:
+        if not spans:
+            return
+        request_id = request.request_id
+        self._release_managed_context_deferred_restore(request_id, "replace")
+        self._reserve_managed_context_restore_spans(request_id, spans)
+        restored_entries_by_span = restored_entries_by_span or {}
+        skip_hot_hit_span_ids = skip_hot_hit_span_ids or set()
+        deferred = ManagedContextDeferredRestore(
+            span_ids=[span.span_id for span in spans],
+            spans=list(spans),
+            restored_entries_by_span=restored_entries_by_span,
+            skip_hot_hit_span_ids=set(skip_hot_hit_span_ids),
+            created_at=time.monotonic(),
+        )
+        self._managed_context_deferred_restores[request_id] = deferred
+        if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+            logger.warning(
+                "[MANAGED-CONTEXT-RESTORE-DEFER] req=%s spans=%s "
+                "computed=%d prompt=%d loaded_spans=%s",
+                request_id[:8],
+                deferred.span_ids,
+                request.num_computed_tokens,
+                request.num_prompt_tokens,
+                list(restored_entries_by_span),
+            )
+
+    def _release_managed_context_deferred_restore(
+        self, request_id: str, reason: str
+    ) -> None:
+        deferred = self._managed_context_deferred_restores.pop(request_id, None)
+        if deferred is None:
+            return
+        self._release_managed_context_restore_reservation(request_id, reason)
+        released_blocks = 0
+        for entries in deferred.restored_entries_by_span.values():
+            released_blocks += self._release_managed_context_entries(entries)
+        if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+            logger.warning(
+                "[MANAGED-CONTEXT-RESTORE-DEFER-RELEASE] req=%s "
+                "reason=%s spans=%s released_blocks=%d",
+                request_id[:8],
+                reason,
+                deferred.span_ids,
+                released_blocks,
+            )
+
+    def _activate_deferred_managed_context_restore_if_ready(
+        self,
+        request: Request,
+        *,
+        computed_tokens: int | None = None,
+    ) -> bool:
+        request_id = request.request_id
+        if request_id in self._managed_context_active_restores:
+            return False
+        if not self._managed_context_defer_restore_until_prefill(request):
+            return False
+        ready_tokens = self._managed_context_deferred_restore_ready_tokens(
+            request
+        )
+        current_computed_tokens = (
+            request.num_computed_tokens
+            if computed_tokens is None
+            else int(computed_tokens)
+        )
+        if current_computed_tokens < ready_tokens:
+            return False
+
+        deferred = self._managed_context_deferred_restores.pop(request_id, None)
+        if deferred is None:
+            spans, error = self._validate_managed_context_restore_request(request)
+            if error is not None:
+                logger.error(
+                    "[MANAGED-CONTEXT-DEFER-ACTIVATE-ABORT] req=%s %s",
+                    request_id[:8],
+                    error,
+                )
+                self.finish_requests(request_id, RequestStatus.FINISHED_ABORTED)
+                return False
+            if not spans:
+                return False
+            deferred = ManagedContextDeferredRestore(
+                span_ids=[span.span_id for span in spans],
+                spans=list(spans),
+                restored_entries_by_span={},
+                skip_hot_hit_span_ids=set(),
+                created_at=time.monotonic(),
+            )
+
+        self._release_managed_context_restore_reservation(request_id, "activate")
+        self._activate_managed_context_restore(
+            request,
+            deferred.spans,
+            restored_entries_by_span=deferred.restored_entries_by_span,
+            skip_hot_hit_span_ids=deferred.skip_hot_hit_span_ids,
+        )
+        request.needs_rebuild = True
+        if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+            restore = self._managed_context_active_restores.get(request_id)
+            logger.warning(
+                "[MANAGED-CONTEXT-RESTORE-DEFER-ACTIVE] req=%s spans=%s "
+                "hidden_tokens=%d computed=%d prompt=%d ready=%d",
+                request_id[:8],
+                deferred.span_ids,
+                restore.num_tokens if restore is not None else 0,
+                current_computed_tokens,
+                request.num_prompt_tokens,
+                ready_tokens,
+            )
+        return True
+
     def _release_managed_context_pending_load(
         self, request_id: str, reason: str, *, only_if_safe: bool = True
     ) -> bool:
@@ -3872,13 +4646,18 @@ class Scheduler(SchedulerInterface):
     def _align_managed_context_restore_position(
         self, request: Request, spans: list[ManagedContextSpan]
     ) -> bool:
-        """Seed the retry request's RoPE frame after restored hidden KV.
+        """Seed a non-deferred retry request's RoPE frame after hidden KV.
 
         Managed-context restore mirrors Phase4's retained-KV invariant: cached
         K/V keeps the original RoPE frame, and newly written retry K/V must be
         positioned after the retained/restored frame. The scheduler must do
         this before allocate_slots so freshly allocated blocks get logical_start
         metadata matching the positions the worker will use.
+
+        Deferred restore is different: the visible prompt is prefetched first
+        in its normal Phase4 frame, then old hidden K/V is attached as sideband
+        evidence. In that mode, callers must not use restored spans to mutate
+        the visible prompt's position_offset.
         """
         if not spans or not self._managed_context_align_positions:
             return False
@@ -3931,7 +4710,10 @@ class Scheduler(SchedulerInterface):
 
         ttl_seconds = max(0.0, self._managed_context_archive_ttl_seconds)
         now = time.monotonic()
+        protected = self._managed_context_cpu_archive_protected_keys()
         for key in list(self._managed_context_archive_order):
+            if key in protected:
+                continue
             span = self._managed_context_archive.get(key)
             if span is None:
                 continue
@@ -3948,6 +4730,14 @@ class Scheduler(SchedulerInterface):
             if not self._managed_context_archive_order:
                 break
             key = self._managed_context_archive_order.popleft()
+            if key in protected:
+                self._managed_context_archive_order.append(key)
+                if all(
+                    item in protected
+                    for item in self._managed_context_archive_order
+                ):
+                    break
+                continue
             if key in self._managed_context_archive:
                 self._release_managed_context_span(key, "block-limit")
 
@@ -4253,6 +5043,17 @@ class Scheduler(SchedulerInterface):
                 promoted_span_ids.add(span.span_id)
             else:
                 active_entries_by_span[span.span_id] = entries
+        if (
+            self._managed_context_defer_restore_until_prefill(request)
+            and request.num_computed_tokens < request.num_prompt_tokens
+        ):
+            self._set_managed_context_deferred_restore(
+                request,
+                pending.spans,
+                restored_entries_by_span=active_entries_by_span,
+                skip_hot_hit_span_ids=promoted_span_ids,
+            )
+            return
         self._activate_managed_context_restore(
             request,
             pending.spans,
@@ -4899,6 +5700,7 @@ class Scheduler(SchedulerInterface):
         position_offsets: dict[str, int] = {}
         prompt_lengths: dict[str, int] = {}
         protected_prefix_lens: dict[str, int] = {}
+        hidden_kv_num_tokens: dict[str, int] = {}
 
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
@@ -4944,12 +5746,45 @@ class Scheduler(SchedulerInterface):
                         req_id
                     )
                 )
-                hidden_block_ids, _, _ = self._managed_context_active_hidden_kv(
-                    req_id
+                hidden_block_ids, hidden_tokens, _ = (
+                    self._managed_context_active_hidden_kv(
+                        req_id
+                    )
                 )
+                if hidden_tokens:
+                    hidden_kv_num_tokens[req_id] = hidden_tokens
                 if hidden_block_ids:
+                    managers = (
+                        self.kv_cache_manager.coordinator.single_type_managers
+                    )
                     full_block_ids = tuple(
-                        list(hidden_block_ids[i]) + list(full_block_ids[i])
+                        list(
+                            full_block_ids[i][
+                                : min(
+                                    len(full_block_ids[i]),
+                                    (
+                                        self._worker_protected_prefix_len(req)
+                                        + managers[i].block_size
+                                        - 1
+                                    )
+                                    // managers[i].block_size,
+                                )
+                            ]
+                        )
+                        + list(hidden_block_ids[i])
+                        + list(
+                            full_block_ids[i][
+                                min(
+                                    len(full_block_ids[i]),
+                                    (
+                                        self._worker_protected_prefix_len(req)
+                                        + managers[i].block_size
+                                        - 1
+                                    )
+                                    // managers[i].block_size,
+                                ) :
+                            ]
+                        )
                         for i in range(len(full_block_ids))
                     )
                 new_block_ids.append(full_block_ids)
@@ -4984,6 +5819,7 @@ class Scheduler(SchedulerInterface):
             position_offsets=position_offsets,
             prompt_lengths=prompt_lengths,
             protected_prefix_lens=protected_prefix_lens,
+            hidden_kv_num_tokens=hidden_kv_num_tokens,
         )
 
     def _try_schedule_encoder_inputs(
@@ -5195,6 +6031,12 @@ class Scheduler(SchedulerInterface):
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+        if self._pending_engine_core_outputs:
+            for client_index, pending_outputs in (
+                self._pending_engine_core_outputs.items()
+            ):
+                outputs[client_index].extend(pending_outputs)
+            self._pending_engine_core_outputs.clear()
         spec_decoding_stats: SpecDecodingStats | None = None
         kv_connector_stats: KVConnectorStats | None = (
             kv_connector_output.kv_connector_stats if kv_connector_output else None
@@ -5678,6 +6520,26 @@ class Scheduler(SchedulerInterface):
             # Include ids of requests that finished since last outputs
             # were sent.
             for client_index, finished_set in finished_req_ids.items():
+                if os.environ.get("KVE_DIAG_OUTPUT_ORPHANS") == "1":
+                    emitted_req_ids = {
+                        output.request_id for output in outputs.get(client_index, ())
+                    }
+                    finished_without_output = finished_set - emitted_req_ids
+                    if finished_without_output:
+                        logger.warning(
+                            "[KVE-OUTPUT-ORPHAN-SCHED] client=%d "
+                            "finished_without_output=%s finished=%s outputs=%s "
+                            "still_tracked=%s",
+                            client_index,
+                            sorted(finished_without_output),
+                            sorted(finished_set),
+                            sorted(emitted_req_ids),
+                            sorted(
+                                req_id
+                                for req_id in finished_without_output
+                                if req_id in self.requests
+                            ),
+                        )
                 # Set finished request set in EngineCoreOutputs for this client.
                 if (eco := engine_core_outputs.get(client_index)) is not None:
                     eco.finished_requests = finished_set
@@ -6006,6 +6868,16 @@ class Scheduler(SchedulerInterface):
         self._release_managed_context_restore_reservation(
             request_id, "free-request"
         )
+        self._release_managed_context_deferred_restore(
+            request_id, "free-request"
+        )
+        if request_id in self._managed_context_pending_loads:
+            pending_load_released = self._release_managed_context_pending_load(
+                request_id,
+                "free-request",
+                only_if_safe=True,
+            )
+            delay_free_blocks |= not pending_load_released
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
@@ -6027,6 +6899,9 @@ class Scheduler(SchedulerInterface):
         )
         self._release_managed_context_pending_load(
             request.request_id, "request-finished", only_if_safe=False
+        )
+        self._release_managed_context_deferred_restore(
+            request.request_id, "request-finished"
         )
         self._release_managed_context_active_restore(
             request.request_id, "request-finished"
@@ -6110,6 +6985,8 @@ class Scheduler(SchedulerInterface):
             while self.running:
                 request = self.running.pop()
                 self._preempt_request(request, timestamp)
+                if request.is_finished():
+                    continue
                 # NOTE(zhuohan): For async scheduling, we need to discard the latest
                 # output token on the fly to avoid a redundant repetitive output token.
                 request.num_output_placeholders = 0
@@ -6153,6 +7030,10 @@ class Scheduler(SchedulerInterface):
         # all pins before resetting the normal cache.
         for request_id in list(self._managed_context_active_restores):
             self._release_managed_context_active_restore(
+                request_id, "reset-prefix-cache"
+            )
+        for request_id in list(self._managed_context_deferred_restores):
+            self._release_managed_context_deferred_restore(
                 request_id, "reset-prefix-cache"
             )
         self._release_all_managed_context_spans("reset-prefix-cache")
