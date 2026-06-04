@@ -1171,6 +1171,9 @@ class Scheduler(SchedulerInterface):
 
                     if new_blocks is not None:
                         # The request can be scheduled.
+                        self._restamp_reprefill_logical_starts(
+                            request, reason="running-alloc"
+                        )
                         break
 
                     # The request cannot be scheduled.
@@ -1938,7 +1941,12 @@ class Scheduler(SchedulerInterface):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
-                if restore_spans:
+                restore_defer_until_prefill = (
+                    bool(restore_spans)
+                    and self._managed_context_defer_restore_until_prefill(request)
+                    and num_computed_tokens < request.num_prompt_tokens
+                )
+                if restore_spans and not restore_defer_until_prefill:
                     min_visible_prefix = self._worker_protected_prefix_len(
                         request
                     )
@@ -1959,11 +1967,6 @@ class Scheduler(SchedulerInterface):
                         clear_pending_phase4_pin_consumed()
                         self._abort_waiting_phase4_request(request, reason)
                         continue
-                restore_defer_until_prefill = (
-                    bool(restore_spans)
-                    and self._managed_context_defer_restore_until_prefill(request)
-                    and num_computed_tokens < request.num_prompt_tokens
-                )
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
@@ -2121,7 +2124,17 @@ class Scheduler(SchedulerInterface):
                                 request.request_id,
                                 restore_spans,
                             )
-                            if request.num_computed_tokens == 0:
+                            reprefill_after_flush = bool(
+                                getattr(
+                                    request,
+                                    "_kve_reprefill_after_flush",
+                                    False,
+                                )
+                            )
+                            if (
+                                request.num_computed_tokens == 0
+                                and not reprefill_after_flush
+                            ):
                                 if (
                                     request.position_offset != 0
                                     and os.environ.get(
@@ -2165,7 +2178,17 @@ class Scheduler(SchedulerInterface):
                     )
                     request = request_queue.pop_request()
                     clear_pending_phase4_pin_consumed()
-                    if request.num_computed_tokens == 0:
+                    reprefill_after_flush = bool(
+                        getattr(
+                            request,
+                            "_kve_reprefill_after_flush",
+                            False,
+                        )
+                    )
+                    if (
+                        request.num_computed_tokens == 0
+                        and not reprefill_after_flush
+                    ):
                         if (
                             request.position_offset != 0
                             and os.environ.get("KVE_TRACE_MANAGED_CONTEXT")
@@ -2288,6 +2311,9 @@ class Scheduler(SchedulerInterface):
                         continue
                     break
 
+                self._restamp_reprefill_logical_starts(
+                    request, reason="waiting-alloc"
+                )
                 if pending_inherit_event is not None:
                     request.compaction_events.append(pending_inherit_event)
                     logger.info(
@@ -2655,9 +2681,16 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
-        # Cannot preempt compacted requests — trimmed tokens are unrecoverable.
-        # Abort instead: free blocks and mark finished to avoid KV block leak.
+        # Compacted requests carry a trimmed token view plus a non-zero RoPE
+        # frame. Flush and re-prefill that compacted state instead of treating
+        # this as ordinary preemption.
         if request.position_offset > 0:
+            if self._preempt_request_for_reprefill(
+                request,
+                timestamp,
+                reason="compacted",
+            ):
+                return
             logger.warning(
                 "Attempted to preempt compacted request %s "
                 "(position_offset=%d) — aborting request instead.",
@@ -2673,6 +2706,12 @@ class Scheduler(SchedulerInterface):
             request.request_id in self._managed_context_active_restores
             or request.request_id in self._managed_context_deferred_restores
         ):
+            if self._preempt_request_for_reprefill(
+                request,
+                timestamp,
+                reason="managed-context-restore",
+            ):
+                return
             logger.warning(
                 "Attempted to preempt managed-context restore request %s; "
                 "aborting request instead.",
@@ -2694,6 +2733,160 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
+
+    def _preempt_request_for_reprefill(
+        self,
+        request: Request,
+        timestamp: float,
+        *,
+        reason: str,
+    ) -> bool:
+        """Flush a replayable request and requeue it for full re-prefill."""
+        raw_enabled = os.environ.get("KVE_COMPACTED_REPREFILL_ON_PREEMPT", "1")
+        if raw_enabled.lower() in ("0", "false", "no", "off"):
+            return False
+        if request.padding_pending or request.num_output_placeholders:
+            logger.warning(
+                "[COMPACT-REPREFILL-SKIP] req=%s reason=%s "
+                "padding_pending=%s output_placeholders=%d",
+                request.request_id[:8],
+                reason,
+                request.padding_pending,
+                request.num_output_placeholders,
+            )
+            return False
+        if request.prompt_token_ids is None:
+            logger.warning(
+                "[COMPACT-REPREFILL-SKIP] req=%s reason=%s "
+                "prompt_token_ids unavailable",
+                request.request_id[:8],
+                reason,
+            )
+            return False
+
+        request_id = request.request_id
+        if request_id in self._managed_context_pending_loads:
+            pending_released = self._release_managed_context_pending_load(
+                request_id,
+                "reprefill-preempt",
+                only_if_safe=True,
+            )
+            if not pending_released:
+                logger.warning(
+                    "[COMPACT-REPREFILL-SKIP] req=%s reason=%s "
+                    "managed-context load in flight",
+                    request_id[:8],
+                    reason,
+                )
+                return False
+
+        old_computed = request.num_computed_tokens
+        old_position_offset = request.position_offset
+        old_prompt_tokens = request.num_prompt_tokens
+        old_num_tokens = request.num_tokens
+        old_compaction_events = len(request.compaction_events or [])
+
+        self._release_managed_context_active_restore(
+            request_id, "reprefill-preempt"
+        )
+        self._release_managed_context_deferred_restore(
+            request_id, "reprefill-preempt"
+        )
+        self._release_managed_context_restore_reservation(
+            request_id, "reprefill-preempt"
+        )
+        self._pending_admission_compaction_ids.discard(request_id)
+        self.kv_cache_manager.free(request)
+        self.encoder_cache_manager.free(request)
+
+        request.status = RequestStatus.PREEMPTED
+        request.num_computed_tokens = 0
+        request.num_external_computed_tokens = 0
+        request.num_cached_tokens = -1
+        request.num_preemptions += 1
+        request.spec_token_ids = []
+        request.is_prefill_chunk = False
+        request.needs_rebuild = True
+        request.skip_reading_prefix_cache = True
+        request._kve_reprefill_after_flush = True  # type: ignore[attr-defined]
+        self.prev_step_scheduled_req_ids.discard(request_id)
+        self.waiting.prepend_request(request)
+        if self.log_stats:
+            request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
+        logger.warning(
+            "[COMPACT-REPREFILL] req=%s reason=%s prompt=%d tokens=%d "
+            "computed=%d position_offset=%d events=%d preemptions=%d "
+            "timestamp=%.6f",
+            request_id[:8],
+            reason,
+            old_prompt_tokens,
+            old_num_tokens,
+            old_computed,
+            old_position_offset,
+            old_compaction_events,
+            request.num_preemptions,
+            timestamp,
+        )
+        return True
+
+    def _restamp_reprefill_logical_starts(
+        self,
+        request: Request,
+        *,
+        reason: str,
+    ) -> None:
+        if (
+            not getattr(request, "_kve_reprefill_after_flush", False)
+            or request.position_offset <= 0
+        ):
+            return
+        protected_prefix_len = self._worker_protected_prefix_len(request)
+        changed = 0
+        for manager in self.kv_cache_manager.coordinator.single_type_managers:
+            blocks = manager.req_to_blocks.get(request.request_id, [])
+            block_size = manager.block_size
+            for block_idx, block in enumerate(blocks):
+                if block.is_null or block.logical_start < 0:
+                    continue
+                physical_start = block_idx * block_size
+                target_logical_start = physical_start
+                if physical_start >= protected_prefix_len:
+                    target_logical_start += request.position_offset
+                if block.logical_start != target_logical_start:
+                    block.logical_start = target_logical_start
+                    changed += 1
+        if changed and os.environ.get("KVE_TRACE_COMPACT_REPREFILL") == "1":
+            logger.warning(
+                "[COMPACT-REPREFILL-RESTAMP] req=%s reason=%s "
+                "changed=%d position_offset=%d protected_prefix_len=%d",
+                request.request_id[:8],
+                reason,
+                changed,
+                request.position_offset,
+                protected_prefix_len,
+            )
+
+    def _clear_reprefill_after_flush_if_prompt_ready(
+        self,
+        request: Request,
+        *,
+        reason: str,
+    ) -> None:
+        if not getattr(request, "_kve_reprefill_after_flush", False):
+            return
+        if request.num_computed_tokens < request.num_prompt_tokens:
+            return
+        request._kve_reprefill_after_flush = False  # type: ignore[attr-defined]
+        if os.environ.get("KVE_TRACE_COMPACT_REPREFILL") == "1":
+            logger.warning(
+                "[COMPACT-REPREFILL-DONE] req=%s reason=%s "
+                "computed=%d prompt=%d position_offset=%d",
+                request.request_id[:8],
+                reason,
+                request.num_computed_tokens,
+                request.num_prompt_tokens,
+                request.position_offset,
+            )
 
     # --- Compaction helpers ---
 
@@ -5606,6 +5799,9 @@ class Scheduler(SchedulerInterface):
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
+            self._clear_reprefill_after_flush_if_prompt_ready(
+                request, reason="update-after-schedule"
+            )
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )

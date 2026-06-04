@@ -6,14 +6,27 @@ from vllm.v1.core.sched.scheduler import Phase4Pin, Scheduler
 from vllm.v1.request import RequestStatus
 
 
+class _FakeRequestQueue(deque):
+    def prepend_request(self, request) -> None:
+        self.appendleft(request)
+
+
 def _scheduler_with_requests(request_ids: set[str]) -> Scheduler:
     scheduler = object.__new__(Scheduler)
     scheduler.requests = {request_id: object() for request_id in request_ids}
     scheduler.running = []
-    scheduler.waiting = deque()
-    scheduler.skipped_waiting = deque()
+    scheduler.waiting = _FakeRequestQueue()
+    scheduler.skipped_waiting = _FakeRequestQueue()
     scheduler._phase4_pinned_blocks = {}
     scheduler._phase4_pin_order = deque()
+    scheduler._managed_context_active_restores = {}
+    scheduler._managed_context_deferred_restores = {}
+    scheduler._managed_context_pending_loads = {}
+    scheduler._managed_context_restore_reservations = {}
+    scheduler._pending_admission_compaction_ids = set()
+    scheduler.prev_step_scheduled_req_ids = set()
+    scheduler.num_cumulative_preemption = 0
+    scheduler.log_stats = False
     scheduler._compaction_enabled = True
     scheduler._compaction_max_turns = 1
     scheduler.cache_config = SimpleNamespace(enable_prefix_caching=True)
@@ -264,29 +277,166 @@ def test_phase4_stall_pressure_release_requires_no_progress() -> None:
     assert calls == ["scheduler-stall-pressure"]
 
 
-def test_managed_context_restore_preempt_abort_uses_free_request() -> None:
-    scheduler = _scheduler_with_requests({"restore"})
-    request = SimpleNamespace(
-        request_id="restore",
+def _replayable_request(
+    request_id: str,
+    *,
+    position_offset: int,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id=request_id,
         status=RequestStatus.RUNNING,
-        position_offset=0,
+        position_offset=position_offset,
+        padding_pending=False,
+        num_output_placeholders=0,
+        prompt_token_ids=[1, 2, 3, 4],
+        num_prompt_tokens=4,
+        num_tokens=8,
+        num_computed_tokens=8,
+        num_external_computed_tokens=0,
+        num_cached_tokens=8,
+        num_preemptions=0,
+        spec_token_ids=[99],
+        is_prefill_chunk=False,
+        needs_rebuild=False,
+        skip_reading_prefix_cache=False,
+        _kve_reprefill_after_flush=False,
+        compaction_events=[object()],
     )
-    scheduler.requests = {"restore": request}
-    scheduler._managed_context_active_restores = {"restore": object()}
-    scheduler._managed_context_deferred_restores = {}
-    freed_requests = []
 
-    def fake_free_request(freed_request):
-        freed_requests.append(freed_request)
-        scheduler.requests.pop(freed_request.request_id, None)
 
-    scheduler._free_request = fake_free_request
-    queued_outputs = []
-    scheduler._queue_finished_request_output = queued_outputs.append
+def test_compacted_preempt_flushes_and_requeues_for_reprefill() -> None:
+    scheduler = _scheduler_with_requests({"compact"})
+    request = _replayable_request("compact", position_offset=128)
+    scheduler.requests = {"compact": request}
+    freed_visible = []
+    freed_encoder = []
+    released = []
+
+    scheduler.kv_cache_manager = SimpleNamespace(
+        free=lambda req: freed_visible.append(req.request_id)
+    )
+    scheduler.encoder_cache_manager = SimpleNamespace(
+        free=lambda req: freed_encoder.append(req.request_id)
+    )
+    scheduler._release_managed_context_active_restore = (
+        lambda req_id, reason: released.append(("active", req_id, reason))
+    )
+    scheduler._release_managed_context_deferred_restore = (
+        lambda req_id, reason: released.append(("deferred", req_id, reason))
+    )
+    scheduler._release_managed_context_restore_reservation = (
+        lambda req_id, reason: released.append(("reserve", req_id, reason))
+    )
 
     scheduler._preempt_request(request, time.monotonic())
 
-    assert request.status == RequestStatus.FINISHED_ERROR
-    assert freed_requests == [request]
-    assert queued_outputs == [request]
-    assert "restore" not in scheduler.requests
+    assert request.status == RequestStatus.PREEMPTED
+    assert request.position_offset == 128
+    assert request.num_computed_tokens == 0
+    assert request.num_cached_tokens == -1
+    assert request.num_preemptions == 1
+    assert request.spec_token_ids == []
+    assert request.needs_rebuild
+    assert request.skip_reading_prefix_cache
+    assert request._kve_reprefill_after_flush
+    assert list(scheduler.waiting) == [request]
+    assert freed_visible == ["compact"]
+    assert freed_encoder == ["compact"]
+    assert released == [
+        ("active", "compact", "reprefill-preempt"),
+        ("deferred", "compact", "reprefill-preempt"),
+        ("reserve", "compact", "reprefill-preempt"),
+    ]
+
+
+def test_reprefill_restamp_keeps_protected_prefix_in_zero_frame() -> None:
+    scheduler = _scheduler_with_requests({"compact"})
+    request = _replayable_request("compact", position_offset=128)
+    request._kve_reprefill_after_flush = True
+    blocks = [
+        SimpleNamespace(is_null=False, logical_start=128),
+        SimpleNamespace(is_null=False, logical_start=144),
+        SimpleNamespace(is_null=False, logical_start=160),
+    ]
+    manager = SimpleNamespace(
+        block_size=16,
+        req_to_blocks={"compact": blocks},
+    )
+    scheduler.kv_cache_manager = SimpleNamespace(
+        coordinator=SimpleNamespace(single_type_managers=[manager])
+    )
+    scheduler._worker_protected_prefix_len = lambda req: 32
+
+    scheduler._restamp_reprefill_logical_starts(
+        request,
+        reason="test",
+    )
+
+    assert [block.logical_start for block in blocks] == [0, 16, 160]
+
+
+def test_reprefill_marker_clears_after_visible_prompt_ready() -> None:
+    scheduler = _scheduler_with_requests({"compact"})
+    request = _replayable_request("compact", position_offset=128)
+    request._kve_reprefill_after_flush = True
+    request.num_prompt_tokens = 4
+    request.num_computed_tokens = 3
+
+    scheduler._clear_reprefill_after_flush_if_prompt_ready(
+        request,
+        reason="test-partial",
+    )
+
+    assert request._kve_reprefill_after_flush
+
+    request.num_computed_tokens = 4
+    scheduler._clear_reprefill_after_flush_if_prompt_ready(
+        request,
+        reason="test-ready",
+    )
+
+    assert not request._kve_reprefill_after_flush
+
+
+def test_managed_context_restore_preempt_releases_hidden_state_for_reprefill() -> None:
+    scheduler = _scheduler_with_requests({"restore"})
+    request = _replayable_request("restore", position_offset=0)
+    scheduler.requests = {"restore": request}
+    scheduler._managed_context_active_restores = {"restore": object()}
+    scheduler._managed_context_deferred_restores = {}
+    freed_visible = []
+    freed_encoder = []
+    released = []
+
+    scheduler.kv_cache_manager = SimpleNamespace(
+        free=lambda req: freed_visible.append(req.request_id)
+    )
+    scheduler.encoder_cache_manager = SimpleNamespace(
+        free=lambda req: freed_encoder.append(req.request_id)
+    )
+    scheduler._release_managed_context_active_restore = (
+        lambda req_id, reason: released.append(("active", req_id, reason))
+    )
+    scheduler._release_managed_context_deferred_restore = (
+        lambda req_id, reason: released.append(("deferred", req_id, reason))
+    )
+    scheduler._release_managed_context_restore_reservation = (
+        lambda req_id, reason: released.append(("reserve", req_id, reason))
+    )
+
+    scheduler._preempt_request(request, time.monotonic())
+
+    assert request.status == RequestStatus.PREEMPTED
+    assert request.num_computed_tokens == 0
+    assert request.needs_rebuild
+    assert request.skip_reading_prefix_cache
+    assert request._kve_reprefill_after_flush
+    assert list(scheduler.waiting) == [request]
+    assert "restore" in scheduler.requests
+    assert freed_visible == ["restore"]
+    assert freed_encoder == ["restore"]
+    assert released == [
+        ("active", "restore", "reprefill-preempt"),
+        ("deferred", "restore", "reprefill-preempt"),
+        ("reserve", "restore", "reprefill-preempt"),
+    ]
