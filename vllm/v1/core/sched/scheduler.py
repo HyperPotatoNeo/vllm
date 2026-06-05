@@ -221,6 +221,19 @@ class RequestKVSwap:
     last_error: str | None = None
 
 
+_PREEMPTION_FREED = "freed"
+_PREEMPTION_ASYNC_PENDING = "async_pending"
+_PREEMPTION_DEFERRED = "deferred"
+_PREEMPTION_FINISHED = "finished"
+_PREEMPTION_FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class PreemptionResult:
+    kind: str
+    error: str | None = None
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -1266,31 +1279,59 @@ class Scheduler(SchedulerInterface):
                             self.running,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
-                        self.running.remove(preempted_req)
-                        if preempted_req in scheduled_running_reqs:
-                            preempted_req_id = preempted_req.request_id
-                            scheduled_running_reqs.remove(preempted_req)
-                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
-                            req_to_new_blocks.pop(preempted_req_id)
-                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
-                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
-                                preempted_req_id, None
-                            )
-                            if preempted_encoder_inputs:
-                                # Restore encoder compute budget if the preempted
-                                # request had encoder inputs scheduled in this step.
-                                num_embeds_to_restore = sum(
-                                    preempted_req.get_num_encoder_embeds(i)
-                                    for i in preempted_encoder_inputs
-                                )
-                                encoder_compute_budget += num_embeds_to_restore
-                            req_index -= 1
+                        preempted_req_index = self.running.index(preempted_req)
+                        self.running.pop(preempted_req_index)
                     else:
+                        preempted_req_index = len(self.running) - 1
                         preempted_req = self.running.pop()
 
-                    self._preempt_request(preempted_req, scheduled_timestamp)
+                    was_scheduled_this_step = (
+                        preempted_req in scheduled_running_reqs
+                    )
+                    preemption_result = self._preempt_request(
+                        preempted_req,
+                        scheduled_timestamp,
+                        allow_async_kv_swap=not was_scheduled_this_step,
+                    )
+                    if preemption_result.kind == _PREEMPTION_DEFERRED:
+                        self.running.insert(preempted_req_index, preempted_req)
+                        if (
+                            os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1"
+                            and preemption_result.error is not None
+                        ):
+                            logger.warning(
+                                "[REQUEST-KV-SWAP-PREEMPT-DEFER] req=%s "
+                                "error=%s",
+                                preempted_req.request_id[:8],
+                                preemption_result.error,
+                            )
+                        break
+                    if was_scheduled_this_step:
+                        preempted_req_id = preempted_req.request_id
+                        scheduled_running_reqs.remove(preempted_req)
+                        token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                        req_to_new_blocks.pop(preempted_req_id)
+                        scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                        preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                            preempted_req_id, None
+                        )
+                        if preempted_encoder_inputs:
+                            # Restore encoder compute budget if the preempted
+                            # request had encoder inputs scheduled in this step.
+                            num_embeds_to_restore = sum(
+                                preempted_req.get_num_encoder_embeds(i)
+                                for i in preempted_encoder_inputs
+                            )
+                            encoder_compute_budget += num_embeds_to_restore
+                        req_index -= 1
                     if not preempted_req.is_finished():
                         preempted_reqs.append(preempted_req)
+                    if preemption_result.kind == _PREEMPTION_ASYNC_PENDING:
+                        # Request KV swap-out frees GPU blocks only after the
+                        # D2H store completion arrives. Stop this allocation
+                        # retry loop until a later scheduler tick observes that
+                        # completion and actual block release.
+                        break
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
                         break
@@ -2849,7 +2890,13 @@ class Scheduler(SchedulerInterface):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
-    def _preempt_request(self, request: Request, timestamp: float) -> None:
+    def _preempt_request(
+        self,
+        request: Request,
+        timestamp: float,
+        *,
+        allow_async_kv_swap: bool = True,
+    ) -> PreemptionResult:
         """Preempt a request and put it back to the waiting queue.
 
         NOTE: The request should be popped from the running queue outside of this
@@ -2862,18 +2909,29 @@ class Scheduler(SchedulerInterface):
         # frame. Flush and re-prefill that compacted state instead of treating
         # this as ordinary preemption.
         if request.position_offset > 0:
-            if self._preempt_request_for_kv_swap(
-                request,
-                timestamp,
-                reason="compacted",
-            ):
-                return
+            if not allow_async_kv_swap:
+                if self._request_kv_swap_strict_preempt_enabled():
+                    return PreemptionResult(
+                        _PREEMPTION_DEFERRED,
+                        "request was scheduled in the current scheduler step",
+                    )
+            else:
+                swap_result = self._preempt_request_for_kv_swap(
+                    request,
+                    timestamp,
+                    reason="compacted",
+                )
+                if swap_result.kind in (
+                    _PREEMPTION_ASYNC_PENDING,
+                    _PREEMPTION_DEFERRED,
+                ):
+                    return swap_result
             if self._preempt_request_for_reprefill(
                 request,
                 timestamp,
                 reason="compacted",
             ):
-                return
+                return PreemptionResult(_PREEMPTION_FREED)
             logger.warning(
                 "Attempted to preempt compacted request %s "
                 "(position_offset=%d) — aborting request instead.",
@@ -2884,23 +2942,34 @@ class Scheduler(SchedulerInterface):
             self._free_request(request)
             self._kve_log_compacted_preempt_abort(request, phase="after-free")
             self._queue_finished_request_output(request)
-            return
+            return PreemptionResult(_PREEMPTION_FINISHED)
         if (
             request.request_id in self._managed_context_active_restores
             or request.request_id in self._managed_context_deferred_restores
         ):
-            if self._preempt_request_for_kv_swap(
-                request,
-                timestamp,
-                reason="managed-context-restore",
-            ):
-                return
+            if not allow_async_kv_swap:
+                if self._request_kv_swap_strict_preempt_enabled():
+                    return PreemptionResult(
+                        _PREEMPTION_DEFERRED,
+                        "request was scheduled in the current scheduler step",
+                    )
+            else:
+                swap_result = self._preempt_request_for_kv_swap(
+                    request,
+                    timestamp,
+                    reason="managed-context-restore",
+                )
+                if swap_result.kind in (
+                    _PREEMPTION_ASYNC_PENDING,
+                    _PREEMPTION_DEFERRED,
+                ):
+                    return swap_result
             if self._preempt_request_for_reprefill(
                 request,
                 timestamp,
                 reason="managed-context-restore",
             ):
-                return
+                return PreemptionResult(_PREEMPTION_FREED)
             logger.warning(
                 "Attempted to preempt managed-context restore request %s; "
                 "aborting request instead.",
@@ -2909,7 +2978,7 @@ class Scheduler(SchedulerInterface):
             request.status = RequestStatus.FINISHED_ERROR
             self._free_request(request)
             self._queue_finished_request_output(request)
-            return
+            return PreemptionResult(_PREEMPTION_FINISHED)
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
@@ -2922,6 +2991,7 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
+        return PreemptionResult(_PREEMPTION_FREED)
 
     def _preempt_request_for_kv_swap(
         self,
@@ -2929,17 +2999,23 @@ class Scheduler(SchedulerInterface):
         timestamp: float,
         *,
         reason: str,
-    ) -> bool:
+    ) -> PreemptionResult:
         error = self._start_request_kv_swap_out(request, reason)
         if error is not None:
             if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
                 logger.warning(
-                    "[REQUEST-KV-SWAP-SKIP] req=%s reason=%s error=%s",
+                    "[REQUEST-KV-SWAP-SKIP] req=%s reason=%s error=%s "
+                    "action=%s",
                     request.request_id[:8],
                     reason,
                     error,
+                    "defer"
+                    if self._request_kv_swap_preempt_error_defers(error)
+                    else "fallback",
                 )
-            return False
+            if self._request_kv_swap_preempt_error_defers(error):
+                return PreemptionResult(_PREEMPTION_DEFERRED, error)
+            return PreemptionResult(_PREEMPTION_FAILED, error)
         request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
         request.num_preemptions += 1
         if request.spec_token_ids:
@@ -2957,7 +3033,7 @@ class Scheduler(SchedulerInterface):
             request.position_offset,
             request.num_preemptions,
         )
-        return True
+        return PreemptionResult(_PREEMPTION_ASYNC_PENDING)
 
     def _preempt_request_for_reprefill(
         self,
@@ -4603,6 +4679,30 @@ class Scheduler(SchedulerInterface):
             in ("1", "true", "yes", "on")
             and self._managed_context_cpu_archive_enabled
             and not self._request_kv_swap_suspended
+        )
+
+    def _request_kv_swap_strict_preempt_enabled(self) -> bool:
+        raw = os.environ.get("KVE_REQUEST_KV_SWAP_STRICT_PREEMPT", "1")
+        return self._request_kv_swap_enabled() and raw.strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+
+    def _request_kv_swap_preempt_error_defers(self, error: str) -> bool:
+        if not self._request_kv_swap_strict_preempt_enabled():
+            return False
+        exactness_or_backpressure_errors = {
+            "request KV swap is already active",
+            "request KV swap store queue is full",
+            "request has active managed-context hidden KV",
+            "request has deferred managed-context hidden KV",
+            "request has managed-context load in flight",
+        }
+        return (
+            error in exactness_or_backpressure_errors
+            or error.startswith("managed-context CPU store transfer limit reached")
         )
 
     def _request_kv_swap_max_pending_stores(self) -> int:

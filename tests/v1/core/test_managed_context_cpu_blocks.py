@@ -134,6 +134,18 @@ class _FakeBlockPool:
         self._free_blocks += len(block_list)
 
 
+class _FakeRequestQueue(deque):
+    def prepend_request(self, request) -> None:
+        self.appendleft(request)
+
+    def remove_requests(self, requests) -> None:
+        for request in requests:
+            try:
+                self.remove(request)
+            except ValueError:
+                pass
+
+
 def _request_kv_swap_test_scheduler(
     monkeypatch,
     *,
@@ -188,30 +200,145 @@ def _request_kv_swap_test_scheduler(
     scheduler.finished_req_ids = set()
     scheduler.finished_req_ids_dict = None
     scheduler.running = []
-    scheduler.waiting = SimpleNamespace(remove_requests=lambda requests: None)
-    scheduler.skipped_waiting = SimpleNamespace(
-        remove_requests=lambda requests: None
-    )
+    scheduler.waiting = _FakeRequestQueue()
+    scheduler.skipped_waiting = _FakeRequestQueue()
     scheduler.num_waiting_for_streaming_input = 0
     scheduler.connector = None
     scheduler.encoder_cache_manager = SimpleNamespace(free=lambda request: None)
     scheduler._connector_finished = lambda request: (False, None)
+    scheduler.log_stats = False
     request = _Request(
         request_id="req",
         client_index=0,
         status=RequestStatus.WAITING_FOR_REMOTE_KVS,
         padding_pending=False,
         num_output_placeholders=0,
+        prompt_token_ids=[1] * 64,
+        num_prompt_tokens=64,
+        num_tokens=80,
         num_computed_tokens=64,
         num_external_computed_tokens=0,
         num_cached_tokens=0,
         position_offset=128,
         needs_rebuild=False,
+        compaction_events=[SimpleNamespace()],
+        is_prefill_chunk=False,
+        skip_reading_prefix_cache=False,
+        _kve_reprefill_after_flush=False,
+        _kve_phase4_reprefill_after_pin_release=False,
         spec_token_ids=[],
         num_preemptions=0,
     )
     scheduler.requests[request.request_id] = request
     return scheduler, manager, request
+
+
+def _make_request_running_for_preempt_test(request: _Request) -> None:
+    request.status = RequestStatus.RUNNING
+    request.num_cached_tokens = 64
+    request.spec_token_ids = [99]
+
+
+def test_compacted_preempt_request_kv_swap_store_queue_full_defers_without_reprefill(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_REQUEST_KV_SWAP_MAX_PENDING_STORES", "1")
+    scheduler, manager, request = _request_kv_swap_test_scheduler(monkeypatch)
+    _make_request_running_for_preempt_test(request)
+    scheduler._request_kv_swaps["other"] = SimpleNamespace(status="store_pending")
+
+    def fail_reprefill(*args, **kwargs):
+        raise AssertionError("compact re-prefill must not run")
+
+    scheduler._preempt_request_for_reprefill = fail_reprefill
+
+    result = scheduler._preempt_request(request, 123.0)
+
+    assert result.kind == "deferred"
+    assert result.error == "request KV swap store queue is full"
+    assert request.status == RequestStatus.RUNNING
+    assert request.num_preemptions == 0
+    assert request.num_computed_tokens == 64
+    assert request.num_cached_tokens == 64
+    assert request.position_offset == 128
+    assert request.spec_token_ids == [99]
+    assert not request.needs_rebuild
+    assert not request.skip_reading_prefix_cache
+    assert not request._kve_reprefill_after_flush
+    assert list(scheduler.waiting) == []
+    assert set(scheduler._request_kv_swaps) == {"other"}
+    assert scheduler._managed_context_store_events_to_submit == {}
+    assert [block.block_id for block in manager.req_to_blocks["req"]] == [10, 11]
+    assert manager.num_cached_block == {"req": 1}
+    assert manager.block_pool.freed_block_ids == []
+    assert list(scheduler._managed_context_cpu_free_block_ids) == [0, 1, 2, 3]
+
+
+def test_compacted_preempt_current_step_request_defers_without_async_swap(
+    monkeypatch,
+) -> None:
+    scheduler, manager, request = _request_kv_swap_test_scheduler(monkeypatch)
+    _make_request_running_for_preempt_test(request)
+
+    def fail_reprefill(*args, **kwargs):
+        raise AssertionError("compact re-prefill must not run")
+
+    scheduler._preempt_request_for_reprefill = fail_reprefill
+
+    result = scheduler._preempt_request(
+        request,
+        123.0,
+        allow_async_kv_swap=False,
+    )
+
+    assert result.kind == "deferred"
+    assert result.error == "request was scheduled in the current scheduler step"
+    assert request.status == RequestStatus.RUNNING
+    assert request.num_preemptions == 0
+    assert request.spec_token_ids == [99]
+    assert list(scheduler.waiting) == []
+    assert scheduler._request_kv_swaps == {}
+    assert scheduler._managed_context_store_events_to_submit == {}
+    assert [block.block_id for block in manager.req_to_blocks["req"]] == [10, 11]
+    assert manager.block_pool.freed_block_ids == []
+    assert list(scheduler._managed_context_cpu_free_block_ids) == [0, 1, 2, 3]
+
+
+def test_compacted_preempt_request_kv_swap_success_is_async_pending(
+    monkeypatch,
+) -> None:
+    scheduler, manager, request = _request_kv_swap_test_scheduler(monkeypatch)
+    _make_request_running_for_preempt_test(request)
+
+    result = scheduler._preempt_request(request, 123.0)
+
+    assert result.kind == "async_pending"
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert request.num_preemptions == 1
+    assert request.spec_token_ids == []
+    assert not request._kve_reprefill_after_flush
+    assert list(scheduler.waiting) == [request]
+
+    swap = scheduler._request_kv_swaps["req"]
+    assert swap.status == "store_pending"
+    assert swap.store_event_id == 0
+    assert swap.kv_block_count == 2
+    assert swap.num_computed_tokens == 64
+    assert swap.position_offset == 128
+    assert swap.cpu_block_ids_by_group == ([0, 1],)
+    assert swap.logical_start_by_group == ([0, 16],)
+
+    assert [block.block_id for block in manager.req_to_blocks["req"]] == [10, 11]
+    assert manager.num_cached_block == {"req": 1}
+    assert manager.block_pool.freed_block_ids == []
+    assert list(scheduler._managed_context_cpu_free_block_ids) == [2, 3]
+
+    metadata = scheduler._drain_managed_context_transfer_metadata()
+    assert metadata is not None
+    assert len(metadata.store_events) == 1
+    assert metadata.store_events[0].event_id == 0
+    assert metadata.store_events[0].gpu_block_ids == [10, 11]
+    assert metadata.store_events[0].cpu_block_ids == [0, 1]
 
 
 def test_request_kv_swap_store_completion_frees_gpu_and_queues_load(
