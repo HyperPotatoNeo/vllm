@@ -5081,6 +5081,72 @@ class Scheduler(SchedulerInterface):
         value = self._env_float("KVE_REQUEST_KV_SWAP_RELOAD_STARVATION_SECONDS", 30.0)
         return max(0.0, value)
 
+    def _request_kv_swap_usage_watermark(
+        self,
+        name: str,
+    ) -> float | None:
+        raw = os.environ.get(name)
+        if raw is None or raw == "":
+            return None
+        try:
+            value = float(raw)
+        except ValueError:
+            return None
+        if not 0.0 < value < 1.0:
+            return None
+        return value
+
+    def _request_kv_swap_reload_target_usage(self) -> float | None:
+        return self._request_kv_swap_usage_watermark(
+            "KVE_REQUEST_KV_SWAP_RELOAD_TARGET_USAGE"
+        )
+
+    def _request_kv_swap_offload_start_usage(self) -> float | None:
+        return self._request_kv_swap_usage_watermark(
+            "KVE_REQUEST_KV_SWAP_OFFLOAD_START_USAGE"
+        )
+
+    def _request_kv_swap_offload_stop_usage(self) -> float | None:
+        explicit_stop = self._request_kv_swap_usage_watermark(
+            "KVE_REQUEST_KV_SWAP_OFFLOAD_STOP_USAGE"
+        )
+        if explicit_stop is not None:
+            return explicit_stop
+        start = self._request_kv_swap_offload_start_usage()
+        if start is None:
+            return None
+        return max(0.0, start - 0.10)
+
+    def _request_kv_swap_pressure_largest_first_enabled(self) -> bool:
+        raw = os.environ.get("KVE_REQUEST_KV_SWAP_PRESSURE_LARGEST_FIRST")
+        if raw is None:
+            return self._request_kv_swap_offload_start_usage() is not None
+        return raw.strip().lower() not in ("0", "false", "no", "off")
+
+    @staticmethod
+    def _request_kv_swap_usage_free_blocks(
+        total_blocks: int,
+        usage: float,
+    ) -> int:
+        free_blocks = total_blocks * (1.0 - usage)
+        return max(0, int(free_blocks + 0.999999))
+
+    def _request_kv_swap_gpu_block_pool_stats(self) -> tuple[int, int]:
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        if not managers:
+            return 0, 0
+        total_blocks_by_group: list[int] = []
+        free_blocks_by_group: list[int] = []
+        for manager in managers:
+            block_pool = manager.block_pool
+            free_blocks = int(block_pool.get_num_free_blocks())
+            total_blocks = int(getattr(block_pool, "num_gpu_blocks", 0) or 0)
+            if total_blocks <= 0:
+                total_blocks = free_blocks
+            total_blocks_by_group.append(total_blocks)
+            free_blocks_by_group.append(free_blocks)
+        return min(total_blocks_by_group), min(free_blocks_by_group)
+
     def _request_kv_swap_preempt_error_defers(self, error: str) -> bool:
         if not self._request_kv_swap_strict_preempt_enabled():
             return False
@@ -5117,6 +5183,17 @@ class Scheduler(SchedulerInterface):
         )
 
     def _request_kv_swap_gpu_pressure_blocks(self) -> int:
+        start_usage = self._request_kv_swap_offload_start_usage()
+        if start_usage is not None:
+            total_blocks, _free_blocks = self._request_kv_swap_gpu_block_pool_stats()
+            if total_blocks > 0:
+                return max(
+                    1,
+                    self._request_kv_swap_usage_free_blocks(
+                        total_blocks,
+                        start_usage,
+                    ),
+                )
         explicit_pressure = self._env_optional_int(
             "KVE_REQUEST_KV_SWAP_GPU_PRESSURE_BLOCKS"
         )
@@ -5136,6 +5213,13 @@ class Scheduler(SchedulerInterface):
             1
             for swap in self._request_kv_swaps.values()
             if swap.status == "load_pending"
+        )
+
+    def _request_kv_swap_pending_store_blocks(self) -> int:
+        return sum(
+            int(getattr(swap, "kv_block_count", 0) or 0)
+            for swap in self._request_kv_swaps.values()
+            if swap.status == "store_pending"
         )
 
     def _request_kv_swap_remove_ready(self, request_id: str) -> None:
@@ -5220,16 +5304,56 @@ class Scheduler(SchedulerInterface):
                 token_budget=token_budget,
             )
         )
-        min_free = self._request_kv_swap_gpu_headroom_blocks()
-        free_blocks = min(
-            manager.block_pool.get_num_free_blocks() for manager in managers
+        return (
+            self._request_kv_swap_load_capacity_error(
+                swap,
+                extra_required_gpu_blocks=extra_required_gpu_blocks,
+            )
+            is None
         )
+
+    def _request_kv_swap_load_capacity_error(
+        self,
+        swap: RequestKVSwap,
+        *,
+        extra_required_gpu_blocks: int,
+    ) -> str | None:
+        min_free = self._request_kv_swap_gpu_headroom_blocks()
+        total_blocks, free_blocks = self._request_kv_swap_gpu_block_pool_stats()
         required_blocks = (
             int(getattr(swap, "kv_block_count", 0) or 0)
             + max(0, extra_required_gpu_blocks)
             + min_free
         )
-        return free_blocks >= required_blocks
+        if free_blocks < required_blocks:
+            return (
+                "request KV swap load is waiting for GPU blocks: "
+                f"reload_blocks={swap.kv_block_count} free={free_blocks} "
+                f"extra_blocks={extra_required_gpu_blocks} "
+                f"min_free={min_free} required={required_blocks}"
+            )
+
+        target_usage = self._request_kv_swap_reload_target_usage()
+        if target_usage is None or total_blocks <= 0:
+            return None
+
+        reload_blocks = int(getattr(swap, "kv_block_count", 0) or 0)
+        extra_blocks = max(0, extra_required_gpu_blocks)
+        used_blocks = max(0, total_blocks - free_blocks)
+        projected_used_blocks = used_blocks + reload_blocks + extra_blocks
+        target_used_blocks = int(total_blocks * target_usage)
+        if projected_used_blocks <= target_used_blocks:
+            return None
+
+        return (
+            "request KV swap load is parked by GPU watermark: "
+            f"reload_blocks={reload_blocks} used={used_blocks} "
+            f"free={free_blocks} total={total_blocks} "
+            f"extra_blocks={extra_blocks} min_free={min_free} "
+            f"target_usage={target_usage:.3f} "
+            f"target_used={target_used_blocks} "
+            f"projected_used={projected_used_blocks}"
+        )
 
     def _request_kv_swap_should_park_waiting_request(
         self,
@@ -5375,8 +5499,17 @@ class Scheduler(SchedulerInterface):
                 key=lambda request: (request.priority, request.arrival_time),
                 reverse=True,
             )
+        else:
+            candidates = list(reversed(candidates))
+        if self._request_kv_swap_pressure_largest_first_enabled():
+            candidates.sort(
+                key=lambda request: self._request_kv_swap_gpu_block_count(
+                    request.request_id
+                ),
+                reverse=True,
+            )
             return candidates
-        return list(reversed(candidates))
+        return candidates
 
     @staticmethod
     def _request_kv_swap_pressure_global_error(error: str | None) -> bool:
@@ -5400,9 +5533,20 @@ class Scheduler(SchedulerInterface):
         pressure_blocks = self._request_kv_swap_gpu_pressure_blocks()
         if pressure_blocks <= 0:
             return None
-        free_blocks = self._managed_context_min_free_gpu_blocks()
+        total_blocks, free_blocks = self._request_kv_swap_gpu_block_pool_stats()
         if free_blocks >= pressure_blocks:
             return None
+        stop_usage = self._request_kv_swap_offload_stop_usage()
+        if stop_usage is not None and total_blocks > 0:
+            target_free_blocks = self._request_kv_swap_usage_free_blocks(
+                total_blocks,
+                stop_usage,
+            )
+            projected_free_blocks = (
+                free_blocks + self._request_kv_swap_pending_store_blocks()
+            )
+            if projected_free_blocks >= target_free_blocks:
+                return None
 
         last_error: str | None = None
         for candidate in self._request_kv_swap_pressure_candidates(
@@ -5670,22 +5814,12 @@ class Scheduler(SchedulerInterface):
         if len(managers) != len(swap.logical_start_by_group):
             return "request KV swap has incomplete manager metadata"
 
-        min_free = self._request_kv_swap_gpu_headroom_blocks()
-        free_blocks = min(
-            manager.block_pool.get_num_free_blocks() for manager in managers
+        capacity_error = self._request_kv_swap_load_capacity_error(
+            swap,
+            extra_required_gpu_blocks=extra_required_gpu_blocks,
         )
-        required_blocks = (
-            swap.kv_block_count
-            + max(0, extra_required_gpu_blocks)
-            + min_free
-        )
-        if free_blocks < required_blocks:
-            return (
-                "request KV swap load is waiting for GPU blocks: "
-                f"reload_blocks={swap.kv_block_count} free={free_blocks} "
-                f"extra_blocks={extra_required_gpu_blocks} "
-                f"min_free={min_free} required={required_blocks}"
-            )
+        if capacity_error is not None:
+            return capacity_error
 
         entries: list[tuple[Any, list[Any]]] = []
         gpu_block_ids: list[int] = []

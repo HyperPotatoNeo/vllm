@@ -108,10 +108,19 @@ class _Request(SimpleNamespace):
 
 
 class _FakeBlockPool:
-    def __init__(self, *, free_blocks: int, new_block_ids: list[int]) -> None:
+    def __init__(
+        self,
+        *,
+        free_blocks: int,
+        new_block_ids: list[int],
+        num_gpu_blocks: int | None = None,
+    ) -> None:
         self._free_blocks = free_blocks
         self._new_block_ids = deque(new_block_ids)
         self.freed_block_ids: list[int] = []
+        self.num_gpu_blocks = (
+            num_gpu_blocks if num_gpu_blocks is not None else free_blocks
+        )
 
     def get_num_free_blocks(self) -> int:
         return self._free_blocks
@@ -151,12 +160,14 @@ def _request_kv_swap_test_scheduler(
     monkeypatch,
     *,
     gpu_free_blocks: int = 4,
+    gpu_total_blocks: int | None = None,
 ) -> tuple[Scheduler, SimpleNamespace, _Request]:
     monkeypatch.setenv("KVE_REQUEST_KV_SWAP", "1")
     scheduler = object.__new__(Scheduler)
     block_pool = _FakeBlockPool(
         free_blocks=gpu_free_blocks,
         new_block_ids=[20, 21, 22, 23],
+        num_gpu_blocks=gpu_total_blocks,
     )
     blocks = [
         SimpleNamespace(block_id=10, logical_start=0, is_null=False),
@@ -243,6 +254,31 @@ def _make_request_running_for_preempt_test(request: _Request) -> None:
     request.status = RequestStatus.RUNNING
     request.num_cached_tokens = 64
     request.spec_token_ids = [99]
+
+
+def _running_request(request_id: str) -> _Request:
+    return _Request(
+        request_id=request_id,
+        client_index=0,
+        status=RequestStatus.RUNNING,
+        padding_pending=False,
+        num_output_placeholders=0,
+        prompt_token_ids=[1] * 64,
+        num_prompt_tokens=64,
+        num_tokens=80,
+        num_computed_tokens=64,
+        num_external_computed_tokens=0,
+        num_cached_tokens=64,
+        position_offset=128,
+        needs_rebuild=False,
+        compaction_events=[SimpleNamespace()],
+        is_prefill_chunk=False,
+        skip_reading_prefix_cache=False,
+        _kve_reprefill_after_flush=False,
+        _kve_phase4_reprefill_after_pin_release=False,
+        spec_token_ids=[],
+        num_preemptions=0,
+    )
 
 
 def test_compacted_preempt_request_kv_swap_store_queue_full_defers_without_reprefill(
@@ -473,6 +509,61 @@ def test_request_kv_swap_load_accounts_resumed_allocation_blocks(
     assert list(scheduler._managed_context_load_events_to_submit) == [1]
 
 
+def test_request_kv_swap_reload_watermark_parks_projected_high_usage(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_REQUEST_KV_SWAP_RELOAD_TARGET_USAGE", "0.70")
+    scheduler, _manager, request = _request_kv_swap_test_scheduler(
+        monkeypatch,
+        gpu_free_blocks=5,
+        gpu_total_blocks=10,
+    )
+    swap = SimpleNamespace(
+        status="swapped",
+        created_at=time.monotonic(),
+        kv_block_count=2,
+        logical_start_by_group=([0, 16],),
+        num_computed_tokens=request.num_computed_tokens,
+        last_error=None,
+    )
+    scheduler._request_kv_swaps["req"] = swap
+
+    assert scheduler._request_kv_swap_load_capacity_error(
+        swap,
+        extra_required_gpu_blocks=1,
+    ).startswith("request KV swap load is parked by GPU watermark")
+    assert not scheduler._request_kv_swap_load_is_admissible(
+        request,
+        swap,
+        token_budget=128,
+    )
+
+
+def test_request_kv_swap_reload_watermark_allows_projected_safe_usage(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_REQUEST_KV_SWAP_RELOAD_TARGET_USAGE", "0.80")
+    scheduler, _manager, request = _request_kv_swap_test_scheduler(
+        monkeypatch,
+        gpu_free_blocks=5,
+        gpu_total_blocks=10,
+    )
+    swap = SimpleNamespace(
+        status="swapped",
+        created_at=time.monotonic(),
+        kv_block_count=2,
+        logical_start_by_group=([0, 16],),
+        num_computed_tokens=request.num_computed_tokens,
+        last_error=None,
+    )
+    scheduler._request_kv_swaps["req"] = swap
+
+    assert scheduler._request_kv_swap_load_capacity_error(
+        swap,
+        extra_required_gpu_blocks=1,
+    ) is None
+
+
 def test_request_kv_swap_load_completion_restores_request_and_frees_cpu(
     monkeypatch,
 ) -> None:
@@ -588,6 +679,69 @@ def test_request_kv_swap_pressure_skips_protected_request(monkeypatch) -> None:
     assert scheduler._request_kv_swaps == {}
     assert scheduler._managed_context_store_events_to_submit == {}
     assert [block.block_id for block in manager.req_to_blocks["req"]] == [10, 11]
+
+
+def test_request_kv_swap_pressure_uses_largest_first_with_watermark(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_REQUEST_KV_SWAP_OFFLOAD_START_USAGE", "0.90")
+    scheduler, manager, _request = _request_kv_swap_test_scheduler(
+        monkeypatch,
+        gpu_free_blocks=0,
+        gpu_total_blocks=10,
+    )
+    large = _running_request("large")
+    small = _running_request("small")
+    scheduler.requests = {"large": large, "small": small}
+    manager.req_to_blocks = {
+        "large": [
+            SimpleNamespace(block_id=30, logical_start=0, is_null=False),
+            SimpleNamespace(block_id=31, logical_start=16, is_null=False),
+            SimpleNamespace(block_id=32, logical_start=32, is_null=False),
+        ],
+        "small": [
+            SimpleNamespace(block_id=40, logical_start=0, is_null=False),
+        ],
+    }
+    scheduler._managed_context_cpu_free_block_ids = deque(range(8))
+    scheduler.running = [large, small]
+
+    preempted = scheduler._preempt_request_for_kv_swap_pressure(
+        123.0,
+        reason="test-pressure",
+        protected_request_ids=set(),
+    )
+
+    assert preempted is large
+    assert scheduler.running == [small]
+    assert large.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert scheduler._request_kv_swaps["large"].kv_block_count == 3
+
+
+def test_request_kv_swap_pressure_counts_pending_store_blocks_toward_stop(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_REQUEST_KV_SWAP_OFFLOAD_START_USAGE", "0.90")
+    monkeypatch.setenv("KVE_REQUEST_KV_SWAP_OFFLOAD_STOP_USAGE", "0.70")
+    scheduler, _manager, request = _request_kv_swap_test_scheduler(
+        monkeypatch,
+        gpu_free_blocks=0,
+        gpu_total_blocks=10,
+    )
+    _make_request_running_for_preempt_test(request)
+    scheduler.running = [request]
+    scheduler._request_kv_swaps["pending"] = SimpleNamespace(
+        status="store_pending",
+        kv_block_count=3,
+    )
+
+    assert scheduler._preempt_request_for_kv_swap_pressure(
+        123.0,
+        reason="test-pressure",
+        protected_request_ids=set(),
+    ) is None
+    assert scheduler.running == [request]
+    assert set(scheduler._request_kv_swaps) == {"pending"}
 
 
 def test_request_kv_swap_ready_queue_discards_stale_ids(monkeypatch) -> None:
