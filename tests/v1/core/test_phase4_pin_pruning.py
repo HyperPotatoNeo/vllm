@@ -182,6 +182,24 @@ def test_phase4_consumed_pin_keeps_queued_successor_after_grace(
     )
 
 
+def test_phase4_consumed_pin_keeps_queued_successor_after_ttl(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_PHASE4_CONSUMED_PIN_GRACE_SECONDS", "1")
+    scheduler = _scheduler_with_requests(set())
+    scheduler.waiting.append(_request("trace", expected_cached_tokens=128))
+    pin = _pin(
+        token_count=128,
+        consumed_by_request_id="reader",
+        consumed_at=time.monotonic() - 60.0,
+    )
+    pin.created_at = time.monotonic() - 60.0
+
+    assert not scheduler._phase4_pin_is_prunable(
+        "trace", pin, time.monotonic(), ttl_seconds=30.0
+    )
+
+
 def test_phase4_consumed_pin_ignores_queued_request_without_expected_tokens(
     monkeypatch,
 ) -> None:

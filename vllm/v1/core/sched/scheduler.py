@@ -4721,7 +4721,7 @@ class Scheduler(SchedulerInterface):
             if grace_seconds > 0 and now - consumed_at < grace_seconds:
                 return False
             if self._phase4_has_queued_successor(trace_id, pin):
-                return ttl_seconds > 0 and now - pin.created_at >= ttl_seconds
+                return False
             return True
         if ttl_seconds <= 0:
             return False
