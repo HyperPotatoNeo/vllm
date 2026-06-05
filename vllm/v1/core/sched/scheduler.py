@@ -135,6 +135,12 @@ class Phase4Pin:
     created_at: float
     consumed_by_request_id: str | None = None
     consumed_at: float | None = None
+    status: str = "gpu_pinned"
+    cpu_block_ids_by_group: tuple[list[int], ...] = ()
+    logical_start_by_group: tuple[list[int], ...] = ()
+    store_event_id: int | None = None
+    load_event_id: int | None = None
+    last_error: str | None = None
 
 
 @dataclass
@@ -654,6 +660,8 @@ class Scheduler(SchedulerInterface):
         self._request_kv_swap_load_event_to_request_id: dict[int, str] = {}
         self._request_kv_swap_finished_load_req_ids: set[str] = set()
         self._request_kv_swap_suspended = False
+        self._phase4_pin_store_event_to_trace_id: dict[int, str] = {}
+        self._phase4_pin_load_event_to_trace_id: dict[int, str] = {}
         self._managed_context_restore_reservations: dict[
             str, set[tuple[str, str]]
         ] = {}
@@ -1993,19 +2001,50 @@ class Scheduler(SchedulerInterface):
                                         "[PHASE4-PREFIX-REFILL-ALLOWED] %s",
                                         phase4_prefix_miss_msg,
                                     )
-                                elif self._phase4_requeue_prefix_miss_for_reprefill(
-                                    request, phase4_prefix_miss_msg
-                                ):
-                                    request_queue.pop_request()
-                                    clear_pending_phase4_pin_consumed()
-                                    step_skipped_waiting.prepend_request(
-                                        request
-                                    )
-                                    continue
                                 else:
+                                    pin_load_reason = (
+                                        self._phase4_try_load_pin_for_prefix_miss(
+                                            phase4_trace_id,
+                                            expected_cached_tokens,
+                                            request,
+                                            phase4_prefix_miss_msg,
+                                        )
+                                    )
+                                    if self._phase4_pin_recovery_defers(
+                                        pin_load_reason
+                                    ):
+                                        logger.warning(
+                                            "[PHASE4-PREFIX-DEFER] req=%s "
+                                            "trace=%s call=%s reason=%s "
+                                            "miss=%s",
+                                            request.request_id[:8],
+                                            phase4_trace_id,
+                                            phase4_call_idx,
+                                            pin_load_reason,
+                                            phase4_prefix_miss_msg,
+                                        )
+                                        request_queue.pop_request()
+                                        clear_pending_phase4_pin_consumed()
+                                        step_skipped_waiting.prepend_request(
+                                            request
+                                        )
+                                        continue
+                                    if self._phase4_prefix_miss_reprefill_enabled():
+                                        if self._phase4_requeue_prefix_miss_for_reprefill(
+                                            request,
+                                            phase4_prefix_miss_msg,
+                                        ):
+                                            request_queue.pop_request()
+                                            clear_pending_phase4_pin_consumed()
+                                            step_skipped_waiting.prepend_request(
+                                                request
+                                            )
+                                            continue
                                     logger.error(
-                                        "[PHASE4-PREFIX-ABORT] %s",
+                                        "[PHASE4-PREFIX-ABORT] %s "
+                                        "pin_recovery=%s",
                                         phase4_prefix_miss_msg,
+                                        pin_load_reason,
                                     )
                                     request_queue.pop_request()
                                     clear_pending_phase4_pin_consumed()
@@ -3241,11 +3280,7 @@ class Scheduler(SchedulerInterface):
         request: Request,
         reason: str,
     ) -> bool:
-        raw_enabled = os.environ.get(
-            "KVE_COMPACTED_REPREFILL_ON_PREEMPT",
-            "1",
-        )
-        if raw_enabled.lower() in ("0", "false", "no", "off"):
+        if not self._phase4_prefix_miss_reprefill_enabled():
             return False
         if request.prompt_token_ids is None:
             return False
@@ -4207,26 +4242,60 @@ class Scheduler(SchedulerInterface):
     ) -> None:
         if not trace_id:
             return
-        pin = self._phase4_pinned_blocks.pop(trace_id, None)
+        pin = self._phase4_pinned_blocks.get(trace_id)
         if pin is None:
             return
-        released_blocks = 0
-        for manager, blocks in pin.entries:
-            if blocks:
-                manager.block_pool.free_blocks(blocks)
-                if evict_prefix:
-                    manager.block_pool.evict_blocks(
-                        {
-                            block.block_id
-                            for block in blocks
-                            if block.block_hash is not None
-                        }
-                    )
-                released_blocks += len(blocks)
+        if self._phase4_pin_store_in_flight(trace_id, pin):
+            pin.status = "expired"
+            if os.environ.get("KVE_TRACE_PHASE4_PIN") == "1":
+                logger.warning(
+                    "[PHASE4-PIN-EXPIRE] trace=%s reason=%s "
+                    "store_in_flight=True",
+                    trace_id,
+                    reason,
+                )
+            return
+        if self._phase4_pin_load_in_flight(trace_id, pin):
+            pin.status = "expired"
+            if os.environ.get("KVE_TRACE_PHASE4_PIN") == "1":
+                logger.warning(
+                    "[PHASE4-PIN-EXPIRE] trace=%s reason=%s "
+                    "load_in_flight=True",
+                    trace_id,
+                    reason,
+                )
+            return
+
+        self._phase4_pinned_blocks.pop(trace_id, None)
+        if pin.store_event_id is not None:
+            self._managed_context_store_events_to_submit.pop(
+                pin.store_event_id, None
+            )
+            getattr(
+                self,
+                "_phase4_pin_store_event_to_trace_id",
+                {},
+            ).pop(pin.store_event_id, None)
+        if pin.load_event_id is not None:
+            self._managed_context_load_events_to_submit.pop(
+                pin.load_event_id, None
+            )
+            getattr(
+                self,
+                "_phase4_pin_load_event_to_trace_id",
+                {},
+            ).pop(pin.load_event_id, None)
+
+        released_blocks = self._release_phase4_pin_gpu_entries(
+            pin,
+            evict_prefix=evict_prefix,
+        )
+        self._managed_context_free_cpu_block_ids(pin.cpu_block_ids_by_group)
         if evict_prefix or os.environ.get("KVE_TRACE_PHASE4_PIN") == "1":
             logger.warning(
                 "[PHASE4-PIN-RELEASE] trace=%s reason=%s blocks=%d "
-                "tokens=%d req=%s call=%s consumed_by=%s evict_prefix=%s",
+                "tokens=%d req=%s call=%s consumed_by=%s status=%s "
+                "evict_prefix=%s",
                 trace_id,
                 reason,
                 released_blocks,
@@ -4234,12 +4303,312 @@ class Scheduler(SchedulerInterface):
                 pin.request_id,
                 pin.call_idx,
                 pin.consumed_by_request_id,
+                pin.status,
                 evict_prefix,
             )
 
     def _release_all_phase4_pins(self, reason: str) -> None:
         for trace_id in list(self._phase4_pinned_blocks):
             self._release_phase4_pins(trace_id, reason)
+
+    def _phase4_pin_store_in_flight(
+        self, trace_id: str, pin: Phase4Pin
+    ) -> bool:
+        event_id = pin.store_event_id
+        return bool(
+            pin.status == "store_pending"
+            and event_id is not None
+            and event_id not in self._managed_context_store_events_to_submit
+            and event_id
+            in getattr(self, "_phase4_pin_store_event_to_trace_id", {})
+            and self._phase4_pin_store_event_to_trace_id[event_id] == trace_id
+        )
+
+    def _phase4_pin_load_in_flight(
+        self, trace_id: str, pin: Phase4Pin
+    ) -> bool:
+        event_id = pin.load_event_id
+        return bool(
+            pin.status == "load_pending"
+            and event_id is not None
+            and event_id not in self._managed_context_load_events_to_submit
+            and event_id
+            in getattr(self, "_phase4_pin_load_event_to_trace_id", {})
+            and self._phase4_pin_load_event_to_trace_id[event_id] == trace_id
+        )
+
+    def _release_phase4_pin_gpu_entries(
+        self,
+        pin: Phase4Pin,
+        *,
+        evict_prefix: bool = False,
+    ) -> int:
+        released_blocks = 0
+        for manager, blocks in pin.entries:
+            if not blocks:
+                continue
+            manager.block_pool.free_blocks(blocks)
+            if evict_prefix:
+                manager.block_pool.evict_blocks(
+                    {
+                        block.block_id
+                        for block in blocks
+                        if block.block_hash is not None
+                    }
+                )
+            released_blocks += len(blocks)
+        pin.entries = []
+        return released_blocks
+
+    def _start_phase4_pin_cpu_offload(
+        self,
+        trace_id: str,
+        pin: Phase4Pin,
+        *,
+        reason: str,
+    ) -> str | None:
+        if not self._managed_context_cpu_archive_enabled:
+            return "managed-context CPU archive is disabled"
+        if pin.status in ("cpu_offloaded", "store_pending", "load_pending"):
+            return None
+        if pin.status != "gpu_pinned":
+            return f"Phase4 pin cannot be offloaded from {pin.status}"
+        if not pin.entries:
+            return "Phase4 pin has no GPU blocks to offload"
+
+        limit_error = self._managed_context_cpu_store_transfer_limit_error()
+        if limit_error is not None:
+            return limit_error
+
+        logical_start_by_group: list[list[int]] = []
+        total_blocks = 0
+        for _manager, blocks in pin.entries:
+            logical_starts = [int(block.logical_start) for block in blocks]
+            logical_start_by_group.append(logical_starts)
+            total_blocks += len(blocks)
+        cpu_block_ids = self._alloc_managed_context_cpu_blocks(total_blocks)
+        if cpu_block_ids is None:
+            return (
+                f"Phase4 pin needs {total_blocks} CPU blocks, "
+                f"available={len(self._managed_context_cpu_free_block_ids)} "
+                f"max={self._managed_context_cpu_max_blocks}"
+            )
+
+        cpu_by_group: list[list[int]] = []
+        offset = 0
+        for logical_starts in logical_start_by_group:
+            count = len(logical_starts)
+            cpu_by_group.append(cpu_block_ids[offset : offset + count])
+            offset += count
+        if offset != len(cpu_block_ids):
+            self._managed_context_free_cpu_block_ids((cpu_block_ids,))
+            return "Phase4 pin has inconsistent block metadata"
+
+        event_id = self._next_managed_context_transfer_event_id()
+        pin.status = "store_pending"
+        pin.cpu_block_ids_by_group = tuple(cpu_by_group)
+        pin.logical_start_by_group = tuple(logical_start_by_group)
+        pin.store_event_id = event_id
+        self._managed_context_store_events_to_submit[event_id] = (
+            ManagedContextCopyEvent(
+                event_id=event_id,
+                gpu_block_ids=self._managed_context_gpu_block_ids(pin.entries),
+                cpu_block_ids=cpu_block_ids,
+            )
+        )
+        self._phase4_pin_store_event_to_trace_id[event_id] = trace_id
+        logger.warning(
+            "[PHASE4-PIN-OFFLOAD-SUBMIT] trace=%s reason=%s event=%d "
+            "blocks=%d cpu_blocks=%s",
+            trace_id,
+            reason,
+            event_id,
+            total_blocks,
+            cpu_by_group,
+        )
+        return None
+
+    def _complete_phase4_pin_cpu_store(self, event_id: int) -> bool:
+        trace_id = getattr(
+            self,
+            "_phase4_pin_store_event_to_trace_id",
+            {},
+        ).pop(event_id, None)
+        if trace_id is None:
+            return False
+        pin = self._phase4_pinned_blocks.get(trace_id)
+        if pin is None:
+            return True
+        released_blocks = self._release_phase4_pin_gpu_entries(pin)
+        pin.store_event_id = None
+        if pin.status == "expired":
+            self._managed_context_free_cpu_block_ids(pin.cpu_block_ids_by_group)
+            self._phase4_pinned_blocks.pop(trace_id, None)
+            status = "expired"
+        else:
+            pin.status = "cpu_offloaded"
+            status = pin.status
+        logger.warning(
+            "[PHASE4-PIN-STORE-DONE] trace=%s event=%d "
+            "released_gpu_blocks=%d status=%s cpu_blocks=%s",
+            trace_id,
+            event_id,
+            released_blocks,
+            status,
+            pin.cpu_block_ids_by_group,
+        )
+        return True
+
+    def _start_phase4_pin_cpu_load(
+        self,
+        trace_id: str,
+        pin: Phase4Pin,
+        *,
+        reason: str,
+    ) -> str | None:
+        if pin.status == "gpu_pinned":
+            return None
+        if pin.status in ("store_pending", "load_pending"):
+            return f"Phase4 pin is waiting for {pin.status}"
+        if pin.status != "cpu_offloaded":
+            return f"Phase4 pin cannot be loaded from {pin.status}"
+        if not pin.cpu_block_ids_by_group or not pin.logical_start_by_group:
+            return "Phase4 pin has no CPU archive metadata"
+
+        limit_error = self._managed_context_cpu_load_transfer_limit_error()
+        if limit_error is not None:
+            return limit_error
+
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        if len(managers) != len(pin.cpu_block_ids_by_group):
+            return "Phase4 pin has incomplete manager metadata"
+        free_blocks = min(
+            manager.block_pool.get_num_free_blocks() for manager in managers
+        )
+        if free_blocks < pin.block_count:
+            return (
+                "Phase4 pin load is waiting for GPU blocks: "
+                f"reload_blocks={pin.block_count} free={free_blocks}"
+            )
+
+        entries: list[tuple[Any, list[Any]]] = []
+        gpu_block_ids: list[int] = []
+        cpu_block_ids: list[int] = []
+        try:
+            for idx, manager in enumerate(managers):
+                group_cpu_ids = pin.cpu_block_ids_by_group[idx]
+                logical_starts = pin.logical_start_by_group[idx]
+                if len(group_cpu_ids) != len(logical_starts):
+                    return "Phase4 pin CPU block metadata mismatch"
+                blocks = manager.block_pool.get_new_blocks(len(group_cpu_ids))
+                for block, logical_start in zip(blocks, logical_starts):
+                    block.logical_start = int(logical_start)
+                entries.append((manager, blocks))
+                gpu_block_ids.extend(int(block.block_id) for block in blocks)
+                cpu_block_ids.extend(int(block_id) for block_id in group_cpu_ids)
+        except ValueError as exc:
+            for manager, blocks in entries:
+                manager.block_pool.free_blocks(reversed(blocks))
+            return f"insufficient GPU blocks for Phase4 pin load: {exc}"
+
+        event_id = self._next_managed_context_transfer_event_id()
+        self._managed_context_load_events_to_submit[event_id] = (
+            ManagedContextCopyEvent(
+                event_id=event_id,
+                gpu_block_ids=gpu_block_ids,
+                cpu_block_ids=cpu_block_ids,
+            )
+        )
+        self._phase4_pin_load_event_to_trace_id[event_id] = trace_id
+        pin.status = "load_pending"
+        pin.entries = entries
+        pin.load_event_id = event_id
+        logger.warning(
+            "[PHASE4-PIN-LOAD-SUBMIT] trace=%s reason=%s event=%d "
+            "blocks=%d gpu_blocks=%s cpu_blocks=%s",
+            trace_id,
+            reason,
+            event_id,
+            pin.block_count,
+            gpu_block_ids,
+            cpu_block_ids,
+        )
+        return None
+
+    def _complete_phase4_pin_cpu_load(self, event_id: int) -> bool:
+        trace_id = getattr(
+            self,
+            "_phase4_pin_load_event_to_trace_id",
+            {},
+        ).pop(event_id, None)
+        if trace_id is None:
+            return False
+        pin = self._phase4_pinned_blocks.get(trace_id)
+        if pin is None:
+            return True
+        pin.load_event_id = None
+        if pin.status == "expired":
+            released_blocks = self._release_phase4_pin_gpu_entries(pin)
+            self._managed_context_free_cpu_block_ids(pin.cpu_block_ids_by_group)
+            self._phase4_pinned_blocks.pop(trace_id, None)
+            logger.warning(
+                "[PHASE4-PIN-LOAD-DONE] trace=%s event=%d "
+                "status=expired released_gpu_blocks=%d",
+                trace_id,
+                event_id,
+                released_blocks,
+            )
+            return True
+        pin.status = "gpu_pinned"
+        self._managed_context_free_cpu_block_ids(pin.cpu_block_ids_by_group)
+        pin.cpu_block_ids_by_group = ()
+        pin.logical_start_by_group = ()
+        logger.warning(
+            "[PHASE4-PIN-LOAD-DONE] trace=%s event=%d blocks=%d",
+            trace_id,
+            event_id,
+            pin.block_count,
+        )
+        return True
+
+    def _phase4_prefix_miss_reprefill_enabled(self) -> bool:
+        raw = os.environ.get("KVE_PHASE4_PREFIX_MISS_REPREFILL", "0")
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def _phase4_pin_recovery_defers(reason: str) -> bool:
+        return (
+            reason.endswith("submitted")
+            or " is waiting for " in reason
+            or " transfer limit reached" in reason
+            or reason.startswith("insufficient GPU blocks for Phase4 pin load")
+        )
+
+    def _phase4_try_load_pin_for_prefix_miss(
+        self,
+        trace_id: str,
+        expected_cached_tokens: int,
+        request: Request,
+        reason: str,
+    ) -> str | None:
+        pin = self._phase4_pinned_blocks.get(trace_id)
+        if pin is None:
+            return "Phase4 pin is missing"
+        if pin.token_count < expected_cached_tokens:
+            return (
+                "Phase4 pin is too short: "
+                f"tokens={pin.token_count} expected={expected_cached_tokens}"
+            )
+        if pin.status == "gpu_pinned":
+            return "Phase4 pin GPU blocks are unavailable"
+        error = self._start_phase4_pin_cpu_load(
+            trace_id,
+            pin,
+            reason=reason,
+        )
+        if error is None:
+            return "Phase4 pin load submitted"
+        return error
 
     def _mark_phase4_pin_consumed(
         self, trace_id: str, request_id: str
@@ -4310,100 +4679,6 @@ class Scheduler(SchedulerInterface):
                 ):
                     successors.append(request)
         return successors
-
-    def _phase4_pin_inherited_offset(
-        self,
-        pin: Phase4Pin,
-        expected_cached_tokens: int,
-    ) -> int:
-        if expected_cached_tokens <= 0:
-            return 0
-        first_entry = pin.entries[0] if pin.entries else None
-        if first_entry is None:
-            return 0
-        manager, blocks = first_entry
-        block_size = getattr(manager, "block_size", None)
-        if block_size is None:
-            block_size = getattr(
-                self,
-                "block_size",
-                getattr(self, "_compaction_block_size", 16),
-            )
-        block_size = max(1, int(block_size))
-        num_blocks = expected_cached_tokens // block_size
-        for block_idx, block in enumerate(blocks[:num_blocks]):
-            logical_start = getattr(block, "logical_start", -1)
-            if logical_start < 0:
-                continue
-            block_offset = logical_start - block_idx * block_size
-            if block_offset != 0:
-                return int(block_offset)
-        return 0
-
-    def _phase4_abandon_queued_successors_for_reprefill(
-        self,
-        trace_id: str,
-        pin: Phase4Pin,
-        *,
-        reason: str,
-    ) -> int:
-        if (
-            os.environ.get(
-                "KVE_PHASE4_ABANDON_QUEUED_ON_STALL",
-                "1",
-            )
-            .lower()
-            in ("0", "false", "no", "off")
-        ):
-            return 0
-        abandoned = 0
-        for request in self._phase4_queued_successors(trace_id, pin):
-            expected_cached_tokens = self._phase4_expected_cached_tokens(request)
-            if expected_cached_tokens is None:
-                continue
-            request_id = getattr(request, "request_id", "")
-            if request.status not in (
-                RequestStatus.WAITING,
-                RequestStatus.PREEMPTED,
-            ):
-                logger.warning(
-                    "[PHASE4-PIN-ABANDON-SKIP] req=%s trace=%s reason=%s "
-                    "status=%s",
-                    str(request_id)[:8],
-                    trace_id,
-                    reason,
-                    request.status,
-                )
-                continue
-            inherited_offset = self._phase4_pin_inherited_offset(
-                pin,
-                expected_cached_tokens,
-            )
-            if not self._mark_request_for_full_reprefill(
-                request,
-                "phase4-pin-abandon",
-                position_offset=inherited_offset,
-                phase4_pin_release=True,
-                skip_log_reason=reason,
-            ):
-                continue
-            if request_id:
-                self._clear_phase4_pin_consumed(trace_id, request_id)
-            abandoned += 1
-            logger.warning(
-                "[PHASE4-PIN-ABANDON] req=%s trace=%s reason=%s "
-                "expected_cached=%d position_offset=%d waiting=%d "
-                "skipped=%d pins=%d",
-                str(request_id)[:8],
-                trace_id,
-                reason,
-                expected_cached_tokens,
-                inherited_offset,
-                len(getattr(self, "waiting", ())),
-                len(getattr(self, "skipped_waiting", ())),
-                len(self._phase4_pinned_blocks),
-            )
-        return abandoned
 
     def _phase4_pin_is_prunable(
         self,
@@ -4502,22 +4777,27 @@ class Scheduler(SchedulerInterface):
             }:
                 continue
             queued_successors = self._phase4_queued_successors(trace_id, pin)
-            force_stall_release = False
             if queued_successors:
                 if reason != "scheduler-stall-pressure":
                     continue
-                abandoned = self._phase4_abandon_queued_successors_for_reprefill(
+                offload_error = self._start_phase4_pin_cpu_offload(
                     trace_id,
                     pin,
                     reason=reason,
                 )
-                if abandoned <= 0:
+                if offload_error is not None:
+                    logger.warning(
+                        "[PHASE4-PIN-OFFLOAD-DEFER] trace=%s reason=%s "
+                        "queued_successors=%d error=%s",
+                        trace_id,
+                        reason,
+                        len(queued_successors),
+                        offload_error,
+                    )
                     continue
-                force_stall_release = True
+                return True
             consumed_at = pin.consumed_at or pin.created_at
             if (
-                not force_stall_release
-                and
                 pin.consumed_by_request_id is not None
                 and grace_seconds > 0
                 and now - consumed_at < grace_seconds
@@ -5523,6 +5803,8 @@ class Scheduler(SchedulerInterface):
             return None
         pending = len(self._managed_context_store_event_to_span) + len(
             getattr(self, "_request_kv_swap_store_event_to_request_id", {})
+        ) + len(
+            getattr(self, "_phase4_pin_store_event_to_trace_id", {})
         )
         if pending < max_pending:
             return None
@@ -5537,6 +5819,8 @@ class Scheduler(SchedulerInterface):
             return None
         pending = len(self._managed_context_load_event_to_request_id) + len(
             getattr(self, "_request_kv_swap_load_event_to_request_id", {})
+        ) + len(
+            getattr(self, "_phase4_pin_load_event_to_trace_id", {})
         )
         if pending < max_pending:
             return None
@@ -6705,6 +6989,8 @@ class Scheduler(SchedulerInterface):
             return None
         entries = self._phase4_pinned_blocks.get(trace_id)
         if entries is None:
+            return None
+        if entries.status != "gpu_pinned":
             return None
 
         by_manager_id = {
@@ -8689,6 +8975,8 @@ class Scheduler(SchedulerInterface):
         self, output: ManagedContextTransferOutput
     ) -> None:
         for event_id in output.completed_store_event_ids:
+            if self._complete_phase4_pin_cpu_store(event_id):
+                continue
             span = self._managed_context_store_event_to_span.pop(event_id, None)
             if span is None:
                 self._complete_request_kv_swap_store(event_id)
@@ -8714,6 +9002,8 @@ class Scheduler(SchedulerInterface):
             self._retry_managed_context_gpu_pinned_offloads("store-done")
 
         for event_id in output.completed_load_event_ids:
+            if self._complete_phase4_pin_cpu_load(event_id):
+                continue
             request_id = self._managed_context_load_event_to_request_id.pop(
                 event_id, None
             )

@@ -2,6 +2,7 @@ import time
 from collections import deque
 from types import SimpleNamespace
 
+from vllm.v1.outputs import ManagedContextTransferOutput
 from vllm.v1.core.sched.scheduler import Phase4Pin, Scheduler
 from vllm.v1.request import RequestStatus
 
@@ -9,6 +10,35 @@ from vllm.v1.request import RequestStatus
 class _FakeRequestQueue(deque):
     def prepend_request(self, request) -> None:
         self.appendleft(request)
+
+
+class _FakeBlockPool:
+    def __init__(self, new_block_ids: list[int] | None = None) -> None:
+        self.freed_blocks = []
+        self.evicted_ids = []
+        self._new_block_ids = deque(new_block_ids or [])
+
+    def free_blocks(self, blocks) -> None:
+        self.freed_blocks.extend(list(blocks))
+
+    def evict_blocks(self, block_ids) -> None:
+        self.evicted_ids.extend(sorted(block_ids))
+
+    def get_num_free_blocks(self) -> int:
+        return len(self._new_block_ids)
+
+    def get_new_blocks(self, count: int):
+        if count > len(self._new_block_ids):
+            raise ValueError("not enough free blocks")
+        return [
+            SimpleNamespace(
+                block_id=self._new_block_ids.popleft(),
+                logical_start=-1,
+                block_hash=None,
+                is_null=False,
+            )
+            for _ in range(count)
+        ]
 
 
 def _scheduler_with_requests(request_ids: set[str]) -> Scheduler:
@@ -19,10 +49,27 @@ def _scheduler_with_requests(request_ids: set[str]) -> Scheduler:
     scheduler.skipped_waiting = _FakeRequestQueue()
     scheduler._phase4_pinned_blocks = {}
     scheduler._phase4_pin_order = deque()
+    scheduler._phase4_pin_store_event_to_trace_id = {}
+    scheduler._phase4_pin_load_event_to_trace_id = {}
     scheduler._managed_context_active_restores = {}
     scheduler._managed_context_deferred_restores = {}
     scheduler._managed_context_pending_loads = {}
     scheduler._managed_context_restore_reservations = {}
+    scheduler._managed_context_archive = {}
+    scheduler._managed_context_archive_order = deque()
+    scheduler._managed_context_store_events_to_submit = {}
+    scheduler._managed_context_load_events_to_submit = {}
+    scheduler._managed_context_store_event_to_span = {}
+    scheduler._managed_context_load_event_to_request_id = {}
+    scheduler._request_kv_swap_store_event_to_request_id = {}
+    scheduler._request_kv_swap_load_event_to_request_id = {}
+    scheduler._managed_context_cpu_free_block_ids = deque()
+    scheduler._managed_context_cpu_max_blocks = 0
+    scheduler._managed_context_cpu_offload_immediate = False
+    scheduler._managed_context_cpu_evict_on_capacity = False
+    scheduler._managed_context_cpu_max_pending_store_events = 0
+    scheduler._managed_context_cpu_max_pending_load_events = 0
+    scheduler._managed_context_next_transfer_event_id = 0
     scheduler._pending_admission_compaction_ids = set()
     scheduler.prev_step_scheduled_req_ids = set()
     scheduler.num_cumulative_preemption = 0
@@ -245,19 +292,23 @@ def test_phase4_pressure_release_skips_queued_successor(
     assert released == []
 
 
-def test_phase4_stall_pressure_abandons_queued_successor_for_reprefill(
+def test_phase4_stall_pressure_offloads_queued_successor_pin(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("KVE_PHASE4_CONSUMED_PIN_GRACE_SECONDS", "999999")
     scheduler = _scheduler_with_requests({"reader"})
+    scheduler._managed_context_cpu_archive_enabled = True
+    scheduler._managed_context_cpu_max_blocks = 16
+    scheduler._managed_context_cpu_free_block_ids = deque(range(16))
     request = _request("trace", expected_cached_tokens=64)
     scheduler.waiting.append(request)
-    manager = SimpleNamespace(block_size=16)
+    block_pool = _FakeBlockPool()
+    manager = SimpleNamespace(block_size=16, block_pool=block_pool)
     blocks = [
-        SimpleNamespace(logical_start=128),
-        SimpleNamespace(logical_start=144),
-        SimpleNamespace(logical_start=160),
-        SimpleNamespace(logical_start=176),
+        SimpleNamespace(block_id=10, logical_start=128, block_hash="a"),
+        SimpleNamespace(block_id=11, logical_start=144, block_hash="b"),
+        SimpleNamespace(block_id=12, logical_start=160, block_hash="c"),
+        SimpleNamespace(block_id=13, logical_start=176, block_hash="d"),
     ]
     scheduler._phase4_pinned_blocks = {
         "trace": _pin(
@@ -268,35 +319,144 @@ def test_phase4_stall_pressure_abandons_queued_successor_for_reprefill(
         )
     }
     scheduler._phase4_pin_order = deque(["trace"])
-    released = []
-
-    def fake_release_phase4_pins(trace_id, reason, *, evict_prefix=False):
-        released.append((trace_id, reason, evict_prefix))
-        scheduler._phase4_pinned_blocks.pop(trace_id, None)
-
-    scheduler._release_phase4_pins = fake_release_phase4_pins
 
     assert scheduler._release_phase4_pressure_pin("scheduler-stall-pressure")
-    assert released == [("trace", "scheduler-stall-pressure", True)]
-    assert "trace" not in scheduler._phase4_pinned_blocks
-    assert request.position_offset == 128
+
+    pin = scheduler._phase4_pinned_blocks["trace"]
+    assert pin.status == "store_pending"
+    assert pin.cpu_block_ids_by_group == ([0, 1, 2, 3],)
+    assert pin.logical_start_by_group == ([128, 144, 160, 176],)
+    assert pin.store_event_id == 0
+    assert scheduler._phase4_pin_store_event_to_trace_id == {0: "trace"}
+    assert scheduler._managed_context_store_events_to_submit[0].gpu_block_ids == [
+        10,
+        11,
+        12,
+        13,
+    ]
+    assert scheduler._managed_context_store_events_to_submit[0].cpu_block_ids == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    assert list(scheduler._managed_context_cpu_free_block_ids) == list(range(4, 16))
+    assert block_pool.freed_blocks == []
+    assert request.position_offset == 0
     assert request.num_computed_tokens == 0
     assert request.num_external_computed_tokens == 0
-    assert request.num_cached_tokens == -1
-    assert request.skip_reading_prefix_cache
-    assert request.needs_rebuild
-    assert request._kve_reprefill_after_flush
-    assert request._kve_phase4_reprefill_after_pin_release
-    assert not scheduler._phase4_has_queued_successor(
+    assert request.num_cached_tokens == 0
+    assert not request.skip_reading_prefix_cache
+    assert not request.needs_rebuild
+    assert not request._kve_reprefill_after_flush
+    assert not request._kve_phase4_reprefill_after_pin_release
+    assert scheduler._phase4_has_queued_successor(
         "trace",
         _pin(token_count=128),
     )
 
 
-def test_phase4_stall_pressure_abandon_can_be_disabled(
+def test_phase4_pin_store_and_load_completion_round_trip(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("KVE_PHASE4_ABANDON_QUEUED_ON_STALL", "0")
+    monkeypatch.setenv("KVE_PHASE4_CONSUMED_PIN_GRACE_SECONDS", "999999")
+    scheduler = _scheduler_with_requests({"reader"})
+    scheduler._managed_context_cpu_archive_enabled = True
+    scheduler._managed_context_cpu_max_blocks = 16
+    scheduler._managed_context_cpu_free_block_ids = deque(range(16))
+    request = _request("trace", expected_cached_tokens=64)
+    scheduler.waiting.append(request)
+    block_pool = _FakeBlockPool(new_block_ids=[20, 21, 22, 23])
+    manager = SimpleNamespace(block_size=16, block_pool=block_pool)
+    blocks = [
+        SimpleNamespace(block_id=10, logical_start=128, block_hash="a"),
+        SimpleNamespace(block_id=11, logical_start=144, block_hash="b"),
+        SimpleNamespace(block_id=12, logical_start=160, block_hash="c"),
+        SimpleNamespace(block_id=13, logical_start=176, block_hash="d"),
+    ]
+    scheduler.kv_cache_manager = SimpleNamespace(
+        coordinator=SimpleNamespace(single_type_managers=[manager])
+    )
+    scheduler._phase4_pinned_blocks = {
+        "trace": _pin(
+            token_count=128,
+            consumed_by_request_id="old-reader",
+            consumed_at=time.monotonic(),
+            entries=[(manager, blocks)],
+        )
+    }
+    scheduler._phase4_pin_order = deque(["trace"])
+
+    assert scheduler._release_phase4_pressure_pin("scheduler-stall-pressure")
+    scheduler._drain_managed_context_transfer_metadata()
+    scheduler._update_from_managed_context_transfer_finished(
+        ManagedContextTransferOutput(completed_store_event_ids=[0])
+    )
+
+    pin = scheduler._phase4_pinned_blocks["trace"]
+    assert pin.status == "cpu_offloaded"
+    assert pin.entries == []
+    assert block_pool.freed_blocks == blocks
+    assert list(scheduler._managed_context_cpu_free_block_ids) == list(range(4, 16))
+
+    error = scheduler._start_phase4_pin_cpu_load(
+        "trace",
+        pin,
+        reason="test",
+    )
+
+    assert error is None
+    assert pin.status == "load_pending"
+    assert scheduler._phase4_pin_load_event_to_trace_id == {1: "trace"}
+    scheduler._drain_managed_context_transfer_metadata()
+    scheduler._update_from_managed_context_transfer_finished(
+        ManagedContextTransferOutput(completed_load_event_ids=[1])
+    )
+
+    assert pin.status == "gpu_pinned"
+    assert pin.cpu_block_ids_by_group == ()
+    assert [block.block_id for _manager, group in pin.entries for block in group] == [
+        20,
+        21,
+        22,
+        23,
+    ]
+    assert [block.logical_start for _manager, group in pin.entries for block in group] == [
+        128,
+        144,
+        160,
+        176,
+    ]
+    assert list(scheduler._managed_context_cpu_free_block_ids) == list(range(4, 16)) + [
+        0,
+        1,
+        2,
+        3,
+    ]
+
+
+def test_phase4_prefix_miss_reprefill_requires_explicit_opt_in(
+    monkeypatch,
+) -> None:
+    scheduler = _scheduler_with_requests({"reader"})
+    request = _request("trace", expected_cached_tokens=64)
+
+    assert not scheduler._phase4_requeue_prefix_miss_for_reprefill(
+        request,
+        "prefix miss",
+    )
+    assert not request._kve_reprefill_after_flush
+
+    monkeypatch.setenv("KVE_PHASE4_PREFIX_MISS_REPREFILL", "1")
+
+    assert scheduler._phase4_requeue_prefix_miss_for_reprefill(
+        request,
+        "prefix miss",
+    )
+    assert request._kve_reprefill_after_flush
+
+
+def test_phase4_stall_pressure_does_not_replay_when_pin_offload_unavailable() -> None:
     scheduler = _scheduler_with_requests(set())
     scheduler.waiting.append(_request("trace", expected_cached_tokens=64))
     scheduler._phase4_pinned_blocks = {
@@ -314,6 +474,7 @@ def test_phase4_stall_pressure_abandon_can_be_disabled(
         "scheduler-stall-pressure"
     )
     assert released == []
+    assert not scheduler.waiting[0]._kve_reprefill_after_flush
 
 
 def test_phase4_stall_pressure_releases_multiple_pins(monkeypatch) -> None:
@@ -655,7 +816,10 @@ def test_phase4_pin_release_reprefill_skips_prefix_expectation() -> None:
     assert Scheduler._phase4_pin_release_reprefill_active(request)
 
 
-def test_phase4_prefix_miss_requeues_for_reprefill() -> None:
+def test_phase4_prefix_miss_requeues_for_reprefill_when_explicitly_enabled(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_PHASE4_PREFIX_MISS_REPREFILL", "1")
     scheduler = _scheduler_with_requests({"reader"})
     request = _request("trace", expected_cached_tokens=64)
     request.prompt_token_ids = [1] * 512
@@ -694,10 +858,7 @@ def test_phase4_prefix_miss_requeues_for_reprefill() -> None:
     assert "reader" not in scheduler.prev_step_scheduled_req_ids
 
 
-def test_phase4_prefix_miss_reprefill_can_be_disabled(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("KVE_COMPACTED_REPREFILL_ON_PREEMPT", "0")
+def test_phase4_prefix_miss_reprefill_is_disabled_by_default() -> None:
     scheduler = _scheduler_with_requests({"reader"})
     request = _request("trace", expected_cached_tokens=64)
     request.prompt_token_ids = [1] * 512
