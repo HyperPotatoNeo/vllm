@@ -1142,6 +1142,13 @@ class Scheduler(SchedulerInterface):
         self._prune_phase4_pins()
         self.kv_cache_manager.new_step_starts()
         self._retry_managed_context_gpu_pinned_offloads("schedule-start")
+        pressure_preempted_req = self._preempt_request_for_kv_swap_pressure(
+            scheduled_timestamp,
+            reason="schedule-start-headroom",
+            protected_request_ids=set(),
+        )
+        if pressure_preempted_req is not None:
+            preempted_reqs.append(pressure_preempted_req)
 
         # First, schedule the RUNNING requests.
         if self._compaction_block_aligned_finish:
@@ -1276,6 +1283,23 @@ class Scheduler(SchedulerInterface):
                         break
 
                     # The request cannot be scheduled.
+                    pressure_preempted_req = (
+                        self._preempt_request_for_kv_swap_pressure(
+                            scheduled_timestamp,
+                            reason="running-alloc-pressure",
+                            protected_request_ids={
+                                request.request_id,
+                                *(
+                                    scheduled_req.request_id
+                                    for scheduled_req in scheduled_running_reqs
+                                ),
+                            },
+                        )
+                    )
+                    if pressure_preempted_req is not None:
+                        preempted_reqs.append(pressure_preempted_req)
+                        break
+
                     if self._release_phase4_pressure_pin(
                         "running-alloc-pressure"
                     ):
@@ -1422,6 +1446,7 @@ class Scheduler(SchedulerInterface):
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
+                self._request_kv_swap_prioritize_ready_waiting()
                 request_queue = self._select_waiting_queue_for_scheduling()
                 assert request_queue is not None
 
@@ -1468,7 +1493,15 @@ class Scheduler(SchedulerInterface):
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
                     request.status
-                ) and not self._try_promote_blocked_waiting_request(request):
+                ) and not self._try_promote_blocked_waiting_request(
+                    request,
+                    token_budget=token_budget,
+                ):
+                    block_waiting_admission = (
+                        self._request_kv_swap_should_block_waiting_admission(
+                            request
+                        )
+                    )
                     if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
@@ -1476,6 +1509,8 @@ class Scheduler(SchedulerInterface):
                         )
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
+                    if block_waiting_admission:
+                        break
                     continue
 
                 if (
@@ -2559,6 +2594,22 @@ class Scheduler(SchedulerInterface):
                                 self._kve_managed_context_diag_summary(),
                             )
                             continue
+                    pressure_preempted_req = (
+                        self._preempt_request_for_kv_swap_pressure(
+                            scheduled_timestamp,
+                            reason="waiting-alloc-pressure",
+                            protected_request_ids={
+                                request.request_id,
+                                *(
+                                    scheduled_req.request_id
+                                    for scheduled_req in scheduled_running_reqs
+                                ),
+                            },
+                        )
+                    )
+                    if pressure_preempted_req is not None:
+                        preempted_reqs.append(pressure_preempted_req)
+                        break
                     if (
                         not self.running
                         and self._release_phase4_pressure_pin(
@@ -5027,6 +5078,24 @@ class Scheduler(SchedulerInterface):
     def _request_kv_swap_max_pending_loads(self) -> int:
         return max(1, self._env_int("KVE_REQUEST_KV_SWAP_MAX_PENDING_LOADS", 1))
 
+    def _request_kv_swap_gpu_headroom_blocks(self) -> int:
+        explicit_headroom = self._env_optional_int(
+            "KVE_REQUEST_KV_SWAP_GPU_HEADROOM_BLOCKS"
+        )
+        if explicit_headroom is not None:
+            return explicit_headroom
+        return max(
+            0, self._env_int("KVE_REQUEST_KV_SWAP_MIN_FREE_GPU_BLOCKS", 0)
+        )
+
+    def _request_kv_swap_gpu_pressure_blocks(self) -> int:
+        explicit_pressure = self._env_optional_int(
+            "KVE_REQUEST_KV_SWAP_GPU_PRESSURE_BLOCKS"
+        )
+        if explicit_pressure is not None:
+            return explicit_pressure
+        return self._request_kv_swap_gpu_headroom_blocks()
+
     def _request_kv_swap_pending_stores(self) -> int:
         return sum(
             1
@@ -5046,6 +5115,248 @@ class Scheduler(SchedulerInterface):
             self._request_kv_swap_ready_queue.remove(request_id)
         except ValueError:
             pass
+
+    def _request_kv_swap_ready_head(self) -> str | None:
+        while self._request_kv_swap_ready_queue:
+            request_id = self._request_kv_swap_ready_queue[0]
+            swap = self._request_kv_swaps.get(request_id)
+            request = self.requests.get(request_id)
+            is_finished = (
+                request.is_finished()
+                if request is not None and hasattr(request, "is_finished")
+                else False
+            )
+            if (
+                swap is not None
+                and swap.status == "swapped"
+                and request is not None
+                and not is_finished
+            ):
+                return request_id
+            self._request_kv_swap_ready_queue.popleft()
+        return None
+
+    @staticmethod
+    def _request_kv_swap_gpu_wait_error(error: str | None) -> bool:
+        return bool(
+            error
+            and error.startswith(
+                "request KV swap load is waiting for GPU blocks:"
+            )
+        )
+
+    def _request_kv_swap_should_block_waiting_admission(
+        self, request: Request
+    ) -> bool:
+        if not self._request_kv_swap_enabled() or not self.running:
+            return False
+        swap = self._request_kv_swaps.get(request.request_id)
+        if swap is None or swap.status != "swapped":
+            return False
+        if self._request_kv_swap_ready_head() != request.request_id:
+            return False
+        return self._request_kv_swap_gpu_wait_error(swap.last_error)
+
+    def _request_kv_swap_prioritize_ready_waiting(self) -> None:
+        if (
+            not self._request_kv_swap_enabled()
+            or self.policy != SchedulingPolicy.FCFS
+        ):
+            return
+        ready_request_id = self._request_kv_swap_ready_head()
+        if ready_request_id is None:
+            return
+
+        for queue in (self.skipped_waiting, self.waiting):
+            for request in tuple(queue):
+                if request.request_id != ready_request_id:
+                    continue
+                if (
+                    queue is self.skipped_waiting
+                    and self.skipped_waiting
+                    and self.skipped_waiting.peek_request() is request
+                ):
+                    return
+                queue.remove_request(request)
+                self.skipped_waiting.prepend_request(request)
+                return
+
+    def _request_kv_swap_gpu_block_count(self, request_id: str) -> int:
+        total_blocks = 0
+        for manager in self.kv_cache_manager.coordinator.single_type_managers:
+            total_blocks += len(manager.req_to_blocks.get(request_id, []))
+        return total_blocks
+
+    def _request_kv_swap_pressure_candidate_error(
+        self,
+        request: Request,
+        protected_request_ids: set[str],
+    ) -> str | None:
+        request_id = request.request_id
+        if request_id in protected_request_ids:
+            return "request is protected in this scheduler step"
+        if request.status != RequestStatus.RUNNING:
+            return f"request is not running: {request.status}"
+        if request.padding_pending or request.num_output_placeholders:
+            return "request has pending padding/output placeholders"
+        if request_id in self._request_kv_swaps:
+            return "request KV swap is already active"
+        if request_id in self._managed_context_active_restores:
+            return "request has active managed-context hidden KV"
+        if request_id in self._managed_context_deferred_restores:
+            return "request has deferred managed-context hidden KV"
+        if request_id in self._managed_context_pending_loads:
+            return "request has managed-context load in flight"
+        if self._request_kv_swap_gpu_block_count(request_id) <= 0:
+            return "request has no GPU KV blocks"
+        return None
+
+    def _request_kv_swap_pressure_candidates(
+        self,
+        protected_request_ids: set[str],
+    ) -> list[Request]:
+        candidates = [
+            request
+            for request in self.running
+            if self._request_kv_swap_pressure_candidate_error(
+                request,
+                protected_request_ids,
+            )
+            is None
+        ]
+        if self.policy == SchedulingPolicy.PRIORITY:
+            candidates.sort(
+                key=lambda request: (request.priority, request.arrival_time),
+                reverse=True,
+            )
+            return candidates
+        return list(reversed(candidates))
+
+    @staticmethod
+    def _request_kv_swap_pressure_global_error(error: str | None) -> bool:
+        if error is None:
+            return False
+        return (
+            error == "request KV swap store queue is full"
+            or error.startswith("request KV swap needs ")
+            or error.startswith("managed-context CPU store transfer limit reached")
+        )
+
+    def _preempt_request_for_kv_swap_pressure(
+        self,
+        timestamp: float,
+        *,
+        reason: str,
+        protected_request_ids: set[str],
+    ) -> Request | None:
+        if not self._request_kv_swap_enabled():
+            return None
+        pressure_blocks = self._request_kv_swap_gpu_pressure_blocks()
+        if pressure_blocks <= 0:
+            return None
+        free_blocks = self._managed_context_min_free_gpu_blocks()
+        if free_blocks >= pressure_blocks:
+            return None
+
+        last_error: str | None = None
+        for candidate in self._request_kv_swap_pressure_candidates(
+            protected_request_ids
+        ):
+            try:
+                candidate_index = self.running.index(candidate)
+            except ValueError:
+                continue
+            preempted_req = self.running.pop(candidate_index)
+            result = self._preempt_request_for_kv_swap(
+                preempted_req,
+                timestamp,
+                reason=reason,
+            )
+            if result.kind == _PREEMPTION_ASYNC_PENDING:
+                logger.warning(
+                    "[REQUEST-KV-SWAP-PRESSURE] req=%s reason=%s "
+                    "free=%d pressure=%d blocks=%d",
+                    preempted_req.request_id[:8],
+                    reason,
+                    free_blocks,
+                    pressure_blocks,
+                    self._request_kv_swaps[
+                        preempted_req.request_id
+                    ].kv_block_count,
+                )
+                return preempted_req
+
+            self.running.insert(candidate_index, preempted_req)
+            last_error = result.error
+            if self._request_kv_swap_pressure_global_error(result.error):
+                break
+
+        if (
+            last_error is not None
+            and os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1"
+        ):
+            logger.warning(
+                "[REQUEST-KV-SWAP-PRESSURE-SKIP] reason=%s free=%d "
+                "pressure=%d error=%s",
+                reason,
+                free_blocks,
+                pressure_blocks,
+                last_error,
+            )
+        return None
+
+    def _request_kv_swap_next_allocation_block_demand(
+        self,
+        request: Request,
+        swap: RequestKVSwap,
+        *,
+        token_budget: int,
+    ) -> int:
+        if token_budget <= 0:
+            return 0
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        if not managers:
+            return 0
+        block_size = max(1, int(getattr(managers[0], "block_size", 1)))
+        computed_tokens = max(0, swap.num_computed_tokens)
+        tokens_with_spec = getattr(request, "num_tokens_with_spec", None)
+        if tokens_with_spec is None:
+            tokens_with_spec = getattr(request, "num_tokens", 0) + len(
+                getattr(request, "spec_token_ids", []) or []
+            )
+        num_new_tokens = (
+            int(tokens_with_spec)
+            + int(getattr(request, "num_output_placeholders", 0))
+            - computed_tokens
+        )
+        if num_new_tokens <= 0:
+            return 0
+        long_prefill_threshold = int(
+            getattr(
+                getattr(self, "scheduler_config", None),
+                "long_prefill_token_threshold",
+                0,
+            )
+            or 0
+        )
+        if 0 < long_prefill_threshold < num_new_tokens:
+            num_new_tokens = long_prefill_threshold
+        num_new_tokens = min(num_new_tokens, token_budget)
+        if num_new_tokens <= 0:
+            return 0
+
+        max_sched_len = int(getattr(self, "max_model_len", 0) or 0)
+        if max_sched_len > 0 and not getattr(request, "padding_pending", False):
+            max_sched_len -= 1
+        tokens_needing_slots = (
+            computed_tokens
+            + num_new_tokens
+            + max(0, int(getattr(self, "num_lookahead_tokens", 0) or 0))
+        )
+        if max_sched_len > 0:
+            tokens_needing_slots = min(tokens_needing_slots, max_sched_len)
+        required_blocks = (tokens_needing_slots + block_size - 1) // block_size
+        return max(0, required_blocks - max(0, swap.kv_block_count))
 
     def _release_request_kv_swap_entries(
         self, request_id: str, entries: list[tuple[Any, list[Any]]]
@@ -5190,7 +5501,10 @@ class Scheduler(SchedulerInterface):
             )
 
     def _start_request_kv_swap_load(
-        self, request: Request
+        self,
+        request: Request,
+        *,
+        extra_required_gpu_blocks: int = 0,
     ) -> str | None:
         request_id = request.request_id
         swap = self._request_kv_swaps.get(request_id)
@@ -5210,17 +5524,21 @@ class Scheduler(SchedulerInterface):
         if len(managers) != len(swap.logical_start_by_group):
             return "request KV swap has incomplete manager metadata"
 
-        min_free = max(
-            0, self._env_int("KVE_REQUEST_KV_SWAP_MIN_FREE_GPU_BLOCKS", 0)
-        )
+        min_free = self._request_kv_swap_gpu_headroom_blocks()
         free_blocks = min(
             manager.block_pool.get_num_free_blocks() for manager in managers
         )
-        if free_blocks < swap.kv_block_count + min_free:
+        required_blocks = (
+            swap.kv_block_count
+            + max(0, extra_required_gpu_blocks)
+            + min_free
+        )
+        if free_blocks < required_blocks:
             return (
                 "request KV swap load is waiting for GPU blocks: "
                 f"reload_blocks={swap.kv_block_count} free={free_blocks} "
-                f"min_free={min_free}"
+                f"extra_blocks={extra_required_gpu_blocks} "
+                f"min_free={min_free} required={required_blocks}"
             )
 
         entries: list[tuple[Any, list[Any]]] = []
@@ -5262,10 +5580,12 @@ class Scheduler(SchedulerInterface):
         if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
             logger.warning(
                 "[REQUEST-KV-SWAP-IN-SUBMIT] req=%s event=%d blocks=%d "
-                "gpu_blocks=%s cpu_blocks=%s",
+                "extra_blocks=%d min_free=%d gpu_blocks=%s cpu_blocks=%s",
                 request_id[:8],
                 event_id,
                 swap.kv_block_count,
+                extra_required_gpu_blocks,
+                min_free,
                 gpu_block_ids,
                 cpu_block_ids,
             )
@@ -5391,7 +5711,12 @@ class Scheduler(SchedulerInterface):
         )
         return True, True
 
-    def _try_progress_request_kv_swap(self, request: Request) -> bool:
+    def _try_progress_request_kv_swap(
+        self,
+        request: Request,
+        *,
+        token_budget: int | None = None,
+    ) -> bool:
         request_id = request.request_id
         swap = self._request_kv_swaps.get(request_id)
         if swap is None:
@@ -5399,7 +5724,35 @@ class Scheduler(SchedulerInterface):
         if swap.status == "store_pending":
             return False
         if swap.status == "swapped":
-            error = self._start_request_kv_swap_load(request)
+            ready_head = self._request_kv_swap_ready_head()
+            if ready_head is not None and ready_head != request_id:
+                swap.last_error = (
+                    "request KV swap load is waiting behind ready request: "
+                    f"head={ready_head[:8]}"
+                )
+                return False
+            extra_required_gpu_blocks = (
+                self._request_kv_swap_next_allocation_block_demand(
+                    request,
+                    swap,
+                    token_budget=(
+                        int(
+                            getattr(
+                                self,
+                                "max_num_scheduled_tokens",
+                                getattr(request, "num_tokens", 0),
+                            )
+                            or 0
+                        )
+                        if token_budget is None
+                        else token_budget
+                    ),
+                )
+            )
+            error = self._start_request_kv_swap_load(
+                request,
+                extra_required_gpu_blocks=extra_required_gpu_blocks,
+            )
             if error is not None:
                 swap.last_error = error
                 if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
@@ -8955,13 +9308,21 @@ class Scheduler(SchedulerInterface):
 
         self.finished_recving_kv_req_ids.remove(request.request_id)
 
-    def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
+    def _try_promote_blocked_waiting_request(
+        self,
+        request: Request,
+        *,
+        token_budget: int | None = None,
+    ) -> bool:
         """
         Try to promote a blocked waiting request back to schedulable states.
         """
         if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
             if request.request_id in self._request_kv_swaps:
-                return self._try_progress_request_kv_swap(request)
+                return self._try_progress_request_kv_swap(
+                    request,
+                    token_budget=token_budget,
+                )
             if request.request_id in self._managed_context_pending_loads:
                 if (
                     request.request_id

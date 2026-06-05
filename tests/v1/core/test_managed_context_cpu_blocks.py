@@ -190,6 +190,11 @@ def _request_kv_swap_test_scheduler(
     scheduler._managed_context_finished_load_req_ids = set()
     scheduler._managed_context_cpu_max_pending_store_events = 0
     scheduler._managed_context_cpu_max_pending_load_events = 0
+    scheduler.policy = scheduler_mod.SchedulingPolicy.FCFS
+    scheduler.max_num_scheduled_tokens = 128
+    scheduler.max_model_len = 4096
+    scheduler.num_lookahead_tokens = 0
+    scheduler.scheduler_config = SimpleNamespace(long_prefill_token_threshold=0)
     scheduler._request_kv_swaps = {}
     scheduler._request_kv_swap_ready_queue = deque()
     scheduler._request_kv_swap_store_event_to_request_id = {}
@@ -398,6 +403,75 @@ def test_request_kv_swap_store_completion_frees_gpu_and_queues_load(
     assert list(scheduler._managed_context_cpu_free_block_ids) == [2, 3]
 
 
+def test_request_kv_swap_load_respects_min_free_gpu_blocks(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_REQUEST_KV_SWAP_MIN_FREE_GPU_BLOCKS", "1")
+    scheduler, manager, request = _request_kv_swap_test_scheduler(
+        monkeypatch, gpu_free_blocks=0
+    )
+    assert scheduler._start_request_kv_swap_out(request, "test") is None
+    scheduler._drain_managed_context_transfer_metadata()
+    scheduler._update_from_managed_context_transfer_finished(
+        ManagedContextTransferOutput(completed_store_event_ids=[0])
+    )
+
+    error = scheduler._start_request_kv_swap_load(
+        request,
+        extra_required_gpu_blocks=0,
+    )
+
+    assert error is not None
+    assert "reload_blocks=2" in error
+    assert "min_free=1" in error
+    assert "required=3" in error
+    assert scheduler._request_kv_swaps["req"].status == "swapped"
+    assert list(scheduler._request_kv_swap_ready_queue) == ["req"]
+    assert "req" not in manager.req_to_blocks
+    assert scheduler._managed_context_load_events_to_submit == {}
+    assert manager.block_pool.get_num_free_blocks() == 2
+
+
+def test_request_kv_swap_load_accounts_resumed_allocation_blocks(
+    monkeypatch,
+) -> None:
+    scheduler, manager, request = _request_kv_swap_test_scheduler(
+        monkeypatch, gpu_free_blocks=0
+    )
+    assert scheduler._start_request_kv_swap_out(request, "test") is None
+    scheduler._drain_managed_context_transfer_metadata()
+    scheduler._update_from_managed_context_transfer_finished(
+        ManagedContextTransferOutput(completed_store_event_ids=[0])
+    )
+
+    error = scheduler._start_request_kv_swap_load(
+        request,
+        extra_required_gpu_blocks=1,
+    )
+
+    assert error is not None
+    assert "extra_blocks=1" in error
+    assert "required=3" in error
+    assert scheduler._request_kv_swaps["req"].status == "swapped"
+    assert "req" not in manager.req_to_blocks
+    assert scheduler._managed_context_load_events_to_submit == {}
+
+    manager.block_pool._free_blocks = 3
+    assert (
+        scheduler._start_request_kv_swap_load(
+            request,
+            extra_required_gpu_blocks=1,
+        )
+        is None
+    )
+
+    assert scheduler._request_kv_swaps["req"].status == "load_pending"
+    assert list(scheduler._request_kv_swap_ready_queue) == []
+    assert [block.block_id for block in manager.req_to_blocks["req"]] == [20, 21]
+    assert manager.block_pool.get_num_free_blocks() == 1
+    assert list(scheduler._managed_context_load_events_to_submit) == [1]
+
+
 def test_request_kv_swap_load_completion_restores_request_and_frees_cpu(
     monkeypatch,
 ) -> None:
@@ -467,6 +541,87 @@ def test_request_kv_swap_load_respects_shared_managed_load_budget(
     assert scheduler._try_progress_request_kv_swap(request) is False
     assert scheduler._request_kv_swaps["req"].status == "swapped"
     assert scheduler._managed_context_load_events_to_submit == {}
+
+
+def test_request_kv_swap_pressure_swaps_running_request(monkeypatch) -> None:
+    monkeypatch.setenv("KVE_REQUEST_KV_SWAP_GPU_PRESSURE_BLOCKS", "1")
+    scheduler, manager, request = _request_kv_swap_test_scheduler(
+        monkeypatch, gpu_free_blocks=0
+    )
+    _make_request_running_for_preempt_test(request)
+    scheduler.running = [request]
+
+    preempted = scheduler._preempt_request_for_kv_swap_pressure(
+        123.0,
+        reason="test-pressure",
+        protected_request_ids=set(),
+    )
+
+    assert preempted is request
+    assert scheduler.running == []
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert request.num_preemptions == 1
+    assert list(scheduler.waiting) == [request]
+    assert scheduler._request_kv_swaps["req"].status == "store_pending"
+    assert [block.block_id for block in manager.req_to_blocks["req"]] == [10, 11]
+    assert list(scheduler._managed_context_store_events_to_submit) == [0]
+
+
+def test_request_kv_swap_pressure_skips_protected_request(monkeypatch) -> None:
+    monkeypatch.setenv("KVE_REQUEST_KV_SWAP_GPU_PRESSURE_BLOCKS", "1")
+    scheduler, manager, request = _request_kv_swap_test_scheduler(
+        monkeypatch, gpu_free_blocks=0
+    )
+    _make_request_running_for_preempt_test(request)
+    scheduler.running = [request]
+
+    preempted = scheduler._preempt_request_for_kv_swap_pressure(
+        123.0,
+        reason="test-pressure",
+        protected_request_ids={"req"},
+    )
+
+    assert preempted is None
+    assert scheduler.running == [request]
+    assert request.status == RequestStatus.RUNNING
+    assert scheduler._request_kv_swaps == {}
+    assert scheduler._managed_context_store_events_to_submit == {}
+    assert [block.block_id for block in manager.req_to_blocks["req"]] == [10, 11]
+
+
+def test_request_kv_swap_ready_queue_discards_stale_ids(monkeypatch) -> None:
+    scheduler, _manager, request = _request_kv_swap_test_scheduler(monkeypatch)
+    scheduler._request_kv_swap_ready_queue.extend(["missing", "req"])
+    scheduler._request_kv_swaps["req"] = SimpleNamespace(status="swapped")
+
+    assert scheduler._request_kv_swap_ready_head() == "req"
+    assert list(scheduler._request_kv_swap_ready_queue) == ["req"]
+
+    request.status = RequestStatus.FINISHED_ABORTED
+    assert scheduler._request_kv_swap_ready_head() is None
+    assert list(scheduler._request_kv_swap_ready_queue) == []
+
+
+def test_request_kv_swap_ready_waiting_is_prioritized(monkeypatch) -> None:
+    scheduler, _manager, request = _request_kv_swap_test_scheduler(monkeypatch)
+    other = _Request(request_id="other", status=RequestStatus.WAITING)
+    scheduler.requests["other"] = other
+    scheduler.waiting = scheduler_mod.create_request_queue(
+        scheduler_mod.SchedulingPolicy.FCFS
+    )
+    scheduler.skipped_waiting = scheduler_mod.create_request_queue(
+        scheduler_mod.SchedulingPolicy.FCFS
+    )
+    scheduler.skipped_waiting.add_request(other)
+    scheduler.waiting.add_request(request)
+    scheduler._request_kv_swap_ready_queue.append("req")
+    scheduler._request_kv_swaps["req"] = SimpleNamespace(status="swapped")
+
+    scheduler._request_kv_swap_prioritize_ready_waiting()
+
+    assert scheduler.skipped_waiting.peek_request() is request
+    assert list(scheduler.skipped_waiting)[1:] == [other]
+    assert list(scheduler.waiting) == []
 
 
 def test_finish_request_kv_swap_in_flight_store_releases_on_completion(
