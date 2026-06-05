@@ -176,6 +176,10 @@ class CachedRequestData:
     # to decide whether to apply position_offset. Static during a request's
     # lifetime (= sys boundary), so only needs to be shipped on rebuild.
     protected_prefix_lens: dict[str, int] = field(default_factory=dict)
+    # Managed context: rebuilds can prepend restored hidden-KV blocks to an
+    # already-running request. The worker also needs the token count so its
+    # physical positions and attention lengths match the rebuilt block table.
+    hidden_kv_num_tokens: dict[str, int] = field(default_factory=dict)
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -191,7 +195,8 @@ class CachedRequestData:
             f"all_token_ids_lens={all_token_ids_lens},"
             f"new_block_ids={self.new_block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
-            f"num_output_tokens={self.num_output_tokens}"
+            f"num_output_tokens={self.num_output_tokens},"
+            f"hidden_kv_num_tokens={self.hidden_kv_num_tokens}"
             f")"
         )
 

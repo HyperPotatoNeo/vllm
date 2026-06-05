@@ -29,12 +29,18 @@ def _scheduler_with_requests(request_ids: set[str]) -> Scheduler:
     scheduler.log_stats = False
     scheduler._compaction_enabled = True
     scheduler._compaction_max_turns = 1
+    scheduler._managed_context_enabled = True
+    scheduler._managed_context_cpu_archive_enabled = False
+    scheduler._managed_context_recall_max_spans = 2
     scheduler.cache_config = SimpleNamespace(enable_prefix_caching=True)
     return scheduler
 
 
 def _request(
-    trace_id: str, expected_cached_tokens: int | None = 64
+    trace_id: str,
+    expected_cached_tokens: int | None = 64,
+    *,
+    request_id: str = "reader",
 ) -> SimpleNamespace:
     extra_args = {"kve_phase4_trace_id": trace_id}
     if expected_cached_tokens is not None:
@@ -42,7 +48,18 @@ def _request(
             expected_cached_tokens
         )
     return SimpleNamespace(
+        request_id=request_id,
+        status=RequestStatus.WAITING,
         num_prompt_tokens=512,
+        prompt_token_ids=[1] * 512,
+        num_computed_tokens=0,
+        num_external_computed_tokens=0,
+        num_cached_tokens=0,
+        position_offset=0,
+        skip_reading_prefix_cache=False,
+        needs_rebuild=False,
+        _kve_reprefill_after_flush=False,
+        _kve_phase4_reprefill_after_pin_release=False,
         sampling_params=SimpleNamespace(
             extra_args=extra_args,
         ),
@@ -54,9 +71,10 @@ def _pin(
     token_count: int = 0,
     consumed_by_request_id: str | None = None,
     consumed_at: float | None = None,
+    entries=None,
 ) -> Phase4Pin:
     return Phase4Pin(
-        entries=[],
+        entries=[] if entries is None else entries,
         token_count=token_count,
         block_count=0,
         request_id="writer",
@@ -227,6 +245,195 @@ def test_phase4_pressure_release_skips_queued_successor(
     assert released == []
 
 
+def test_phase4_stall_pressure_abandons_queued_successor_for_reprefill(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_PHASE4_CONSUMED_PIN_GRACE_SECONDS", "999999")
+    scheduler = _scheduler_with_requests({"reader"})
+    request = _request("trace", expected_cached_tokens=64)
+    scheduler.waiting.append(request)
+    manager = SimpleNamespace(block_size=16)
+    blocks = [
+        SimpleNamespace(logical_start=128),
+        SimpleNamespace(logical_start=144),
+        SimpleNamespace(logical_start=160),
+        SimpleNamespace(logical_start=176),
+    ]
+    scheduler._phase4_pinned_blocks = {
+        "trace": _pin(
+            token_count=128,
+            consumed_by_request_id="old-reader",
+            consumed_at=time.monotonic(),
+            entries=[(manager, blocks)],
+        )
+    }
+    scheduler._phase4_pin_order = deque(["trace"])
+    released = []
+
+    def fake_release_phase4_pins(trace_id, reason, *, evict_prefix=False):
+        released.append((trace_id, reason, evict_prefix))
+        scheduler._phase4_pinned_blocks.pop(trace_id, None)
+
+    scheduler._release_phase4_pins = fake_release_phase4_pins
+
+    assert scheduler._release_phase4_pressure_pin("scheduler-stall-pressure")
+    assert released == [("trace", "scheduler-stall-pressure", True)]
+    assert "trace" not in scheduler._phase4_pinned_blocks
+    assert request.position_offset == 128
+    assert request.num_computed_tokens == 0
+    assert request.num_external_computed_tokens == 0
+    assert request.num_cached_tokens == -1
+    assert request.skip_reading_prefix_cache
+    assert request.needs_rebuild
+    assert request._kve_reprefill_after_flush
+    assert request._kve_phase4_reprefill_after_pin_release
+    assert not scheduler._phase4_has_queued_successor(
+        "trace",
+        _pin(token_count=128),
+    )
+
+
+def test_phase4_stall_pressure_abandon_can_be_disabled(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_PHASE4_ABANDON_QUEUED_ON_STALL", "0")
+    scheduler = _scheduler_with_requests(set())
+    scheduler.waiting.append(_request("trace", expected_cached_tokens=64))
+    scheduler._phase4_pinned_blocks = {
+        "trace": _pin(token_count=128)
+    }
+    scheduler._phase4_pin_order = deque(["trace"])
+    released = []
+
+    def fake_release_phase4_pins(trace_id, reason, *, evict_prefix=False):
+        released.append((trace_id, reason, evict_prefix))
+
+    scheduler._release_phase4_pins = fake_release_phase4_pins
+
+    assert not scheduler._release_phase4_pressure_pin(
+        "scheduler-stall-pressure"
+    )
+    assert released == []
+
+
+def test_phase4_stall_pressure_releases_multiple_pins(monkeypatch) -> None:
+    monkeypatch.setenv("KVE_PHASE4_STALL_PRESSURE_RELEASE_MAX", "3")
+    scheduler = _scheduler_with_requests(set())
+    scheduler.waiting.append(_request("trace"))
+    scheduler._kve_gpu_block_pool_diag_summary = lambda: []
+    scheduler._kve_managed_context_diag_summary = lambda: {}
+    scheduler._managed_context_release_hot_gpu_pressure = lambda reason: 0
+    release_results = [True, True, False]
+    release_calls = []
+
+    def fake_release_phase4_pressure_pin(reason):
+        release_calls.append(reason)
+        return release_results.pop(0)
+
+    scheduler._release_phase4_pressure_pin = fake_release_phase4_pressure_pin
+
+    assert scheduler._maybe_release_phase4_stall_pressure_pin(
+        total_num_scheduled_tokens=0
+    )
+    assert release_calls == [
+        "scheduler-stall-pressure",
+        "scheduler-stall-pressure",
+        "scheduler-stall-pressure",
+    ]
+
+
+def test_phase4_stall_pressure_does_not_abandon_remote_kv_waiter(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_PHASE4_CONSUMED_PIN_GRACE_SECONDS", "999999")
+    scheduler = _scheduler_with_requests({"reader"})
+    request = _request("trace", expected_cached_tokens=64)
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.skipped_waiting.append(request)
+    scheduler._phase4_pinned_blocks = {
+        "trace": _pin(
+            token_count=128,
+            consumed_by_request_id="old-reader",
+            consumed_at=time.monotonic(),
+        )
+    }
+    scheduler._phase4_pin_order = deque(["trace"])
+    released = []
+
+    def fake_release_phase4_pins(trace_id, reason, *, evict_prefix=False):
+        released.append((trace_id, reason, evict_prefix))
+
+    scheduler._release_phase4_pins = fake_release_phase4_pins
+
+    assert not scheduler._release_phase4_pressure_pin(
+        "scheduler-stall-pressure"
+    )
+    assert released == []
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert not request._kve_reprefill_after_flush
+
+
+def test_phase4_queued_successor_uses_active_reprefill_marker() -> None:
+    scheduler = _scheduler_with_requests({"reader"})
+    request = _request("trace", expected_cached_tokens=64)
+    request._kve_phase4_reprefill_after_pin_release = True
+    scheduler.waiting.append(request)
+
+    assert scheduler._phase4_has_queued_successor(
+        "trace",
+        _pin(token_count=128),
+    )
+
+    request._kve_reprefill_after_flush = True
+    assert not scheduler._phase4_has_queued_successor(
+        "trace",
+        _pin(token_count=128),
+    )
+
+
+def test_managed_context_restore_ids_are_reserved_before_schedule() -> None:
+    scheduler = _scheduler_with_requests({"reader"})
+    request = _request("trace", expected_cached_tokens=64)
+    request.sampling_params.extra_args["kve_restore_span_ids"] = [
+        "T0001",
+        "T0002",
+    ]
+
+    scheduler._reserve_managed_context_restore_request(request)
+
+    assert scheduler._managed_context_restore_reservations["reader"] == {
+        ("trace", "T0001"),
+        ("trace", "T0002"),
+    }
+
+
+def test_managed_context_unavailable_restore_drop_is_opt_in(
+    monkeypatch,
+) -> None:
+    scheduler = _scheduler_with_requests({"reader"})
+    request = _request("trace", expected_cached_tokens=64)
+    request.sampling_params.extra_args["kve_restore_span_ids"] = ["T0001"]
+
+    assert not scheduler._drop_unavailable_managed_context_restore(
+        request,
+        "span 'T0001' is not available for this trace",
+    )
+    assert request.sampling_params.extra_args["kve_restore_span_ids"] == [
+        "T0001",
+    ]
+
+    monkeypatch.setenv("KVE_MANAGED_CONTEXT_DROP_UNAVAILABLE_RESTORE", "1")
+    assert scheduler._drop_unavailable_managed_context_restore(
+        request,
+        "span 'T0001' is not available for this trace",
+    )
+    assert "kve_restore_span_ids" not in request.sampling_params.extra_args
+    assert (
+        request.sampling_params.extra_args["kve_phase4_trace_id"]
+        == "trace"
+    )
+
+
 def test_phase4_pressure_release_evicts_safe_stale_prefix(
     monkeypatch,
 ) -> None:
@@ -253,7 +460,8 @@ def test_phase4_pressure_release_evicts_safe_stale_prefix(
     assert "trace" not in scheduler._phase4_pinned_blocks
 
 
-def test_phase4_stall_pressure_release_requires_no_progress() -> None:
+def test_phase4_stall_pressure_release_requires_no_progress(monkeypatch) -> None:
+    monkeypatch.setenv("KVE_PHASE4_STALL_PRESSURE_RELEASE_MAX", "1")
     scheduler = _scheduler_with_requests(set())
     scheduler.waiting.append(_request("trace"))
     calls = []
@@ -300,6 +508,8 @@ def _replayable_request(
         needs_rebuild=False,
         skip_reading_prefix_cache=False,
         _kve_reprefill_after_flush=False,
+        _kve_phase4_reprefill_after_pin_release=False,
+        sampling_params=SimpleNamespace(extra_args={}),
         compaction_events=[object()],
     )
 
@@ -307,6 +517,10 @@ def _replayable_request(
 def test_compacted_preempt_flushes_and_requeues_for_reprefill() -> None:
     scheduler = _scheduler_with_requests({"compact"})
     request = _replayable_request("compact", position_offset=128)
+    request.sampling_params.extra_args = {
+        "kve_phase4_trace_id": "trace",
+        "kve_restore_span_ids": ["T0001"],
+    }
     scheduler.requests = {"compact": request}
     freed_visible = []
     freed_encoder = []
@@ -342,11 +556,42 @@ def test_compacted_preempt_flushes_and_requeues_for_reprefill() -> None:
     assert list(scheduler.waiting) == [request]
     assert freed_visible == ["compact"]
     assert freed_encoder == ["compact"]
+    assert scheduler._managed_context_restore_reservations["compact"] == {
+        ("trace", "T0001"),
+    }
     assert released == [
         ("active", "compact", "reprefill-preempt"),
         ("deferred", "compact", "reprefill-preempt"),
         ("reserve", "compact", "reprefill-preempt"),
     ]
+
+
+def test_compacted_preempt_uses_request_kv_swap_before_reprefill() -> None:
+    scheduler = _scheduler_with_requests({"compact"})
+    request = _replayable_request("compact", position_offset=128)
+    scheduler._request_kv_swaps = {
+        "compact": SimpleNamespace(kv_block_count=2),
+    }
+    swap_calls = []
+
+    def start_request_kv_swap_out(request, reason):
+        swap_calls.append((request.request_id, reason))
+        return None
+
+    def fail_reprefill(*args, **kwargs):
+        raise AssertionError("re-prefill should not run after swap succeeds")
+
+    scheduler._start_request_kv_swap_out = start_request_kv_swap_out
+    scheduler._preempt_request_for_reprefill = fail_reprefill
+
+    scheduler._preempt_request(request, time.monotonic())
+
+    assert swap_calls == [("compact", "compacted")]
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert request.num_preemptions == 1
+    assert request.spec_token_ids == []
+    assert not request._kve_reprefill_after_flush
+    assert list(scheduler.waiting) == [request]
 
 
 def test_reprefill_restamp_keeps_protected_prefix_in_zero_frame() -> None:
@@ -395,6 +640,72 @@ def test_reprefill_marker_clears_after_visible_prompt_ready() -> None:
         reason="test-ready",
     )
 
+    assert not request._kve_reprefill_after_flush
+
+
+def test_phase4_pin_release_reprefill_skips_prefix_expectation() -> None:
+    request = _request("trace", expected_cached_tokens=64)
+
+    assert not Scheduler._phase4_pin_release_reprefill_active(request)
+
+    request._kve_phase4_reprefill_after_pin_release = True
+    assert not Scheduler._phase4_pin_release_reprefill_active(request)
+
+    request._kve_reprefill_after_flush = True
+    assert Scheduler._phase4_pin_release_reprefill_active(request)
+
+
+def test_phase4_prefix_miss_requeues_for_reprefill() -> None:
+    scheduler = _scheduler_with_requests({"reader"})
+    request = _request("trace", expected_cached_tokens=64)
+    request.prompt_token_ids = [1] * 512
+    request.sampling_params.extra_args["kve_restore_span_ids"] = ["T0001"]
+    request.spec_token_ids = [99]
+    request.is_prefill_chunk = True
+    request.num_computed_tokens = 256
+    request.num_external_computed_tokens = 3
+    request.num_cached_tokens = 256
+    request.skip_reading_prefix_cache = False
+    request.needs_rebuild = False
+
+    scheduler._managed_context_restore_reservations["reader"] = {
+        ("trace", "T0001"),
+    }
+    scheduler._pending_admission_compaction_ids.add("reader")
+    scheduler.prev_step_scheduled_req_ids.add("reader")
+
+    assert scheduler._phase4_requeue_prefix_miss_for_reprefill(
+        request,
+        "prefix miss",
+    )
+    assert request.num_computed_tokens == 0
+    assert request.num_external_computed_tokens == 0
+    assert request.num_cached_tokens == -1
+    assert request.spec_token_ids == []
+    assert not request.is_prefill_chunk
+    assert request.needs_rebuild
+    assert request.skip_reading_prefix_cache
+    assert request._kve_reprefill_after_flush
+    assert request._kve_phase4_reprefill_after_pin_release
+    assert scheduler._managed_context_restore_reservations["reader"] == {
+        ("trace", "T0001"),
+    }
+    assert "reader" not in scheduler._pending_admission_compaction_ids
+    assert "reader" not in scheduler.prev_step_scheduled_req_ids
+
+
+def test_phase4_prefix_miss_reprefill_can_be_disabled(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_COMPACTED_REPREFILL_ON_PREEMPT", "0")
+    scheduler = _scheduler_with_requests({"reader"})
+    request = _request("trace", expected_cached_tokens=64)
+    request.prompt_token_ids = [1] * 512
+
+    assert not scheduler._phase4_requeue_prefix_miss_for_reprefill(
+        request,
+        "prefix miss",
+    )
     assert not request._kve_reprefill_after_flush
 
 

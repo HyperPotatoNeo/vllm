@@ -38,8 +38,8 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 class CompactingKVCacheManager(FullAttentionManager):
     """FullAttentionManager with block-level KV cache compaction.
 
-    When compaction_window_size > 0, this manager supports evicting
-    stride_blocks oldest post-prompt blocks via compact_request().
+    Supports token-window FIFO eviction when compaction_window_size > 0, and
+    explicit block-range eviction for turn-mode compaction.
     """
 
     def __init__(

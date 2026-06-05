@@ -427,6 +427,24 @@ class ModelConfig:
                 # It's a dict-valued parameter - set it directly
                 setattr(config, key, value)
 
+    def _disable_hf_text_config_sliding_window(self) -> None:
+        """Disable HF sliding-window metadata, tolerating strict config fields."""
+        for config in (self.hf_config, self.hf_text_config):
+            try:
+                object.__setattr__(config, "_vllm_disable_sliding_window", True)
+            except Exception:
+                pass
+
+        try:
+            self.hf_text_config.sliding_window = None
+        except Exception as exc:
+            logger.warning_once(
+                "Could not set hf_text_config.sliding_window=None while "
+                "disabling sliding window; leaving the original value and "
+                "using the _vllm_disable_sliding_window marker. error=%r",
+                exc,
+            )
+
     def __post_init__(
         self,
         # Multimodal config init vars
@@ -602,7 +620,7 @@ class ModelConfig:
         # capped to 0.
         if self.get_sliding_window() == 0:
             self.disable_sliding_window = True
-            self.hf_text_config.sliding_window = None
+            self._disable_hf_text_config_sliding_window()
 
         self.original_max_model_len = self.max_model_len
         self.max_model_len = self.get_and_verify_max_len(self.max_model_len)
@@ -671,7 +689,7 @@ class ModelConfig:
         if self.disable_sliding_window:
             # Set after get_and_verify_max_len to ensure that max_model_len
             # can be correctly capped to sliding window size
-            self.hf_text_config.sliding_window = None
+            self._disable_hf_text_config_sliding_window()
 
         # Avoid running try_verify_and_update_config multiple times
         self.config_updated = False

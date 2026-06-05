@@ -314,7 +314,12 @@ class Gemma4Attention(nn.Module):
         layer_idx = extract_layer_index(prefix)
         layer_type = config.layer_types[layer_idx]
         self.is_sliding = layer_type == "sliding_attention"
-        sliding_window = config.sliding_window if self.is_sliding else None
+        disable_sliding_window = bool(
+            getattr(config, "_vllm_disable_sliding_window", False)
+        )
+        sliding_window = (
+            None if disable_sliding_window else config.sliding_window
+        ) if self.is_sliding else None
 
         # Initialize RoPE based on layer type.
         # Gemma4 uses different RoPE parameters for sliding vs full attention.

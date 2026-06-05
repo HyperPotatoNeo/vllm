@@ -44,6 +44,7 @@ class KVCacheCoordinator(ABC):
         metrics_collector: KVCacheMetricsCollector | None = None,
         compaction_window_size: int = 0,
         compaction_stride: int = 0,
+        compaction_max_turns: int = 0,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
@@ -64,7 +65,7 @@ class KVCacheCoordinator(ABC):
         for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
             spec = kv_cache_group.kv_cache_spec
             if (
-                compaction_window_size > 0
+                (compaction_window_size > 0 or compaction_max_turns > 0)
                 and isinstance(spec, FullAttentionSpec)
             ):
                 mgr = CompactingKVCacheManager(
@@ -306,6 +307,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         metrics_collector: KVCacheMetricsCollector | None = None,
         compaction_window_size: int = 0,
         compaction_stride: int = 0,
+        compaction_max_turns: int = 0,
     ):
         super().__init__(
             kv_cache_config,
@@ -319,6 +321,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             metrics_collector=metrics_collector,
             compaction_window_size=compaction_window_size,
             compaction_stride=compaction_stride,
+            compaction_max_turns=compaction_max_turns,
         )
         self.num_single_type_manager = len(self.single_type_managers)
 
@@ -356,6 +359,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         metrics_collector: KVCacheMetricsCollector | None = None,
         compaction_window_size: int = 0,
         compaction_stride: int = 0,
+        compaction_max_turns: int = 0,
     ):
         super().__init__(
             kv_cache_config,
@@ -369,6 +373,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             metrics_collector=metrics_collector,
             compaction_window_size=compaction_window_size,
             compaction_stride=compaction_stride,
+            compaction_max_turns=compaction_max_turns,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
@@ -425,6 +430,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         metrics_collector: KVCacheMetricsCollector | None = None,
         compaction_window_size: int = 0,
         compaction_stride: int = 0,
+        compaction_max_turns: int = 0,
     ):
         super().__init__(
             kv_cache_config,
@@ -438,6 +444,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             metrics_collector=metrics_collector,
             compaction_window_size=compaction_window_size,
             compaction_stride=compaction_stride,
+            compaction_max_turns=compaction_max_turns,
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -603,10 +610,12 @@ def get_kv_cache_coordinator(
     metrics_collector: KVCacheMetricsCollector | None = None,
     compaction_window_size: int = 0,
     compaction_stride: int = 0,
+    compaction_max_turns: int = 0,
 ) -> KVCacheCoordinator:
     compaction_kwargs = dict(
         compaction_window_size=compaction_window_size,
         compaction_stride=compaction_stride,
+        compaction_max_turns=compaction_max_turns,
     )
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(

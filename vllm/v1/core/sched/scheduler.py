@@ -205,6 +205,22 @@ class ManagedContextCPULoadStart:
     retryable: bool = False
 
 
+@dataclass
+class RequestKVSwap:
+    request_id: str
+    cpu_block_ids_by_group: tuple[list[int], ...]
+    logical_start_by_group: tuple[list[int], ...]
+    kv_block_count: int
+    num_computed_tokens: int
+    position_offset: int
+    status: str
+    created_at: float
+    entries: list[tuple[Any, list[Any]]]
+    store_event_id: int | None = None
+    load_event_id: int | None = None
+    last_error: str | None = None
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -577,6 +593,24 @@ class Scheduler(SchedulerInterface):
         self._managed_context_cpu_max_blocks = self._env_int(
             "KVE_MANAGED_CONTEXT_CPU_OFFLOAD_MAX_BLOCKS", 0
         )
+        self._managed_context_cpu_evict_on_capacity = (
+            os.environ.get(
+                "KVE_MANAGED_CONTEXT_CPU_EVICT_ON_CAPACITY",
+                "0",
+            )
+            .strip()
+            .lower()
+            not in ("0", "false", "no", "off")
+        )
+        self._managed_context_skip_compaction_on_cpu_capacity = (
+            os.environ.get(
+                "KVE_MANAGED_CONTEXT_SKIP_COMPACTION_ON_CPU_CAPACITY",
+                "1",
+            )
+            .strip()
+            .lower()
+            not in ("0", "false", "no", "off")
+        )
         self._managed_context_cpu_free_block_ids: deque[int] = deque(
             range(max(0, self._managed_context_cpu_max_blocks))
         )
@@ -587,6 +621,12 @@ class Scheduler(SchedulerInterface):
         self._managed_context_load_events_to_submit: dict[
             int, ManagedContextCopyEvent
         ] = {}
+        self._managed_context_cpu_max_pending_store_events = self._env_int(
+            "KVE_MANAGED_CONTEXT_CPU_MAX_PENDING_STORE_EVENTS", 0
+        )
+        self._managed_context_cpu_max_pending_load_events = self._env_int(
+            "KVE_MANAGED_CONTEXT_CPU_MAX_PENDING_LOAD_EVENTS", 0
+        )
         self._managed_context_store_event_to_span: dict[
             int, ManagedContextSpan
         ] = {}
@@ -595,6 +635,12 @@ class Scheduler(SchedulerInterface):
             str, ManagedContextPendingLoad
         ] = {}
         self._managed_context_finished_load_req_ids: set[str] = set()
+        self._request_kv_swaps: dict[str, RequestKVSwap] = {}
+        self._request_kv_swap_ready_queue: deque[str] = deque()
+        self._request_kv_swap_store_event_to_request_id: dict[int, str] = {}
+        self._request_kv_swap_load_event_to_request_id: dict[int, str] = {}
+        self._request_kv_swap_finished_load_req_ids: set[str] = set()
+        self._request_kv_swap_suspended = False
         self._managed_context_restore_reservations: dict[
             str, set[tuple[str, str]]
         ] = {}
@@ -664,10 +710,16 @@ class Scheduler(SchedulerInterface):
             else:
                 logger.warning(
                     "[MANAGED-CONTEXT] CPU archive enabled: async transfers, "
-                    "max_cpu_blocks=%d hot_gpu_blocks=%d policy=%s",
+                    "max_cpu_blocks=%d hot_gpu_blocks=%d policy=%s "
+                    "evict_on_capacity=%s max_pending_store=%d "
+                    "max_pending_load=%d skip_compaction_on_capacity=%s",
                     self._managed_context_cpu_max_blocks,
                     self._managed_context_hot_gpu_stats.budget_blocks,
                     self._managed_context_cpu_offload_policy,
+                    self._managed_context_cpu_evict_on_capacity,
+                    self._managed_context_cpu_max_pending_store_events,
+                    self._managed_context_cpu_max_pending_load_events,
+                    self._managed_context_skip_compaction_on_cpu_capacity,
                 )
         if not self._managed_context_cpu_archive_enabled:
             self._managed_context_hot_gpu_stats.budget_blocks = 0
@@ -761,6 +813,13 @@ class Scheduler(SchedulerInterface):
         for span in self._managed_context_archive.values():
             archive_by_status[span.status] += 1
             archive_blocks_by_status[span.status] += span.kv_block_count
+        protected_archive_keys = self._managed_context_cpu_archive_protected_keys()
+        unprotected_gpu_pinned_spans = 0
+        unprotected_gpu_pinned_blocks = 0
+        for key, span in self._managed_context_archive.items():
+            if span.status == "gpu_pinned" and key not in protected_archive_keys:
+                unprotected_gpu_pinned_spans += 1
+                unprotected_gpu_pinned_blocks += span.kv_block_count
 
         active_restore_blocks = sum(
             self._kve_blocks_from_entries(restore.entries)
@@ -792,6 +851,16 @@ class Scheduler(SchedulerInterface):
             "deferred_restore_blocks": deferred_restore_blocks,
             "pending_loads": len(self._managed_context_pending_loads),
             "pending_load_blocks": pending_load_blocks,
+            "cpu_pending_store_events": len(
+                self._managed_context_store_event_to_span
+            ),
+            "cpu_pending_load_events": len(
+                self._managed_context_load_event_to_request_id
+            ),
+            "cpu_transfer_caps": {
+                "store": self._managed_context_cpu_max_pending_store_events,
+                "load": self._managed_context_cpu_max_pending_load_events,
+            },
             "restore_reservations": len(
                 self._managed_context_restore_reservations
             ),
@@ -801,6 +870,8 @@ class Scheduler(SchedulerInterface):
             ),
             "cpu_free_blocks": len(self._managed_context_cpu_free_block_ids),
             "cpu_max_blocks": self._managed_context_cpu_max_blocks,
+            "unprotected_gpu_pinned_spans": unprotected_gpu_pinned_spans,
+            "unprotected_gpu_pinned_blocks": unprotected_gpu_pinned_blocks,
             "hot_gpu": {
                 "budget": self._managed_context_hot_gpu_stats.budget_blocks,
                 "resident": self._managed_context_hot_gpu_stats.resident_blocks,
@@ -1049,6 +1120,7 @@ class Scheduler(SchedulerInterface):
 
         self._prune_phase4_pins()
         self.kv_cache_manager.new_step_starts()
+        self._retry_managed_context_gpu_pinned_offloads("schedule-start")
 
         # First, schedule the RUNNING requests.
         if self._compaction_block_aligned_finish:
@@ -1101,12 +1173,18 @@ class Scheduler(SchedulerInterface):
                 if _hidden_kv_tokens is not None
                 else 0
             )
+            # Normal decode keeps one position in reserve for sampling at the
+            # model-length boundary. Auto-pad forwards are internal no-sample
+            # steps, so they must be allowed to materialize the final valid
+            # token at position max_model_len - 1.
+            max_sched_len = self.max_model_len
+            if not request.padding_pending:
+                max_sched_len -= 1
             num_new_tokens = min(
                 num_new_tokens,
                 max(
                     0,
-                    self.max_model_len
-                    - 1
+                    max_sched_len
                     - hidden_kv_num_tokens
                     - request.num_computed_tokens,
                 ),
@@ -1305,9 +1383,20 @@ class Scheduler(SchedulerInterface):
                     self._validate_managed_context_restore_request(request)
                 )
                 if restore_error is not None:
-                    request_queue.pop_request()
-                    self._abort_waiting_phase4_request(request, restore_error)
-                    continue
+                    if self._drop_unavailable_managed_context_restore(
+                        request,
+                        restore_error,
+                    ):
+                        restore_spans = []
+                    else:
+                        request_queue.pop_request()
+                        self._abort_waiting_phase4_request(request, restore_error)
+                        continue
+                if restore_spans:
+                    self._reserve_managed_context_restore_spans(
+                        request_id,
+                        restore_spans,
+                    )
                 offload_spans, offload_error = (
                     self._validate_managed_context_offload_request(request)
                 )
@@ -1617,6 +1706,11 @@ class Scheduler(SchedulerInterface):
                     expected_cached_tokens = self._phase4_expected_cached_tokens(
                         request
                     )
+                    phase4_refill_after_pin_release = (
+                        self._phase4_pin_release_reprefill_active(request)
+                    )
+                    if phase4_refill_after_pin_release:
+                        inherited_offset = request.position_offset
                     if (
                         (
                             num_new_local_computed_tokens > 0
@@ -1624,6 +1718,7 @@ class Scheduler(SchedulerInterface):
                         )
                         and self._compaction_enabled
                         and self._compaction_max_turns > 0
+                        and not phase4_refill_after_pin_release
                     ):
                         sys_boundary_raw = self._effective_prompt_tokens(request)
                         extra_args = (
@@ -1654,9 +1749,11 @@ class Scheduler(SchedulerInterface):
                                     num_new_local_computed_tokens,
                                 )
                         else:
-                            pinned = self._phase4_pinned_cache_blocks(
-                                phase4_trace_id, expected_cached_tokens
-                            )
+                            pinned = None
+                            if not phase4_refill_after_pin_release:
+                                pinned = self._phase4_pinned_cache_blocks(
+                                    phase4_trace_id, expected_cached_tokens
+                                )
                             phase4_pin_trace_to_mark_consumed = ""
                             if pinned is not None:
                                 (
@@ -1841,7 +1938,12 @@ class Scheduler(SchedulerInterface):
                                     f"expected_nuf={request.num_prompt_tokens - expected_cached_tokens} "
                                     f"position_offset={inherited_offset}"
                                 )
-                                if (
+                                if phase4_refill_after_pin_release:
+                                    logger.warning(
+                                        "[PHASE4-PREFIX-REFILL] %s",
+                                        phase4_prefix_miss_msg,
+                                    )
+                                elif (
                                     os.environ.get(
                                         "KVE_ALLOW_PHASE4_REFILL", ""
                                     ) == "1"
@@ -1850,6 +1952,15 @@ class Scheduler(SchedulerInterface):
                                         "[PHASE4-PREFIX-REFILL-ALLOWED] %s",
                                         phase4_prefix_miss_msg,
                                     )
+                                elif self._phase4_requeue_prefix_miss_for_reprefill(
+                                    request, phase4_prefix_miss_msg
+                                ):
+                                    request_queue.pop_request()
+                                    clear_pending_phase4_pin_consumed()
+                                    step_skipped_waiting.prepend_request(
+                                        request
+                                    )
+                                    continue
                                 else:
                                     logger.error(
                                         "[PHASE4-PREFIX-ABORT] %s",
@@ -2208,6 +2319,19 @@ class Scheduler(SchedulerInterface):
                     step_skipped_waiting.prepend_request(request)
                     continue
 
+                visible_allocation_demand = (
+                    self._managed_context_visible_allocation_demand(
+                        request,
+                        num_new_tokens=num_new_tokens,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        num_external_computed_tokens=num_external_computed_tokens,
+                        num_encoder_tokens=num_encoder_tokens,
+                    )
+                    if self._managed_context_enabled
+                    else -1
+                )
                 restore_position_aligned = False
                 if restore_spans:
                     if not restore_defer_until_prefill:
@@ -2260,6 +2384,30 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    logger.warning(
+                        "[SCHED-WAITING-ALLOC-NONE] req=%s prompt=%d "
+                        "tokens=%d computed=%d local=%d external=%d "
+                        "new_tokens=%d token_budget=%d running=%d "
+                        "waiting=%d skipped=%d free_gpu_blocks=%d "
+                        "estimated_visible_blocks=%d visible_blocks=%d "
+                        "position_offset=%d managed=%s",
+                        request.request_id[:8],
+                        request.num_prompt_tokens,
+                        request.num_tokens,
+                        num_computed_tokens,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                        num_new_tokens,
+                        token_budget,
+                        len(self.running),
+                        len(request_queue),
+                        len(self.skipped_waiting),
+                        self._managed_context_min_free_gpu_blocks(),
+                        visible_allocation_demand,
+                        self._kve_request_visible_block_count(request),
+                        request.position_offset,
+                        self._kve_managed_context_diag_summary(),
+                    )
                     if (
                         phase4_pin_trace_to_mark_consumed
                         and os.environ.get("KVE_TRACE_PHASE4_SCHED", "") == "1"
@@ -2302,6 +2450,35 @@ class Scheduler(SchedulerInterface):
                         request.position_offset = (
                             position_offset_before_restore_align
                         )
+                    if (
+                        not self.running
+                        and visible_allocation_demand > 0
+                    ):
+                        before_pools = self._kve_gpu_block_pool_diag_summary()
+                        before_managed = self._kve_managed_context_diag_summary()
+                        released_hot_gpu_blocks = (
+                            self._managed_context_free_hot_gpu_for_blocks(
+                                visible_allocation_demand,
+                                protected=(
+                                    self._managed_context_cpu_archive_protected_keys()
+                                ),
+                            )
+                        )
+                        if released_hot_gpu_blocks:
+                            logger.warning(
+                                "[MANAGED-CONTEXT-HOT-GPU-ALLOC-PRESSURE] "
+                                "req=%s released=%d needed=%d "
+                                "pools_before=%s managed_before=%s "
+                                "pools_after=%s managed_after=%s",
+                                request.request_id[:8],
+                                released_hot_gpu_blocks,
+                                visible_allocation_demand,
+                                before_pools,
+                                before_managed,
+                                self._kve_gpu_block_pool_diag_summary(),
+                                self._kve_managed_context_diag_summary(),
+                            )
+                            continue
                     if (
                         not self.running
                         and self._release_phase4_pressure_pin(
@@ -2685,6 +2862,12 @@ class Scheduler(SchedulerInterface):
         # frame. Flush and re-prefill that compacted state instead of treating
         # this as ordinary preemption.
         if request.position_offset > 0:
+            if self._preempt_request_for_kv_swap(
+                request,
+                timestamp,
+                reason="compacted",
+            ):
+                return
             if self._preempt_request_for_reprefill(
                 request,
                 timestamp,
@@ -2706,6 +2889,12 @@ class Scheduler(SchedulerInterface):
             request.request_id in self._managed_context_active_restores
             or request.request_id in self._managed_context_deferred_restores
         ):
+            if self._preempt_request_for_kv_swap(
+                request,
+                timestamp,
+                reason="managed-context-restore",
+            ):
+                return
             if self._preempt_request_for_reprefill(
                 request,
                 timestamp,
@@ -2733,6 +2922,42 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
+
+    def _preempt_request_for_kv_swap(
+        self,
+        request: Request,
+        timestamp: float,
+        *,
+        reason: str,
+    ) -> bool:
+        error = self._start_request_kv_swap_out(request, reason)
+        if error is not None:
+            if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
+                logger.warning(
+                    "[REQUEST-KV-SWAP-SKIP] req=%s reason=%s error=%s",
+                    request.request_id[:8],
+                    reason,
+                    error,
+                )
+            return False
+        request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        request.num_preemptions += 1
+        if request.spec_token_ids:
+            request.spec_token_ids = []
+        if self.log_stats:
+            request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
+        self.waiting.prepend_request(request)
+        logger.warning(
+            "[REQUEST-KV-SWAP-OUT] req=%s reason=%s blocks=%d "
+            "computed=%d position_offset=%d preemptions=%d",
+            request.request_id[:8],
+            reason,
+            self._request_kv_swaps[request.request_id].kv_block_count,
+            request.num_computed_tokens,
+            request.position_offset,
+            request.num_preemptions,
+        )
+        return True
 
     def _preempt_request_for_reprefill(
         self,
@@ -2765,51 +2990,21 @@ class Scheduler(SchedulerInterface):
             return False
 
         request_id = request.request_id
-        if request_id in self._managed_context_pending_loads:
-            pending_released = self._release_managed_context_pending_load(
-                request_id,
-                "reprefill-preempt",
-                only_if_safe=True,
-            )
-            if not pending_released:
-                logger.warning(
-                    "[COMPACT-REPREFILL-SKIP] req=%s reason=%s "
-                    "managed-context load in flight",
-                    request_id[:8],
-                    reason,
-                )
-                return False
-
         old_computed = request.num_computed_tokens
         old_position_offset = request.position_offset
         old_prompt_tokens = request.num_prompt_tokens
         old_num_tokens = request.num_tokens
         old_compaction_events = len(request.compaction_events or [])
 
-        self._release_managed_context_active_restore(
-            request_id, "reprefill-preempt"
-        )
-        self._release_managed_context_deferred_restore(
-            request_id, "reprefill-preempt"
-        )
-        self._release_managed_context_restore_reservation(
-            request_id, "reprefill-preempt"
-        )
-        self._pending_admission_compaction_ids.discard(request_id)
-        self.kv_cache_manager.free(request)
-        self.encoder_cache_manager.free(request)
-
-        request.status = RequestStatus.PREEMPTED
-        request.num_computed_tokens = 0
-        request.num_external_computed_tokens = 0
-        request.num_cached_tokens = -1
-        request.num_preemptions += 1
-        request.spec_token_ids = []
-        request.is_prefill_chunk = False
-        request.needs_rebuild = True
-        request.skip_reading_prefix_cache = True
-        request._kve_reprefill_after_flush = True  # type: ignore[attr-defined]
-        self.prev_step_scheduled_req_ids.discard(request_id)
+        if not self._mark_request_for_full_reprefill(
+            request,
+            "reprefill-preempt",
+            status=RequestStatus.PREEMPTED,
+            free_request_kv=True,
+            count_preemption=True,
+            skip_log_reason=reason,
+        ):
+            return False
         self.waiting.prepend_request(request)
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
@@ -2826,6 +3021,77 @@ class Scheduler(SchedulerInterface):
             old_compaction_events,
             request.num_preemptions,
             timestamp,
+        )
+        return True
+
+    def _mark_request_for_full_reprefill(
+        self,
+        request: Request,
+        reason: str,
+        *,
+        status: RequestStatus | None = None,
+        position_offset: int | None = None,
+        phase4_pin_release: bool = False,
+        free_request_kv: bool = False,
+        count_preemption: bool = False,
+        skip_log_reason: str | None = None,
+    ) -> bool:
+        """Reset scheduler-visible state so a request can replay its prompt."""
+        request_id = request.request_id
+        if request.prompt_token_ids is None:
+            logger.warning(
+                "[COMPACT-REPREFILL-SKIP] req=%s reason=%s "
+                "prompt_token_ids unavailable",
+                request_id[:8],
+                skip_log_reason or reason,
+            )
+            return False
+
+        if request_id in self._managed_context_pending_loads:
+            pending_released = self._release_managed_context_pending_load(
+                request_id,
+                reason,
+                only_if_safe=True,
+            )
+            if not pending_released:
+                logger.warning(
+                    "[COMPACT-REPREFILL-SKIP] req=%s reason=%s "
+                    "managed-context load in flight",
+                    request_id[:8],
+                    skip_log_reason or reason,
+                )
+                return False
+
+        preserve_phase4_reprefill = (
+            phase4_pin_release
+            or self._phase4_pin_release_reprefill_active(request)
+        )
+        self._release_managed_context_active_restore(request_id, reason)
+        self._release_managed_context_deferred_restore(request_id, reason)
+        self._release_managed_context_restore_reservation(request_id, reason)
+        self._reserve_managed_context_restore_request(request)
+        self._pending_admission_compaction_ids.discard(request_id)
+        self.prev_step_scheduled_req_ids.discard(request_id)
+        if free_request_kv:
+            self.kv_cache_manager.free(request)
+            self.encoder_cache_manager.free(request)
+
+        if status is not None:
+            request.status = status
+        if position_offset is not None:
+            request.position_offset = position_offset
+        request.num_computed_tokens = 0
+        request.num_external_computed_tokens = 0
+        request.num_cached_tokens = -1
+        if count_preemption:
+            request.num_preemptions += 1
+        request.spec_token_ids = []
+        request.is_prefill_chunk = False
+        request.needs_rebuild = True
+        request.skip_reading_prefix_cache = True
+        request._kve_reprefill_after_flush = True  # type: ignore[attr-defined]
+        request._kve_phase4_reprefill_after_pin_release = (  # type: ignore[attr-defined]
+            preserve_phase4_reprefill
         )
         return True
 
@@ -2877,6 +3143,12 @@ class Scheduler(SchedulerInterface):
         if request.num_computed_tokens < request.num_prompt_tokens:
             return
         request._kve_reprefill_after_flush = False  # type: ignore[attr-defined]
+        if getattr(
+            request,
+            "_kve_phase4_reprefill_after_pin_release",
+            False,
+        ):
+            request._kve_phase4_reprefill_after_pin_release = False  # type: ignore[attr-defined]
         if os.environ.get("KVE_TRACE_COMPACT_REPREFILL") == "1":
             logger.warning(
                 "[COMPACT-REPREFILL-DONE] req=%s reason=%s "
@@ -2887,6 +3159,50 @@ class Scheduler(SchedulerInterface):
                 request.num_prompt_tokens,
                 request.position_offset,
             )
+
+    def _phase4_requeue_prefix_miss_for_reprefill(
+        self,
+        request: Request,
+        reason: str,
+    ) -> bool:
+        raw_enabled = os.environ.get(
+            "KVE_COMPACTED_REPREFILL_ON_PREEMPT",
+            "1",
+        )
+        if raw_enabled.lower() in ("0", "false", "no", "off"):
+            return False
+        if request.prompt_token_ids is None:
+            return False
+
+        request_id = request.request_id
+        if not self._mark_request_for_full_reprefill(
+            request,
+            "phase4-prefix-miss-reprefill",
+            phase4_pin_release=True,
+            skip_log_reason=reason,
+        ):
+            return False
+
+        logger.warning(
+            "[PHASE4-PREFIX-REPREFILL] req=%s prompt=%d "
+            "position_offset=%d reason=%s",
+            request_id[:8],
+            request.num_prompt_tokens,
+            request.position_offset,
+            reason,
+        )
+        return True
+
+    @staticmethod
+    def _phase4_pin_release_reprefill_active(request: Request) -> bool:
+        return bool(
+            getattr(
+                request,
+                "_kve_phase4_reprefill_after_pin_release",
+                False,
+            )
+            and getattr(request, "_kve_reprefill_after_flush", False)
+        )
 
     # --- Compaction helpers ---
 
@@ -3299,7 +3615,7 @@ class Scheduler(SchedulerInterface):
         explicit_block_range: tuple[int, int] | None = None
         last_turn_evicted = -1
         stride_used = 0
-        archived_span_ids: list[str] = []
+        archived_span_ids: list[str] | None = []
         if self._compaction_max_turns > 0:
             plan = self._plan_turn_evict_range(
                 request, block_size,
@@ -3321,6 +3637,8 @@ class Scheduler(SchedulerInterface):
                 last_turn_evicted=last_turn_evicted,
                 stride_used=stride_used,
             )
+            if archived_span_ids is None:
+                return 0
             tokens_evicted = compaction_mgr.compact_request(
                 request.request_id,
                 effective_prompt,
@@ -3890,13 +4208,21 @@ class Scheduler(SchedulerInterface):
     def _phase4_has_queued_successor(
         self, trace_id: str, pin: Phase4Pin
     ) -> bool:
+        return bool(self._phase4_queued_successors(trace_id, pin))
+
+    def _phase4_queued_successors(
+        self, trace_id: str, pin: Phase4Pin
+    ) -> list[Request]:
         if not trace_id:
-            return False
+            return []
+        successors: list[Request] = []
         for request_queue in (
             getattr(self, "waiting", ()),
             getattr(self, "skipped_waiting", ()),
         ):
             for request in request_queue:
+                if self._phase4_pin_release_reprefill_active(request):
+                    continue
                 if self._phase4_trace_id(request) != trace_id:
                     continue
                 expected_cached_tokens = self._phase4_expected_cached_tokens(
@@ -3906,8 +4232,102 @@ class Scheduler(SchedulerInterface):
                     expected_cached_tokens is not None
                     and expected_cached_tokens <= pin.token_count
                 ):
-                    return True
-        return False
+                    successors.append(request)
+        return successors
+
+    def _phase4_pin_inherited_offset(
+        self,
+        pin: Phase4Pin,
+        expected_cached_tokens: int,
+    ) -> int:
+        if expected_cached_tokens <= 0:
+            return 0
+        first_entry = pin.entries[0] if pin.entries else None
+        if first_entry is None:
+            return 0
+        manager, blocks = first_entry
+        block_size = getattr(manager, "block_size", None)
+        if block_size is None:
+            block_size = getattr(
+                self,
+                "block_size",
+                getattr(self, "_compaction_block_size", 16),
+            )
+        block_size = max(1, int(block_size))
+        num_blocks = expected_cached_tokens // block_size
+        for block_idx, block in enumerate(blocks[:num_blocks]):
+            logical_start = getattr(block, "logical_start", -1)
+            if logical_start < 0:
+                continue
+            block_offset = logical_start - block_idx * block_size
+            if block_offset != 0:
+                return int(block_offset)
+        return 0
+
+    def _phase4_abandon_queued_successors_for_reprefill(
+        self,
+        trace_id: str,
+        pin: Phase4Pin,
+        *,
+        reason: str,
+    ) -> int:
+        if (
+            os.environ.get(
+                "KVE_PHASE4_ABANDON_QUEUED_ON_STALL",
+                "1",
+            )
+            .lower()
+            in ("0", "false", "no", "off")
+        ):
+            return 0
+        abandoned = 0
+        for request in self._phase4_queued_successors(trace_id, pin):
+            expected_cached_tokens = self._phase4_expected_cached_tokens(request)
+            if expected_cached_tokens is None:
+                continue
+            request_id = getattr(request, "request_id", "")
+            if request.status not in (
+                RequestStatus.WAITING,
+                RequestStatus.PREEMPTED,
+            ):
+                logger.warning(
+                    "[PHASE4-PIN-ABANDON-SKIP] req=%s trace=%s reason=%s "
+                    "status=%s",
+                    str(request_id)[:8],
+                    trace_id,
+                    reason,
+                    request.status,
+                )
+                continue
+            inherited_offset = self._phase4_pin_inherited_offset(
+                pin,
+                expected_cached_tokens,
+            )
+            if not self._mark_request_for_full_reprefill(
+                request,
+                "phase4-pin-abandon",
+                position_offset=inherited_offset,
+                phase4_pin_release=True,
+                skip_log_reason=reason,
+            ):
+                continue
+            if request_id:
+                self._clear_phase4_pin_consumed(trace_id, request_id)
+            abandoned += 1
+            logger.warning(
+                "[PHASE4-PIN-ABANDON] req=%s trace=%s reason=%s "
+                "expected_cached=%d position_offset=%d waiting=%d "
+                "skipped=%d pins=%d",
+                str(request_id)[:8],
+                trace_id,
+                reason,
+                expected_cached_tokens,
+                inherited_offset,
+                len(getattr(self, "waiting", ())),
+                len(getattr(self, "skipped_waiting", ())),
+                len(self._phase4_pinned_blocks),
+            )
+        return abandoned
 
     def _phase4_pin_is_prunable(
         self,
@@ -4005,10 +4425,23 @@ class Scheduler(SchedulerInterface):
                 request.request_id for request in self.running
             }:
                 continue
-            if self._phase4_has_queued_successor(trace_id, pin):
-                continue
+            queued_successors = self._phase4_queued_successors(trace_id, pin)
+            force_stall_release = False
+            if queued_successors:
+                if reason != "scheduler-stall-pressure":
+                    continue
+                abandoned = self._phase4_abandon_queued_successors_for_reprefill(
+                    trace_id,
+                    pin,
+                    reason=reason,
+                )
+                if abandoned <= 0:
+                    continue
+                force_stall_release = True
             consumed_at = pin.consumed_at or pin.created_at
             if (
+                not force_stall_release
+                and
                 pin.consumed_by_request_id is not None
                 and grace_seconds > 0
                 and now - consumed_at < grace_seconds
@@ -4031,22 +4464,41 @@ class Scheduler(SchedulerInterface):
             return False
         before_pools = self._kve_gpu_block_pool_diag_summary()
         before_managed = self._kve_managed_context_diag_summary()
-        released = self._release_phase4_pressure_pin(
-            "scheduler-stall-pressure"
+        release_limit = max(
+            1,
+            self._env_int("KVE_PHASE4_STALL_PRESSURE_RELEASE_MAX", 8),
         )
-        if released:
-            logger.warning(
-                "[PHASE4-PIN-STALL-PRESSURE] released=1 waiting=%d "
-                "skipped=%d pools_before=%s managed_before=%s "
-                "pools_after=%s managed_after=%s",
-                len(self.waiting),
-                len(self.skipped_waiting),
-                before_pools,
-                before_managed,
-                self._kve_gpu_block_pool_diag_summary(),
-                self._kve_managed_context_diag_summary(),
+        released_hot_gpu_blocks = 0
+        released_phase4_pins = 0
+        for _ in range(release_limit):
+            released_hot = self._managed_context_release_hot_gpu_pressure(
+                "scheduler-stall-pressure"
             )
-        return released
+            if released_hot:
+                released_hot_gpu_blocks += released_hot
+                continue
+            if self._release_phase4_pressure_pin("scheduler-stall-pressure"):
+                released_phase4_pins += 1
+                continue
+            break
+        if not released_hot_gpu_blocks and not released_phase4_pins:
+            return False
+        logger.warning(
+            "[PHASE4-STALL-PRESSURE-RELEASE] hot_gpu_blocks=%d "
+            "phase4_pins=%d limit=%d waiting=%d skipped=%d "
+            "pools_before=%s managed_before=%s pools_after=%s "
+            "managed_after=%s",
+            released_hot_gpu_blocks,
+            released_phase4_pins,
+            release_limit,
+            len(self.waiting),
+            len(self.skipped_waiting),
+            before_pools,
+            before_managed,
+            self._kve_gpu_block_pool_diag_summary(),
+            self._kve_managed_context_diag_summary(),
+        )
+        return True
 
     def _pin_phase4_request_blocks(self, request: Request) -> None:
         trace_id = self._phase4_trace_id(request)
@@ -4143,6 +4595,414 @@ class Scheduler(SchedulerInterface):
                 released_blocks += len(blocks)
         return released_blocks
 
+    def _request_kv_swap_enabled(self) -> bool:
+        return (
+            os.environ.get("KVE_REQUEST_KV_SWAP", "0")
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+            and self._managed_context_cpu_archive_enabled
+            and not self._request_kv_swap_suspended
+        )
+
+    def _request_kv_swap_max_pending_stores(self) -> int:
+        return max(1, self._env_int("KVE_REQUEST_KV_SWAP_MAX_PENDING_STORES", 1))
+
+    def _request_kv_swap_max_pending_loads(self) -> int:
+        return max(1, self._env_int("KVE_REQUEST_KV_SWAP_MAX_PENDING_LOADS", 1))
+
+    def _request_kv_swap_pending_stores(self) -> int:
+        return sum(
+            1
+            for swap in self._request_kv_swaps.values()
+            if swap.status == "store_pending"
+        )
+
+    def _request_kv_swap_pending_loads(self) -> int:
+        return sum(
+            1
+            for swap in self._request_kv_swaps.values()
+            if swap.status == "load_pending"
+        )
+
+    def _request_kv_swap_remove_ready(self, request_id: str) -> None:
+        try:
+            self._request_kv_swap_ready_queue.remove(request_id)
+        except ValueError:
+            pass
+
+    def _release_request_kv_swap_entries(
+        self, request_id: str, entries: list[tuple[Any, list[Any]]]
+    ) -> int:
+        released_blocks = 0
+        for manager, blocks in entries:
+            if hasattr(manager, "req_to_blocks"):
+                manager.req_to_blocks.pop(request_id, None)
+            if hasattr(manager, "num_cached_block"):
+                manager.num_cached_block.pop(request_id, None)
+            if blocks:
+                manager.block_pool.free_blocks(reversed(blocks))
+                released_blocks += len(blocks)
+        return released_blocks
+
+    def _start_request_kv_swap_out(
+        self, request: Request, reason: str
+    ) -> str | None:
+        if not self._request_kv_swap_enabled():
+            return "request KV swap is disabled"
+        request_id = request.request_id
+        if request_id in self._request_kv_swaps:
+            return "request KV swap is already active"
+        if request.padding_pending or request.num_output_placeholders:
+            return "request has pending padding/output placeholders"
+        if request_id in self._managed_context_active_restores:
+            return "request has active managed-context hidden KV"
+        if request_id in self._managed_context_deferred_restores:
+            return "request has deferred managed-context hidden KV"
+        if request_id in self._managed_context_pending_loads:
+            return "request has managed-context load in flight"
+        if self._request_kv_swap_pending_stores() >= (
+            self._request_kv_swap_max_pending_stores()
+        ):
+            return "request KV swap store queue is full"
+        limit_error = self._managed_context_cpu_store_transfer_limit_error()
+        if limit_error is not None:
+            return limit_error
+
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        if len(managers) != 1:
+            return "request KV swap currently supports one KV cache group"
+
+        entries: list[tuple[Any, list[Any]]] = []
+        logical_start_by_group: list[list[int]] = []
+        total_blocks = 0
+        for manager in managers:
+            blocks = list(manager.req_to_blocks.get(request_id, []))
+            if not blocks:
+                return "request has no GPU KV blocks"
+            entries.append((manager, blocks))
+            logical_start_by_group.append(
+                [int(block.logical_start) for block in blocks]
+            )
+            total_blocks += len(blocks)
+
+        cpu_block_ids = self._alloc_managed_context_cpu_blocks(total_blocks)
+        if cpu_block_ids is None:
+            return (
+                f"request KV swap needs {total_blocks} CPU blocks, "
+                f"available={len(self._managed_context_cpu_free_block_ids)} "
+                f"max={self._managed_context_cpu_max_blocks}"
+            )
+
+        cpu_by_group: list[list[int]] = []
+        offset = 0
+        for starts in logical_start_by_group:
+            count = len(starts)
+            cpu_by_group.append(cpu_block_ids[offset : offset + count])
+            offset += count
+        if offset != len(cpu_block_ids):
+            self._managed_context_free_cpu_block_ids((cpu_block_ids,))
+            return "request KV swap has inconsistent block metadata"
+
+        event_id = self._next_managed_context_transfer_event_id()
+        swap = RequestKVSwap(
+            request_id=request_id,
+            cpu_block_ids_by_group=tuple(cpu_by_group),
+            logical_start_by_group=tuple(logical_start_by_group),
+            kv_block_count=total_blocks,
+            num_computed_tokens=request.num_computed_tokens,
+            position_offset=request.position_offset,
+            status="store_pending",
+            created_at=time.monotonic(),
+            entries=entries,
+            store_event_id=event_id,
+        )
+        self._request_kv_swaps[request_id] = swap
+        self._request_kv_swap_store_event_to_request_id[event_id] = request_id
+        self._managed_context_store_events_to_submit[event_id] = (
+            ManagedContextCopyEvent(
+                event_id=event_id,
+                gpu_block_ids=self._managed_context_gpu_block_ids(entries),
+                cpu_block_ids=cpu_block_ids,
+            )
+        )
+        if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
+            logger.warning(
+                "[REQUEST-KV-SWAP-OUT-SUBMIT] req=%s event=%d reason=%s "
+                "blocks=%d computed=%d position_offset=%d cpu_blocks=%s",
+                request_id[:8],
+                event_id,
+                reason,
+                total_blocks,
+                request.num_computed_tokens,
+                request.position_offset,
+                cpu_by_group,
+            )
+        return None
+
+    def _complete_request_kv_swap_store(self, event_id: int) -> None:
+        request_id = self._request_kv_swap_store_event_to_request_id.pop(
+            event_id, None
+        )
+        if request_id is None:
+            return
+        swap = self._request_kv_swaps.get(request_id)
+        if swap is None or swap.status not in ("store_pending", "expired"):
+            return
+        released_blocks = self._release_request_kv_swap_entries(
+            request_id, swap.entries
+        )
+        swap.entries = []
+        swap.store_event_id = None
+        if swap.status == "expired":
+            self._managed_context_free_cpu_block_ids(swap.cpu_block_ids_by_group)
+            self._request_kv_swaps.pop(request_id, None)
+            self._request_kv_swap_remove_ready(request_id)
+            self.requests.pop(request_id, None)
+            return
+        swap.status = "swapped"
+        self._request_kv_swap_remove_ready(request_id)
+        self._request_kv_swap_ready_queue.append(request_id)
+        if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
+            logger.warning(
+                "[REQUEST-KV-SWAP-STORE-DONE] req=%s event=%d "
+                "released_gpu_blocks=%d cpu_blocks=%s",
+                request_id[:8],
+                event_id,
+                released_blocks,
+                swap.cpu_block_ids_by_group,
+            )
+
+    def _start_request_kv_swap_load(
+        self, request: Request
+    ) -> str | None:
+        request_id = request.request_id
+        swap = self._request_kv_swaps.get(request_id)
+        if swap is None:
+            return "request KV swap state is missing"
+        if swap.status != "swapped":
+            return f"request KV swap is not ready to load: {swap.status}"
+        if self._request_kv_swap_pending_loads() >= (
+            self._request_kv_swap_max_pending_loads()
+        ):
+            return "request KV swap load queue is full"
+        limit_error = self._managed_context_cpu_load_transfer_limit_error()
+        if limit_error is not None:
+            return limit_error
+
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        if len(managers) != len(swap.logical_start_by_group):
+            return "request KV swap has incomplete manager metadata"
+
+        min_free = max(
+            0, self._env_int("KVE_REQUEST_KV_SWAP_MIN_FREE_GPU_BLOCKS", 0)
+        )
+        free_blocks = min(
+            manager.block_pool.get_num_free_blocks() for manager in managers
+        )
+        if free_blocks < swap.kv_block_count + min_free:
+            return (
+                "request KV swap load is waiting for GPU blocks: "
+                f"reload_blocks={swap.kv_block_count} free={free_blocks} "
+                f"min_free={min_free}"
+            )
+
+        entries: list[tuple[Any, list[Any]]] = []
+        gpu_block_ids: list[int] = []
+        cpu_block_ids: list[int] = []
+        try:
+            for idx, manager in enumerate(managers):
+                logical_starts = swap.logical_start_by_group[idx]
+                cpu_ids = swap.cpu_block_ids_by_group[idx]
+                if len(logical_starts) != len(cpu_ids):
+                    return "request KV swap block metadata mismatch"
+                blocks = manager.block_pool.get_new_blocks(len(cpu_ids))
+                for block, logical_start in zip(blocks, logical_starts):
+                    block.logical_start = int(logical_start)
+                manager.req_to_blocks[request_id] = blocks
+                manager.num_cached_block.pop(request_id, None)
+                entries.append((manager, blocks))
+                gpu_block_ids.extend(int(block.block_id) for block in blocks)
+                cpu_block_ids.extend(int(block_id) for block_id in cpu_ids)
+        except ValueError as exc:
+            for manager, blocks in entries:
+                manager.req_to_blocks.pop(request_id, None)
+                manager.block_pool.free_blocks(reversed(blocks))
+            return f"insufficient GPU blocks for request KV swap load: {exc}"
+
+        event_id = self._next_managed_context_transfer_event_id()
+        self._managed_context_load_events_to_submit[event_id] = (
+            ManagedContextCopyEvent(
+                event_id=event_id,
+                gpu_block_ids=gpu_block_ids,
+                cpu_block_ids=cpu_block_ids,
+            )
+        )
+        self._request_kv_swap_load_event_to_request_id[event_id] = request_id
+        swap.status = "load_pending"
+        swap.entries = entries
+        swap.load_event_id = event_id
+        self._request_kv_swap_remove_ready(request_id)
+        if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
+            logger.warning(
+                "[REQUEST-KV-SWAP-IN-SUBMIT] req=%s event=%d blocks=%d "
+                "gpu_blocks=%s cpu_blocks=%s",
+                request_id[:8],
+                event_id,
+                swap.kv_block_count,
+                gpu_block_ids,
+                cpu_block_ids,
+            )
+        return None
+
+    def _complete_request_kv_swap_load(self, request: Request) -> None:
+        request_id = request.request_id
+        swap = self._request_kv_swaps.pop(request_id, None)
+        if swap is None:
+            return
+        self._request_kv_swap_finished_load_req_ids.discard(request_id)
+        if swap.load_event_id is not None:
+            self._request_kv_swap_load_event_to_request_id.pop(
+                swap.load_event_id, None
+            )
+        self._managed_context_free_cpu_block_ids(swap.cpu_block_ids_by_group)
+        request.num_computed_tokens = swap.num_computed_tokens
+        request.position_offset = swap.position_offset
+        request.num_external_computed_tokens = 0
+        request.num_cached_tokens = request.num_computed_tokens
+        request.needs_rebuild = True
+        if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
+            logger.warning(
+                "[REQUEST-KV-SWAP-LOAD-DONE] req=%s blocks=%d "
+                "computed=%d position_offset=%d",
+                request_id[:8],
+                swap.kv_block_count,
+                request.num_computed_tokens,
+                request.position_offset,
+            )
+
+    def _release_request_kv_swap(
+        self,
+        request_id: str,
+        reason: str,
+        *,
+        release_gpu_entries: bool,
+    ) -> bool:
+        swap = self._request_kv_swaps.get(request_id)
+        if swap is None:
+            return True
+
+        store_in_flight = (
+            swap.status == "store_pending"
+            and swap.store_event_id is not None
+            and swap.store_event_id
+            not in self._managed_context_store_events_to_submit
+        )
+        load_in_flight = (
+            swap.status == "load_pending"
+            and swap.load_event_id is not None
+            and swap.load_event_id
+            not in self._managed_context_load_events_to_submit
+            and request_id not in self._request_kv_swap_finished_load_req_ids
+        )
+        if store_in_flight or load_in_flight:
+            swap.status = "expired"
+            self._request_kv_swap_remove_ready(request_id)
+            if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
+                logger.warning(
+                    "[REQUEST-KV-SWAP-EXPIRE] req=%s reason=%s "
+                    "store_in_flight=%s load_in_flight=%s",
+                    request_id[:8],
+                    reason,
+                    store_in_flight,
+                    load_in_flight,
+                )
+            return False
+
+        self._request_kv_swaps.pop(request_id, None)
+        self._request_kv_swap_remove_ready(request_id)
+        if swap.store_event_id is not None:
+            self._managed_context_store_events_to_submit.pop(
+                swap.store_event_id, None
+            )
+            self._request_kv_swap_store_event_to_request_id.pop(
+                swap.store_event_id, None
+            )
+        if swap.load_event_id is not None:
+            self._managed_context_load_events_to_submit.pop(
+                swap.load_event_id, None
+            )
+            self._request_kv_swap_load_event_to_request_id.pop(
+                swap.load_event_id, None
+            )
+            self._request_kv_swap_finished_load_req_ids.discard(request_id)
+        if release_gpu_entries:
+            self._release_request_kv_swap_entries(request_id, swap.entries)
+        self._managed_context_free_cpu_block_ids(swap.cpu_block_ids_by_group)
+        if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
+            logger.warning(
+                "[REQUEST-KV-SWAP-RELEASE] req=%s reason=%s status=%s",
+                request_id[:8],
+                reason,
+                swap.status,
+            )
+        return True
+
+    def _release_request_kv_swap_for_finish(
+        self, request_id: str, reason: str
+    ) -> tuple[bool, bool]:
+        swap = self._request_kv_swaps.get(request_id)
+        if swap is None:
+            return False, False
+
+        if swap.status == "store_pending":
+            event_queued = (
+                swap.store_event_id in self._managed_context_store_events_to_submit
+            )
+            self._release_request_kv_swap(
+                request_id,
+                reason,
+                release_gpu_entries=False,
+            )
+            if event_queued:
+                return False, False
+            return True, True
+
+        self._release_request_kv_swap(
+            request_id,
+            reason,
+            release_gpu_entries=True,
+        )
+        return True, True
+
+    def _try_progress_request_kv_swap(self, request: Request) -> bool:
+        request_id = request.request_id
+        swap = self._request_kv_swaps.get(request_id)
+        if swap is None:
+            return False
+        if swap.status == "store_pending":
+            return False
+        if swap.status == "swapped":
+            error = self._start_request_kv_swap_load(request)
+            if error is not None:
+                swap.last_error = error
+                if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
+                    logger.warning(
+                        "[REQUEST-KV-SWAP-IN-DEFER] req=%s %s",
+                        request_id[:8],
+                        error,
+                    )
+            return False
+        if swap.status == "load_pending":
+            if request_id not in self._request_kv_swap_finished_load_req_ids:
+                return False
+            self._complete_request_kv_swap_load(request)
+            request.status = RequestStatus.PREEMPTED
+            return True
+        if swap.status == "expired":
+            return False
+        return False
+
     def _release_managed_context_span_gpu_entries(
         self, span: ManagedContextSpan
     ) -> int:
@@ -4161,9 +5021,39 @@ class Scheduler(SchedulerInterface):
         request_id: str,
         spans: list[ManagedContextSpan],
     ) -> None:
-        keys = {self._managed_context_span_key(span) for span in spans}
+        self._reserve_managed_context_restore_span_keys(
+            request_id,
+            {self._managed_context_span_key(span) for span in spans},
+        )
+
+    def _reserve_managed_context_restore_span_keys(
+        self,
+        request_id: str,
+        keys: set[tuple[str, str]],
+    ) -> None:
         if keys:
             self._managed_context_restore_reservations[request_id] = keys
+
+    def _reserve_managed_context_restore_request(self, request: Request) -> None:
+        if not self._managed_context_enabled:
+            return
+        span_ids = self._managed_context_restore_span_ids(request)
+        if not span_ids:
+            return
+        trace_id = self._managed_context_trace_id(request)
+        if not trace_id:
+            return
+        self._reserve_managed_context_restore_span_keys(
+            request.request_id,
+            {(trace_id, span_id) for span_id in span_ids},
+        )
+        if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+            logger.warning(
+                "[MANAGED-CONTEXT-RESTORE-RESERVE] req=%s trace=%s spans=%s",
+                request.request_id[:8],
+                trace_id,
+                span_ids,
+            )
 
     def _release_managed_context_restore_reservation(
         self,
@@ -4182,6 +5072,83 @@ class Scheduler(SchedulerInterface):
                 reason,
                 sorted(f"{trace}:{span}" for trace, span in keys),
             )
+
+    @staticmethod
+    def _managed_context_restore_error_is_unavailable(
+        error: str | None,
+    ) -> bool:
+        if error is None:
+            return False
+        return "is not available for this trace" in error
+
+    @staticmethod
+    def _managed_context_restore_error_is_oversize(
+        error: str | None,
+    ) -> bool:
+        if error is None:
+            return False
+        return error.startswith("restore would exceed max_model_len:")
+
+    def _drop_unavailable_managed_context_restore(
+        self,
+        request: Request,
+        reason: str,
+    ) -> bool:
+        unavailable = self._managed_context_restore_error_is_unavailable(reason)
+        oversize = self._managed_context_restore_error_is_oversize(reason)
+        drop_unavailable = (
+            os.environ.get(
+                "KVE_MANAGED_CONTEXT_DROP_UNAVAILABLE_RESTORE",
+                "0",
+            )
+            .lower()
+            in ("1", "true", "yes", "on")
+        )
+        drop_oversize = (
+            os.environ.get(
+                "KVE_MANAGED_CONTEXT_DROP_OVERSIZE_RESTORE",
+                "1",
+            )
+            .lower()
+            in ("1", "true", "yes", "on")
+        )
+        if not (
+            (unavailable and drop_unavailable)
+            or (oversize and drop_oversize)
+        ):
+            return False
+        if request.sampling_params is None:
+            return False
+        extra_args = dict(request.sampling_params.extra_args or {})
+        restore_span_ids = extra_args.get("kve_restore_span_ids")
+        if "kve_restore_span_ids" not in extra_args:
+            return False
+
+        for key in (
+            "kve_restore_span_ids",
+            "kve_restore_defer_until_prefill",
+            "kve_restore_after_visible_tokens",
+        ):
+            extra_args.pop(key, None)
+        request.sampling_params.extra_args = extra_args or None
+        request.managed_context_defer_restore_until_prefill = False
+        request_id = request.request_id
+        if request_id:
+            self._release_managed_context_restore_reservation(
+                request_id,
+                "restore-dropped",
+            )
+            self._release_managed_context_deferred_restore(
+                request_id,
+                "restore-dropped",
+            )
+        logger.warning(
+            "[MANAGED-CONTEXT-RESTORE-DROP] req=%s restore=%s reason=%s",
+            request_id[:8],
+            restore_span_ids,
+            reason,
+        )
+        return True
 
     def _managed_context_cpu_archive_protected_keys(
         self,
@@ -4273,31 +5240,77 @@ class Scheduler(SchedulerInterface):
         needed_blocks: int,
         *,
         protected: set[tuple[str, str]] | None = None,
-    ) -> None:
+    ) -> int:
         protected = protected or set()
         if needed_blocks <= 0:
-            return
+            return 0
         managers = self.kv_cache_manager.coordinator.single_type_managers
         if not managers:
-            return
+            return 0
+        released_blocks = 0
         while self._managed_context_hot_gpu_order:
             free_blocks = min(
                 manager.block_pool.get_num_free_blocks() for manager in managers
             )
             if free_blocks >= needed_blocks:
-                return
+                return released_blocks
             key = self._managed_context_hot_gpu_order.popleft()
             if key in protected:
                 self._managed_context_hot_gpu_order.append(key)
                 if all(item in protected for item in self._managed_context_hot_gpu_order):
-                    return
+                    return released_blocks
                 continue
             span = self._managed_context_archive.get(key)
             if span is None or span.status != "cpu_hot":
                 continue
-            self._release_managed_context_hot_gpu_span(
+            released_blocks += self._release_managed_context_hot_gpu_span(
                 span, "gpu-free-block-pressure"
             )
+        return released_blocks
+
+    def _managed_context_release_hot_gpu_pressure(self, reason: str) -> int:
+        if not self._managed_context_cpu_archive_enabled:
+            return 0
+        free_blocks = self._managed_context_min_free_gpu_blocks()
+        target_free_blocks = max(free_blocks + 1, self.block_size)
+        return self._managed_context_free_hot_gpu_for_blocks(
+            target_free_blocks,
+            protected=self._managed_context_cpu_archive_protected_keys(),
+        )
+
+    def _retry_managed_context_gpu_pinned_offloads(self, reason: str) -> int:
+        if not (
+            self._managed_context_enabled
+            and self._managed_context_cpu_offload_immediate
+        ):
+            return 0
+        started = 0
+        for key in list(self._managed_context_archive_order):
+            if self._managed_context_cpu_store_transfer_limit_error() is not None:
+                break
+            span = self._managed_context_archive.get(key)
+            if span is None or span.status != "gpu_pinned":
+                continue
+            if (
+                not self._managed_context_cpu_evict_on_capacity
+                and len(self._managed_context_cpu_free_block_ids)
+                < span.kv_block_count
+            ):
+                continue
+            error = self._start_managed_context_cpu_offload(span, reason)
+            if error is None:
+                started += 1
+                continue
+            if "store transfer limit" in error:
+                break
+            if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+                logger.warning(
+                    "[MANAGED-CONTEXT-CPU-RETRY-SKIP] trace=%s span=%s %s",
+                    span.trace_id,
+                    span.span_id,
+                    error,
+                )
+        return started
 
     def _promote_managed_context_hot_gpu_span(
         self,
@@ -4367,6 +5380,11 @@ class Scheduler(SchedulerInterface):
             return None
 
         protected = self._managed_context_cpu_archive_protected_keys(protected)
+        if (
+            not self._managed_context_cpu_evict_on_capacity
+            and len(self._managed_context_cpu_free_block_ids) < num_blocks
+        ):
+            return None
         while len(self._managed_context_cpu_free_block_ids) < num_blocks:
             if not self._managed_context_archive_order:
                 return None
@@ -4395,6 +5413,34 @@ class Scheduler(SchedulerInterface):
             for _ in range(num_blocks)
         ]
 
+    def _managed_context_cpu_store_transfer_limit_error(self) -> str | None:
+        max_pending = max(0, self._managed_context_cpu_max_pending_store_events)
+        if max_pending <= 0:
+            return None
+        pending = len(self._managed_context_store_event_to_span) + len(
+            getattr(self, "_request_kv_swap_store_event_to_request_id", {})
+        )
+        if pending < max_pending:
+            return None
+        return (
+            "managed-context CPU store transfer limit reached: "
+            f"pending={pending} max={max_pending}"
+        )
+
+    def _managed_context_cpu_load_transfer_limit_error(self) -> str | None:
+        max_pending = max(0, self._managed_context_cpu_max_pending_load_events)
+        if max_pending <= 0:
+            return None
+        pending = len(self._managed_context_load_event_to_request_id) + len(
+            getattr(self, "_request_kv_swap_load_event_to_request_id", {})
+        )
+        if pending < max_pending:
+            return None
+        return (
+            "managed-context CPU load transfer limit reached: "
+            f"pending={pending} max={max_pending}"
+        )
+
     def _start_managed_context_cpu_offload(
         self,
         span: ManagedContextSpan,
@@ -4412,6 +5458,10 @@ class Scheduler(SchedulerInterface):
             return f"span {span.span_id!r} cannot be offloaded from {span.status}"
         if not span.entries:
             return f"span {span.span_id!r} has no GPU blocks to offload"
+
+        limit_error = self._managed_context_cpu_store_transfer_limit_error()
+        if limit_error is not None:
+            return limit_error
 
         cpu_block_ids = self._alloc_managed_context_cpu_blocks(
             span.kv_block_count,
@@ -4709,6 +5759,8 @@ class Scheduler(SchedulerInterface):
         if deferred is None:
             spans, error = self._validate_managed_context_restore_request(request)
             if error is not None:
+                if self._drop_unavailable_managed_context_restore(request, error):
+                    return False
                 logger.error(
                     "[MANAGED-CONTEXT-DEFER-ACTIVATE-ABORT] req=%s %s",
                     request_id[:8],
@@ -4944,7 +5996,7 @@ class Scheduler(SchedulerInterface):
         explicit_block_range: tuple[int, int] | None,
         last_turn_evicted: int,
         stride_used: int,
-    ) -> list[str]:
+    ) -> list[str] | None:
         """Pin the blocks that turn-mode compaction is about to evict.
 
         The archive owns exactly one extra ref per captured block. The normal
@@ -4998,6 +6050,42 @@ class Scheduler(SchedulerInterface):
                 max_blocks,
             )
             return []
+        if (
+            self._managed_context_skip_compaction_on_cpu_capacity
+            and self._managed_context_cpu_offload_immediate
+            and not self._managed_context_cpu_evict_on_capacity
+            and total_blocks > len(self._managed_context_cpu_free_block_ids)
+        ):
+            cpu_free = len(self._managed_context_cpu_free_block_ids)
+            skip_state = (evict_start, evict_end, total_blocks, cpu_free)
+            if (
+                getattr(
+                    request,
+                    "_kve_managed_context_last_capacity_skip",
+                    None,
+                )
+                != skip_state
+            ):
+                request._kve_managed_context_last_capacity_skip = skip_state  # type: ignore[attr-defined]
+                logger.warning(
+                    "[MANAGED-CONTEXT-COMPACT-SKIP-CAPACITY] req=%s trace=%s "
+                    "evict=[%d,%d) blocks=%d cpu_free=%d cpu_max=%d "
+                    "gpu_pinned_blocks=%d managed=%s",
+                    request.request_id[:8],
+                    trace_id,
+                    evict_start,
+                    evict_end,
+                    total_blocks,
+                    cpu_free,
+                    self._managed_context_cpu_max_blocks,
+                    sum(
+                        span.kv_block_count
+                        for span in self._managed_context_archive.values()
+                        if span.status == "gpu_pinned"
+                    ),
+                    self._kve_managed_context_diag_summary(),
+                )
+            return None
 
         entries: list[tuple[Any, list[Any]]] = []
         logical_start_by_group: list[list[int]] = []
@@ -5089,6 +6177,10 @@ class Scheduler(SchedulerInterface):
             return ManagedContextCPULoadStart()
         if request.request_id in self._managed_context_pending_loads:
             return ManagedContextCPULoadStart()
+
+        limit_error = self._managed_context_cpu_load_transfer_limit_error()
+        if limit_error is not None:
+            return ManagedContextCPULoadStart(limit_error, retryable=True)
 
         manager_to_index = {
             id(manager): i
@@ -6963,6 +8055,7 @@ class Scheduler(SchedulerInterface):
                 and request.prompt_token_ids is not None
             ):
                 self._pending_admission_compaction_ids.add(request.request_id)
+            self._reserve_managed_context_restore_request(request)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.log_stats:
@@ -7019,8 +8112,17 @@ class Scheduler(SchedulerInterface):
         # Second pass: set status and free requests
         for request in valid_requests:
             delay_free_blocks = False
+            drop_request_after_free = False
             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
-                if request.request_id in self._managed_context_pending_loads:
+                if request.request_id in self._request_kv_swaps:
+                    (
+                        delay_free_blocks,
+                        drop_request_after_free,
+                    ) = self._release_request_kv_swap_for_finish(
+                        request.request_id,
+                        "finish-waiting-request",
+                    )
+                elif request.request_id in self._managed_context_pending_loads:
                     pending = self._managed_context_pending_loads[
                         request.request_id
                     ]
@@ -7050,6 +8152,8 @@ class Scheduler(SchedulerInterface):
 
             request.status = finished_status
             self._free_request(request, delay_free_blocks=delay_free_blocks)
+            if drop_request_after_free:
+                self.requests.pop(request.request_id, None)
 
         return [(r.request_id, r.client_index) for r in valid_requests]
 
@@ -7178,15 +8282,20 @@ class Scheduler(SchedulerInterface):
             # the kv blocks to 0 and thus we can make sure the reset is successful.
             # Preempt in reverse order so the requests will be added back to the
             # running queue in FIFO order.
-            while self.running:
-                request = self.running.pop()
-                self._preempt_request(request, timestamp)
-                if request.is_finished():
-                    continue
-                # NOTE(zhuohan): For async scheduling, we need to discard the latest
-                # output token on the fly to avoid a redundant repetitive output token.
-                request.num_output_placeholders = 0
-                request.discard_latest_async_tokens = True
+            swap_suspended = self._request_kv_swap_suspended
+            self._request_kv_swap_suspended = True
+            try:
+                while self.running:
+                    request = self.running.pop()
+                    self._preempt_request(request, timestamp)
+                    if request.is_finished():
+                        continue
+                    # NOTE(zhuohan): For async scheduling, we need to discard the latest
+                    # output token on the fly to avoid a redundant repetitive output token.
+                    request.num_output_placeholders = 0
+                    request.discard_latest_async_tokens = True
+            finally:
+                self._request_kv_swap_suspended = swap_suspended
 
             # Clear scheduled request ids cache. Since we are forcing preemption
             # + resumption in the same step, we must act as if these requests were
@@ -7206,6 +8315,13 @@ class Scheduler(SchedulerInterface):
                 "[MANAGED-CONTEXT] refusing prefix-cache reset with pending "
                 "CPU reloads: %s",
                 list(self._managed_context_pending_loads),
+            )
+            return False
+        if self._request_kv_swaps:
+            logger.warning(
+                "[REQUEST-KV-SWAP] refusing prefix-cache reset with request "
+                "KV swaps: %s",
+                list(self._request_kv_swaps),
             )
             return False
         in_flight_store_events = [
@@ -7422,6 +8538,8 @@ class Scheduler(SchedulerInterface):
         Try to promote a blocked waiting request back to schedulable states.
         """
         if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            if request.request_id in self._request_kv_swaps:
+                return self._try_progress_request_kv_swap(request)
             if request.request_id in self._managed_context_pending_loads:
                 if (
                     request.request_id
@@ -7469,6 +8587,7 @@ class Scheduler(SchedulerInterface):
         for event_id in output.completed_store_event_ids:
             span = self._managed_context_store_event_to_span.pop(event_id, None)
             if span is None:
+                self._complete_request_kv_swap_store(event_id)
                 continue
             released_blocks = self._release_managed_context_span_gpu_entries(span)
             span.offload_event_id = None
@@ -7487,12 +8606,26 @@ class Scheduler(SchedulerInterface):
                     span.status,
                     span.cpu_block_ids_by_group,
                 )
+        if output.completed_store_event_ids:
+            self._retry_managed_context_gpu_pinned_offloads("store-done")
 
         for event_id in output.completed_load_event_ids:
             request_id = self._managed_context_load_event_to_request_id.pop(
                 event_id, None
             )
             if request_id is None:
+                request_id = self._request_kv_swap_load_event_to_request_id.pop(
+                    event_id, None
+                )
+                if request_id is not None:
+                    self._request_kv_swap_finished_load_req_ids.add(request_id)
+                    swap = self._request_kv_swaps.get(request_id)
+                    if swap is not None and swap.status == "expired":
+                        self._release_request_kv_swap(
+                            request_id,
+                            "expired-load-done",
+                            release_gpu_entries=True,
+                        )
                 continue
             self._managed_context_finished_load_req_ids.add(request_id)
             request = self.requests.get(request_id)

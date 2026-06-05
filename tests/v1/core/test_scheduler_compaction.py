@@ -14,7 +14,7 @@ from vllm.v1.core.compaction.types import CompactionEvent
 from vllm.v1.engine import EngineCoreOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
-from .utils import create_requests, create_scheduler
+from .utils import EOS_TOKEN_ID, create_requests, create_scheduler
 
 pytestmark = pytest.mark.cpu_test
 
@@ -49,6 +49,52 @@ def _run_decode_until_compacted(scheduler, request, max_steps: int = 2048):
             next_sampled += 1
         steps += 1
     return steps, request.num_total_generated
+
+
+def test_turn_mode_compaction_does_not_require_token_window():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        block_size=16,
+        num_blocks=64,
+        max_model_len=2048,
+        compaction_window_size=0,
+        compaction_stride=0,
+        compaction_max_turns=6,
+        compaction_eviction_turn_stride=2,
+        compaction_turn_end_token_id=50256,
+    )
+
+    compaction_managers = [
+        m for m in scheduler.kv_cache_manager.coordinator.single_type_managers
+        if isinstance(m, CompactingKVCacheManager)
+    ]
+    assert len(compaction_managers) == 1
+    assert compaction_managers[0].compaction_window_size == 0
+    assert compaction_managers[0].compaction_stride == 0
+    assert not compaction_managers[0].needs_compaction(
+        "missing-request", 10_000, 0
+    )
+
+
+def test_compaction_window_and_turn_modes_are_mutually_exclusive():
+    with pytest.raises(AssertionError, match="mutually exclusive"):
+        create_scheduler(
+            max_num_batched_tokens=1024,
+            max_num_seqs=1,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=False,
+            block_size=16,
+            num_blocks=64,
+            max_model_len=2048,
+            compaction_window_size=80,
+            compaction_stride=16,
+            compaction_max_turns=6,
+            compaction_eviction_turn_stride=2,
+            compaction_turn_end_token_id=50256,
+        )
 
 
 def test_compaction_trim_non_block_aligned_prompt():
@@ -838,8 +884,8 @@ def _make_turn_scheduler(
     *,
     sys_len: int,
     block_size: int = 16,
-    compaction_window_size: int = 256,
-    compaction_stride: int = 16,
+    compaction_window_size: int = 0,
+    compaction_stride: int = 0,
     max_turns: int = 2,
     turn_stride: int = 1,
     enable_prefix_caching: bool = False,
@@ -893,7 +939,6 @@ def test_turn_mode_trigger_at_max_turns():
     sys_len = 32
     scheduler = _make_turn_scheduler(
         sys_len=sys_len, max_turns=3, turn_stride=1,
-        compaction_stride=16, compaction_window_size=64,
     )
     (request,) = create_requests(
         num_requests=1, num_tokens=sys_len, max_tokens=2048,
@@ -919,7 +964,6 @@ def test_turn_mode_evicts_one_turn():
     sys_len = 32
     scheduler = _make_turn_scheduler(
         sys_len=sys_len, max_turns=2, turn_stride=1,
-        compaction_window_size=128, compaction_stride=16,
     )
     (request,) = create_requests(
         num_requests=1, num_tokens=sys_len, max_tokens=2048,
@@ -968,7 +1012,6 @@ def test_turn_mode_stride_two_evicts_two_turns():
     sys_len = 32
     scheduler = _make_turn_scheduler(
         sys_len=sys_len, max_turns=4, turn_stride=2,
-        compaction_window_size=128, compaction_stride=16,
     )
     (request,) = create_requests(
         num_requests=1, num_tokens=sys_len, max_tokens=2048,
@@ -998,7 +1041,6 @@ def test_turn_mode_block_alignment_too_short():
     sys_len = 16  # exactly one block, ends on boundary
     scheduler = _make_turn_scheduler(
         sys_len=sys_len, max_turns=2, turn_stride=1,
-        compaction_window_size=64, compaction_stride=16,
     )
     (request,) = create_requests(
         num_requests=1, num_tokens=sys_len, max_tokens=2048,
@@ -1071,6 +1113,72 @@ def test_turn_mode_compaction_event_fields_roundtrip():
     assert len(enc_default) < len(encoded)
 
 
+def test_auto_pad_can_finalize_at_max_model_len_boundary():
+    block_size = 16
+    max_model_len = 64
+    prompt_len = 48
+    scheduler = create_scheduler(
+        max_num_batched_tokens=max_model_len,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=True,
+        block_size=block_size,
+        num_blocks=16,
+        max_model_len=max_model_len,
+    )
+    scheduler._compaction_block_aligned_finish = True
+    scheduler._compaction_block_size = block_size
+    scheduler.max_model_len = max_model_len
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=prompt_len,
+        max_tokens=max_model_len,
+        ignore_eos=False,
+        block_size=block_size,
+    )
+    scheduler.add_request(request)
+
+    # Prefill samples token 1, then eight decode iterations sample through
+    # EOS. The EOS step leaves num_computed one behind the sampled token, so
+    # auto-pad extends 57 visible tokens to exactly max_model_len.
+    for token_id in ([10_000] * 8 + [EOS_TOKEN_ID]):
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens[request.request_id] > 0
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[[token_id]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    assert request.padding_pending
+    assert request.num_tokens == max_model_len
+    assert request.num_computed_tokens == max_model_len - 8
+
+    padding_output = scheduler.schedule()
+    assert padding_output.num_scheduled_tokens[request.request_id] == 8
+    assert request.request_id in padding_output.no_sample_req_ids
+    scheduler.update_from_output(
+        padding_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    assert not request.padding_pending
+    assert request.request_id not in scheduler.requests
+
+
 def test_turn_mode_system_prompt_never_evicted():
     """Hard invariant: across many compaction rounds, the leading system
     prompt is byte-for-byte identical to the original.
@@ -1078,7 +1186,6 @@ def test_turn_mode_system_prompt_never_evicted():
     sys_len = 48  # not block-aligned; sys_aligned = 64
     scheduler = _make_turn_scheduler(
         sys_len=sys_len, max_turns=2, turn_stride=1,
-        compaction_window_size=128, compaction_stride=16,
     )
     (request,) = create_requests(
         num_requests=1, num_tokens=sys_len, max_tokens=4096,
@@ -1123,7 +1230,6 @@ def test_turn_mode_prefix_cache_rebuilt_after_eviction():
     sys_len = 32
     scheduler = _make_turn_scheduler(
         sys_len=sys_len, max_turns=2, turn_stride=1,
-        compaction_window_size=128, compaction_stride=16,
         enable_prefix_caching=True,
     )
     (request,) = create_requests(
@@ -1237,7 +1343,6 @@ def test_inline_admission_eviction_fires_when_prefill_completes():
 
     scheduler = _make_turn_scheduler(
         sys_len=sys_len, max_turns=2, turn_stride=1,
-        compaction_window_size=4096, compaction_stride=16,
         block_size=block_size,
     )
     (request,) = create_requests(
@@ -1341,7 +1446,6 @@ def test_inline_admission_eviction_partial_prefix_cache_hit():
 
     scheduler = _make_turn_scheduler(
         sys_len=sys_len, max_turns=2, turn_stride=1,
-        compaction_window_size=4096, compaction_stride=16,
         block_size=block_size,
     )
     (request,) = create_requests(
@@ -1423,7 +1527,6 @@ def test_inline_admission_eviction_warm_prefix_cache_hit():
 
     scheduler = _make_turn_scheduler(
         sys_len=sys_len, max_turns=2, turn_stride=1,
-        compaction_window_size=4096, compaction_stride=16,
         block_size=block_size,
     )
     (request,) = create_requests(
@@ -1519,7 +1622,6 @@ def test_inline_admission_eviction_position_offset_in_new_req_data():
 
     scheduler = _make_turn_scheduler(
         sys_len=sys_len, max_turns=2, turn_stride=1,
-        compaction_window_size=4096, compaction_stride=16,
         block_size=block_size,
     )
     (request,) = create_requests(

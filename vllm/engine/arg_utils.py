@@ -1658,6 +1658,12 @@ class EngineArgs:
 
         # Compaction incompatibility guards.
         if self.compaction_window_size > 0:
+            assert self.compaction_max_turns == 0, (
+                "KV cache compaction modes are mutually exclusive: "
+                "set either compaction_window_size/compaction_stride for "
+                "token-window FIFO eviction, or compaction_max_turns for "
+                "turn-mode eviction, not both."
+            )
             # NOTE: prefix caching + compaction is supported as of the
             # Phase 2 hash-chain rebuild in scheduler._rehash_after_eviction
             # (plans/prefix_caching_compaction.md). The historical
@@ -1680,11 +1686,22 @@ class EngineArgs:
                 "compaction_protected_prefix_tokens must be >= -1 "
                 "(-1 = auto-detect from system message)"
             )
-        # Turn-mode guards (require window-size set as a safety fallback).
+        else:
+            assert self.compaction_stride == 0, (
+                "compaction_stride requires compaction_window_size > 0; "
+                "leave compaction_stride at 0 for turn-mode eviction"
+            )
+        # Turn-mode guards. Turn-count eviction computes explicit block ranges
+        # from message boundaries, so it does not require token-window FIFO
+        # compaction to be enabled.
         if self.compaction_max_turns > 0:
-            assert self.compaction_window_size > 0, (
-                "compaction_max_turns requires compaction_window_size > 0 "
-                "as a safety fallback"
+            assert self.compaction_window_size == 0, (
+                "KV cache compaction modes are mutually exclusive: "
+                "turn-mode eviction requires compaction_window_size=0"
+            )
+            assert self.compaction_stride == 0, (
+                "KV cache compaction modes are mutually exclusive: "
+                "turn-mode eviction requires compaction_stride=0"
             )
             assert self.compaction_eviction_turn_stride >= 1, (
                 "compaction_eviction_turn_stride must be >= 1"

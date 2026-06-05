@@ -1510,6 +1510,41 @@ class GPUModelRunner(
         reqs_to_add: list[CachedRequestState] = []
         deferred_spec_decode_corrections = []
 
+        def splice_hidden_after_protected_prefix(
+            visible_block_ids: tuple[list[int], ...],
+            hidden_block_ids: tuple[list[int], ...],
+            protected_prefix_len: int,
+        ) -> tuple[list[int], ...]:
+            spliced: list[list[int]] = []
+            for group_idx, visible_ids in enumerate(visible_block_ids):
+                block_table = self.input_batch.block_table[group_idx]
+                manager_block_size = (
+                    block_table.block_size * block_table.blocks_per_kv_block
+                )
+                if (
+                    protected_prefix_len % manager_block_size != 0
+                    and os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1"
+                ):
+                    logger.warning(
+                        "[MANAGED-CONTEXT-SPLICE-WARN] req protected prefix "
+                        "is not block aligned: protected_prefix_len=%d "
+                        "block_size=%d group=%d",
+                        protected_prefix_len,
+                        manager_block_size,
+                        group_idx,
+                    )
+                prefix_blocks = min(
+                    len(visible_ids),
+                    (protected_prefix_len + manager_block_size - 1)
+                    // manager_block_size,
+                )
+                spliced.append(
+                    list(visible_ids[:prefix_blocks])
+                    + list(hidden_block_ids[group_idx])
+                    + list(visible_ids[prefix_blocks:])
+                )
+            return tuple(spliced)
+
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
@@ -1542,9 +1577,10 @@ class GPUModelRunner(
 
             hidden_block_ids = new_req_data.hidden_kv_block_ids
             if hidden_block_ids:
-                block_ids = tuple(
-                    list(hidden_block_ids[i]) + list(new_req_data.block_ids[i])
-                    for i in range(len(new_req_data.block_ids))
+                block_ids = splice_hidden_after_protected_prefix(
+                    new_req_data.block_ids,
+                    hidden_block_ids,
+                    new_req_data.protected_prefix_len,
                 )
             else:
                 block_ids = new_req_data.block_ids
@@ -1686,6 +1722,9 @@ class GPUModelRunner(
                     req_state.protected_prefix_len = (
                         req_data.protected_prefix_lens[req_id]
                     )
+                req_state.hidden_kv_num_tokens = (
+                    req_data.hidden_kv_num_tokens.get(req_id, 0)
+                )
                 # Update prompt length if prompt tokens were evicted
                 # (turn-based eviction with protected prefix).
                 if req_id in req_data.prompt_lengths:
@@ -2457,10 +2496,26 @@ class GPUModelRunner(
             self.input_batch.hidden_kv_num_tokens_cpu_tensor[:num_reqs],
             non_blocking=True,
         )
+        self.position_offsets_gpu[:num_reqs].copy_(
+            self.input_batch.position_offsets_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
+        self.protected_prefix_lens_gpu[:num_reqs].copy_(
+            self.input_batch.protected_prefix_lens_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
         per_token_hidden_kv = self.hidden_kv_num_tokens_gpu[req_indices_gpu]
+        per_token_ppl = self.protected_prefix_lens_gpu[req_indices_gpu]
         # Physical positions are worker block-table positions. Hidden KV blocks
-        # are prepended to the row, so current visible tokens write after them.
-        physical_positions = visible_positions + per_token_hidden_kv
+        # are spliced after the protected/system prefix, so only post-prefix
+        # visible tokens move right.
+        is_after_hidden_insert = (visible_positions >= per_token_ppl).to(
+            torch.int64
+        )
+        physical_positions = (
+            visible_positions
+            + per_token_hidden_kv * is_after_hidden_insert
+        )
         self.seq_lens[:num_reqs] = (
             self.hidden_kv_num_tokens_gpu[:num_reqs].to(torch.int32)
             + self.num_computed_tokens[:num_reqs]
@@ -2481,16 +2536,8 @@ class GPUModelRunner(
         #   physical [protected_prefix_len, ...) → position_offset  (post-sys, smart-bumped)
         # Sys K stays at its original logical positions while admission can bump
         # position_offset high enough to clear survivor logical positions.
-        # Bulk-copy both per-request scalars from CPU to pre-allocated GPU buffers.
-        self.position_offsets_gpu[:num_reqs].copy_(
-            self.input_batch.position_offsets_cpu_tensor[:num_reqs],
-            non_blocking=True,
-        )
-        self.protected_prefix_lens_gpu[:num_reqs].copy_(
-            self.input_batch.protected_prefix_lens_cpu_tensor[:num_reqs],
-            non_blocking=True,
-        )
-        per_token_ppl = self.protected_prefix_lens_gpu[req_indices_gpu]
+        # Bulk-copy both per-request scalars from CPU to pre-allocated GPU
+        # buffers above, before physical slot mapping.
         per_token_offset = self.position_offsets_gpu[req_indices_gpu]
         is_post_sys = (visible_positions >= per_token_ppl).to(torch.int64)
         self.positions[:total_num_scheduled_tokens] = (
@@ -2547,6 +2594,14 @@ class GPUModelRunner(
                     _row_blocks = _bt.block_table.np[
                         _req_i, : min(_num_blocks, 16)
                     ].tolist()
+                    _row_blocks_gpu = (
+                        _bt.block_table.gpu[
+                            _req_i, : min(_num_blocks, 16)
+                        ]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
                     _hidden_capacity = (
                         (_hidden_cpu[_req_i] + _block_size - 1)
                         // _block_size
@@ -2557,6 +2612,7 @@ class GPUModelRunner(
                         "seq_len=%d visible_seq_len=%d num_computed=%d "
                         "scheduled=%d prompt_len=%d position_offset=%d "
                         "protected_prefix_len=%d block_size=%d row_blocks_head=%s "
+                        "row_blocks_gpu_head=%s "
                         "first_token=(visible=%s physical=%s logical=%s slot=%s) "
                         "last_token=(visible=%s physical=%s logical=%s slot=%s)",
                         self.input_batch.req_ids[_req_i][:8],
@@ -2572,6 +2628,7 @@ class GPUModelRunner(
                         _ppl_cpu[_req_i],
                         _block_size,
                         _row_blocks,
+                        _row_blocks_gpu,
                         _visible_cpu[_start] if _start < _end else None,
                         _physical_cpu[_start] if _start < _end else None,
                         _logical_cpu[_start] if _start < _end else None,

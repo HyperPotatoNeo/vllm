@@ -155,7 +155,8 @@ class CacheConfig:
     compaction_window_size: int = 0
     """KV cache compaction: maximum number of tokens before eviction triggers.
     0 = disabled (default). When set, the scheduler evicts the oldest post-prompt
-    KV blocks when a request's KV length exceeds this window."""
+    KV blocks when a request's KV length exceeds this window. Mutually exclusive
+    with compaction_max_turns."""
     compaction_stride: int = 0
     """KV cache compaction: number of tokens to evict per compaction event.
     Must be a multiple of block_size."""
@@ -174,7 +175,8 @@ class CacheConfig:
     keep in context. 0 = disable turn mode (use block-FIFO compaction).
     The system prompt is NOT a turn and is always protected. When set,
     eviction fires once num_live_turns >= compaction_max_turns and removes
-    the oldest compaction_eviction_turn_stride turns at once."""
+    the oldest compaction_eviction_turn_stride turns at once. Mutually
+    exclusive with compaction_window_size/compaction_stride."""
     compaction_eviction_turn_stride: int = 1
     """KV cache compaction: how many oldest turns to evict at once when
     compaction_max_turns is exceeded. Must be >= 1. Larger = fewer but

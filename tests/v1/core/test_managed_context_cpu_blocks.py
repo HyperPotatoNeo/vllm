@@ -2,15 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections import deque
+from types import SimpleNamespace
 
 import pytest
 
+import vllm.v1.core.sched.scheduler as scheduler_mod
+from vllm.v1.outputs import ManagedContextTransferOutput
 from vllm.v1.core.sched.scheduler import (
+    ManagedContextHotGPUStats,
     ManagedContextSpan,
+    Scheduler,
     _managed_context_cpu_reload_block_demand,
     _managed_context_gpu_reload_wait_reason,
     _pop_contiguous_managed_context_cpu_blocks,
 )
+from vllm.v1.request import RequestStatus
 
 pytestmark = pytest.mark.cpu_test
 
@@ -93,3 +99,530 @@ def test_managed_context_gpu_reload_wait_reason_accounts_extra_blocks() -> None:
     assert reason is not None
     assert "required=7" in reason
     assert "free=6" in reason
+
+
+class _Request(SimpleNamespace):
+    def is_finished(self) -> bool:
+        return RequestStatus.is_finished(self.status)
+
+
+class _FakeBlockPool:
+    def __init__(self, *, free_blocks: int, new_block_ids: list[int]) -> None:
+        self._free_blocks = free_blocks
+        self._new_block_ids = deque(new_block_ids)
+        self.freed_block_ids: list[int] = []
+
+    def get_num_free_blocks(self) -> int:
+        return self._free_blocks
+
+    def get_new_blocks(self, count: int) -> list[SimpleNamespace]:
+        if count > self._free_blocks:
+            raise ValueError("not enough free blocks")
+        self._free_blocks -= count
+        return [
+            SimpleNamespace(
+                block_id=self._new_block_ids.popleft(),
+                logical_start=-1,
+                is_null=False,
+            )
+            for _ in range(count)
+        ]
+
+    def free_blocks(self, blocks) -> None:
+        block_list = list(blocks)
+        self.freed_block_ids.extend(int(block.block_id) for block in block_list)
+        self._free_blocks += len(block_list)
+
+
+def _request_kv_swap_test_scheduler(
+    monkeypatch,
+    *,
+    gpu_free_blocks: int = 4,
+) -> tuple[Scheduler, SimpleNamespace, _Request]:
+    monkeypatch.setenv("KVE_REQUEST_KV_SWAP", "1")
+    scheduler = object.__new__(Scheduler)
+    block_pool = _FakeBlockPool(
+        free_blocks=gpu_free_blocks,
+        new_block_ids=[20, 21, 22, 23],
+    )
+    blocks = [
+        SimpleNamespace(block_id=10, logical_start=0, is_null=False),
+        SimpleNamespace(block_id=11, logical_start=16, is_null=False),
+    ]
+    manager = SimpleNamespace(
+        block_size=16,
+        block_pool=block_pool,
+        req_to_blocks={"req": blocks},
+        num_cached_block={"req": 1},
+    )
+    scheduler.kv_cache_manager = SimpleNamespace(
+        coordinator=SimpleNamespace(single_type_managers=[manager])
+    )
+    scheduler._managed_context_enabled = False
+    scheduler._managed_context_cpu_archive_enabled = True
+    scheduler._managed_context_cpu_offload_immediate = False
+    scheduler._managed_context_cpu_evict_on_capacity = False
+    scheduler._managed_context_cpu_free_block_ids = deque([0, 1, 2, 3])
+    scheduler._managed_context_cpu_max_blocks = 4
+    scheduler._managed_context_archive = {}
+    scheduler._managed_context_archive_order = deque()
+    scheduler._managed_context_active_restores = {}
+    scheduler._managed_context_deferred_restores = {}
+    scheduler._managed_context_restore_reservations = {}
+    scheduler._managed_context_next_transfer_event_id = 0
+    scheduler._managed_context_store_events_to_submit = {}
+    scheduler._managed_context_load_events_to_submit = {}
+    scheduler._managed_context_store_event_to_span = {}
+    scheduler._managed_context_load_event_to_request_id = {}
+    scheduler._managed_context_pending_loads = {}
+    scheduler._managed_context_finished_load_req_ids = set()
+    scheduler._managed_context_cpu_max_pending_store_events = 0
+    scheduler._managed_context_cpu_max_pending_load_events = 0
+    scheduler._request_kv_swaps = {}
+    scheduler._request_kv_swap_ready_queue = deque()
+    scheduler._request_kv_swap_store_event_to_request_id = {}
+    scheduler._request_kv_swap_load_event_to_request_id = {}
+    scheduler._request_kv_swap_finished_load_req_ids = set()
+    scheduler._request_kv_swap_suspended = False
+    scheduler.requests = {}
+    scheduler.finished_req_ids = set()
+    scheduler.finished_req_ids_dict = None
+    scheduler.running = []
+    scheduler.waiting = SimpleNamespace(remove_requests=lambda requests: None)
+    scheduler.skipped_waiting = SimpleNamespace(
+        remove_requests=lambda requests: None
+    )
+    scheduler.num_waiting_for_streaming_input = 0
+    scheduler.connector = None
+    scheduler.encoder_cache_manager = SimpleNamespace(free=lambda request: None)
+    scheduler._connector_finished = lambda request: (False, None)
+    request = _Request(
+        request_id="req",
+        client_index=0,
+        status=RequestStatus.WAITING_FOR_REMOTE_KVS,
+        padding_pending=False,
+        num_output_placeholders=0,
+        num_computed_tokens=64,
+        num_external_computed_tokens=0,
+        num_cached_tokens=0,
+        position_offset=128,
+        needs_rebuild=False,
+        spec_token_ids=[],
+        num_preemptions=0,
+    )
+    scheduler.requests[request.request_id] = request
+    return scheduler, manager, request
+
+
+def test_request_kv_swap_store_completion_frees_gpu_and_queues_load(
+    monkeypatch,
+) -> None:
+    scheduler, manager, request = _request_kv_swap_test_scheduler(monkeypatch)
+
+    assert scheduler._start_request_kv_swap_out(request, "test") is None
+    assert manager.req_to_blocks["req"][0].block_id == 10
+    metadata = scheduler._drain_managed_context_transfer_metadata()
+
+    assert metadata is not None
+    assert [event.event_id for event in metadata.store_events] == [0]
+
+    scheduler._update_from_managed_context_transfer_finished(
+        ManagedContextTransferOutput(completed_store_event_ids=[0])
+    )
+
+    swap = scheduler._request_kv_swaps["req"]
+    assert swap.status == "swapped"
+    assert list(scheduler._request_kv_swap_ready_queue) == ["req"]
+    assert "req" not in manager.req_to_blocks
+    assert "req" not in manager.num_cached_block
+    assert manager.block_pool.freed_block_ids == [11, 10]
+    assert list(scheduler._managed_context_cpu_free_block_ids) == [2, 3]
+
+
+def test_request_kv_swap_load_completion_restores_request_and_frees_cpu(
+    monkeypatch,
+) -> None:
+    scheduler, manager, request = _request_kv_swap_test_scheduler(monkeypatch)
+    assert scheduler._start_request_kv_swap_out(request, "test") is None
+    scheduler._drain_managed_context_transfer_metadata()
+    scheduler._update_from_managed_context_transfer_finished(
+        ManagedContextTransferOutput(completed_store_event_ids=[0])
+    )
+
+    assert scheduler._try_progress_request_kv_swap(request) is False
+    swap = scheduler._request_kv_swaps["req"]
+    assert swap.status == "load_pending"
+    assert [block.block_id for block in manager.req_to_blocks["req"]] == [20, 21]
+    assert [block.logical_start for block in manager.req_to_blocks["req"]] == [
+        0,
+        16,
+    ]
+    metadata = scheduler._drain_managed_context_transfer_metadata()
+
+    assert metadata is not None
+    assert [event.event_id for event in metadata.load_events] == [1]
+
+    scheduler._update_from_managed_context_transfer_finished(
+        ManagedContextTransferOutput(completed_load_event_ids=[1])
+    )
+
+    assert scheduler._try_progress_request_kv_swap(request) is True
+    assert request.status == RequestStatus.PREEMPTED
+    assert request.num_computed_tokens == 64
+    assert request.position_offset == 128
+    assert request.num_cached_tokens == 64
+    assert request.needs_rebuild
+    assert "req" not in scheduler._request_kv_swaps
+    assert list(scheduler._managed_context_cpu_free_block_ids) == [2, 3, 0, 1]
+
+
+def test_request_kv_swap_load_waits_for_pending_load_budget(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_REQUEST_KV_SWAP_MAX_PENDING_LOADS", "1")
+    scheduler, _manager, request = _request_kv_swap_test_scheduler(monkeypatch)
+    assert scheduler._start_request_kv_swap_out(request, "test") is None
+    scheduler._drain_managed_context_transfer_metadata()
+    scheduler._update_from_managed_context_transfer_finished(
+        ManagedContextTransferOutput(completed_store_event_ids=[0])
+    )
+    scheduler._request_kv_swaps["other"] = SimpleNamespace(status="load_pending")
+
+    assert scheduler._try_progress_request_kv_swap(request) is False
+    assert scheduler._request_kv_swaps["req"].status == "swapped"
+    assert scheduler._managed_context_load_events_to_submit == {}
+
+
+def test_request_kv_swap_load_respects_shared_managed_load_budget(
+    monkeypatch,
+) -> None:
+    scheduler, _manager, request = _request_kv_swap_test_scheduler(monkeypatch)
+    assert scheduler._start_request_kv_swap_out(request, "test") is None
+    scheduler._drain_managed_context_transfer_metadata()
+    scheduler._update_from_managed_context_transfer_finished(
+        ManagedContextTransferOutput(completed_store_event_ids=[0])
+    )
+    scheduler._managed_context_cpu_max_pending_load_events = 1
+    scheduler._managed_context_load_event_to_request_id = {99: "restore"}
+
+    assert scheduler._try_progress_request_kv_swap(request) is False
+    assert scheduler._request_kv_swaps["req"].status == "swapped"
+    assert scheduler._managed_context_load_events_to_submit == {}
+
+
+def test_finish_request_kv_swap_in_flight_store_releases_on_completion(
+    monkeypatch,
+) -> None:
+    scheduler, manager, request = _request_kv_swap_test_scheduler(monkeypatch)
+    assert scheduler._start_request_kv_swap_out(request, "test") is None
+    scheduler._drain_managed_context_transfer_metadata()
+
+    scheduler.finish_requests("req", RequestStatus.FINISHED_ABORTED)
+
+    assert "req" not in scheduler.requests
+    assert scheduler._request_kv_swaps["req"].status == "expired"
+    assert manager.block_pool.freed_block_ids == []
+
+    scheduler._update_from_managed_context_transfer_finished(
+        ManagedContextTransferOutput(completed_store_event_ids=[0])
+    )
+
+    assert "req" not in scheduler._request_kv_swaps
+    assert "req" not in manager.req_to_blocks
+    assert manager.block_pool.freed_block_ids == [11, 10]
+    assert list(scheduler._managed_context_cpu_free_block_ids) == [2, 3, 0, 1]
+
+
+def _scheduler_for_cpu_capacity_pressure(
+    *,
+    evict_on_capacity: bool,
+) -> Scheduler:
+    scheduler = object.__new__(Scheduler)
+    key = ("trace", "T0001")
+    scheduler._managed_context_cpu_archive_enabled = True
+    scheduler._managed_context_cpu_max_blocks = 1
+    scheduler._managed_context_cpu_free_block_ids = deque()
+    scheduler._managed_context_archive_order = deque([key])
+    scheduler._managed_context_archive = {key: _span("T0001", "cpu_offloaded", 1)}
+    scheduler._managed_context_restore_reservations = {}
+    scheduler._managed_context_cpu_evict_on_capacity = evict_on_capacity
+    return scheduler
+
+
+def test_managed_context_cpu_alloc_evicts_when_enabled() -> None:
+    scheduler = _scheduler_for_cpu_capacity_pressure(evict_on_capacity=True)
+    released = []
+
+    def fake_release_managed_context_span(key, reason) -> None:
+        released.append((key, reason))
+        scheduler._managed_context_archive.pop(key, None)
+        scheduler._managed_context_cpu_free_block_ids.append(0)
+
+    scheduler._release_managed_context_span = fake_release_managed_context_span
+
+    assert scheduler._alloc_managed_context_cpu_blocks(1) == [0]
+    assert released == [(("trace", "T0001"), "cpu-block-limit")]
+
+
+def test_managed_context_cpu_alloc_can_preserve_archive_on_capacity() -> None:
+    scheduler = _scheduler_for_cpu_capacity_pressure(evict_on_capacity=False)
+    released = []
+
+    def fake_release_managed_context_span(key, reason) -> None:
+        released.append((key, reason))
+        scheduler._managed_context_archive.pop(key, None)
+        scheduler._managed_context_cpu_free_block_ids.append(0)
+
+    scheduler._release_managed_context_span = fake_release_managed_context_span
+
+    assert scheduler._alloc_managed_context_cpu_blocks(1) is None
+    assert released == []
+    assert ("trace", "T0001") in scheduler._managed_context_archive
+
+
+def _scheduler_for_archive_capacity_skip() -> Scheduler:
+    scheduler = object.__new__(Scheduler)
+    scheduler._managed_context_enabled = True
+    scheduler._managed_context_cpu_offload_immediate = True
+    scheduler._managed_context_cpu_evict_on_capacity = False
+    scheduler._managed_context_skip_compaction_on_cpu_capacity = True
+    scheduler._managed_context_cpu_free_block_ids = deque()
+    scheduler._managed_context_cpu_max_blocks = 1
+    scheduler._managed_context_archive_max_blocks = None
+    scheduler._managed_context_archive = {}
+    scheduler._managed_context_archive_order = deque()
+    scheduler._managed_context_restore_reservations = {}
+    scheduler._managed_context_active_restores = {}
+    scheduler._managed_context_deferred_restores = {}
+    scheduler._managed_context_pending_loads = {}
+    scheduler._managed_context_store_event_to_span = {}
+    scheduler._managed_context_load_event_to_request_id = {}
+    scheduler._managed_context_cpu_max_pending_store_events = 0
+    scheduler._managed_context_cpu_max_pending_load_events = 0
+    scheduler._managed_context_hot_gpu_stats = ManagedContextHotGPUStats(
+        budget_blocks=0
+    )
+    scheduler._phase4_pinned_blocks = {}
+    scheduler._managed_context_trace_id = lambda request: "trace"
+    return scheduler
+
+
+def test_managed_context_archive_skips_compaction_on_hard_cpu_capacity() -> None:
+    scheduler = _scheduler_for_archive_capacity_skip()
+    blocks = [
+        SimpleNamespace(is_null=False, logical_start=0, block_id=1),
+        SimpleNamespace(is_null=False, logical_start=16, block_id=2),
+    ]
+    compaction_mgr = SimpleNamespace(req_to_blocks={"req": blocks})
+    request = SimpleNamespace(request_id="req", _all_token_ids=list(range(64)))
+
+    span_ids = scheduler._archive_managed_context_span(
+        request,
+        compaction_mgr=compaction_mgr,
+        evict_start=0,
+        evict_end=32,
+        explicit_block_range=(0, 2),
+        last_turn_evicted=1,
+        stride_used=2,
+    )
+
+    assert span_ids is None
+    assert scheduler._managed_context_archive == {}
+
+
+def test_archive_capacity_skip_log_is_rate_limited(monkeypatch) -> None:
+    scheduler = _scheduler_for_archive_capacity_skip()
+    blocks = [
+        SimpleNamespace(is_null=False, logical_start=0, block_id=1),
+        SimpleNamespace(is_null=False, logical_start=16, block_id=2),
+    ]
+    compaction_mgr = SimpleNamespace(req_to_blocks={"req": blocks})
+    request = SimpleNamespace(request_id="req", _all_token_ids=list(range(64)))
+    warnings = []
+
+    def fake_warning(message, *args, **kwargs) -> None:
+        warnings.append(message)
+
+    monkeypatch.setattr(scheduler_mod.logger, "warning", fake_warning)
+    for _ in range(2):
+        assert scheduler._archive_managed_context_span(
+            request,
+            compaction_mgr=compaction_mgr,
+            evict_start=0,
+            evict_end=32,
+            explicit_block_range=(0, 2),
+            last_turn_evicted=1,
+            stride_used=2,
+        ) is None
+    scheduler._managed_context_cpu_free_block_ids.append(0)
+    assert scheduler._archive_managed_context_span(
+        request,
+        compaction_mgr=compaction_mgr,
+        evict_start=0,
+        evict_end=32,
+        explicit_block_range=(0, 2),
+        last_turn_evicted=1,
+        stride_used=2,
+    ) is None
+
+    assert warnings.count(
+        "[MANAGED-CONTEXT-COMPACT-SKIP-CAPACITY] req=%s trace=%s "
+        "evict=[%d,%d) blocks=%d cpu_free=%d cpu_max=%d "
+        "gpu_pinned_blocks=%d managed=%s"
+    ) == 2
+
+
+def test_retry_managed_context_gpu_pinned_offload_retries_when_capacity_exists() -> None:
+    scheduler = object.__new__(Scheduler)
+    key = ("trace", "T0001")
+    span = _span("T0001", "gpu_pinned", 1)
+    scheduler._managed_context_enabled = True
+    scheduler._managed_context_cpu_offload_immediate = True
+    scheduler._managed_context_cpu_evict_on_capacity = False
+    scheduler._managed_context_cpu_free_block_ids = deque([0])
+    scheduler._managed_context_cpu_max_pending_store_events = 0
+    scheduler._managed_context_store_event_to_span = {}
+    scheduler._managed_context_archive_order = deque([key])
+    scheduler._managed_context_archive = {key: span}
+    started = []
+
+    def fake_start_managed_context_cpu_offload(span, reason):
+        started.append((span.span_id, reason))
+        span.status = "offload_pending"
+        return None
+
+    scheduler._start_managed_context_cpu_offload = (
+        fake_start_managed_context_cpu_offload
+    )
+
+    assert scheduler._retry_managed_context_gpu_pinned_offloads("test") == 1
+    assert started == [("T0001", "test")]
+
+
+def test_retry_managed_context_gpu_pinned_offload_skips_hard_capacity() -> None:
+    scheduler = object.__new__(Scheduler)
+    key = ("trace", "T0001")
+    span = _span("T0001", "gpu_pinned", 2)
+    scheduler._managed_context_enabled = True
+    scheduler._managed_context_cpu_offload_immediate = True
+    scheduler._managed_context_cpu_evict_on_capacity = False
+    scheduler._managed_context_cpu_free_block_ids = deque([0])
+    scheduler._managed_context_cpu_max_pending_store_events = 0
+    scheduler._managed_context_store_event_to_span = {}
+    scheduler._managed_context_archive_order = deque([key])
+    scheduler._managed_context_archive = {key: span}
+    scheduler._start_managed_context_cpu_offload = lambda span, reason: None
+
+    assert scheduler._retry_managed_context_gpu_pinned_offloads("test") == 0
+    assert span.status == "gpu_pinned"
+
+
+def _request_with_restore_args() -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id="request",
+        managed_context_defer_restore_until_prefill=True,
+        sampling_params=SimpleNamespace(
+            extra_args={
+                "kve_restore_span_ids": ["T0001"],
+                "kve_restore_defer_until_prefill": True,
+                "kve_restore_after_visible_tokens": 128,
+                "other": "kept",
+            }
+        ),
+    )
+
+
+def test_managed_context_drops_oversize_restore_by_default() -> None:
+    scheduler = object.__new__(Scheduler)
+    released = []
+    scheduler._release_managed_context_restore_reservation = (
+        lambda request_id, reason: released.append(("reserve", request_id, reason))
+    )
+    scheduler._release_managed_context_deferred_restore = (
+        lambda request_id, reason: released.append(("deferred", request_id, reason))
+    )
+    request = _request_with_restore_args()
+
+    dropped = scheduler._drop_unavailable_managed_context_restore(
+        request,
+        "restore would exceed max_model_len: visible=16000 hidden=512 max=16384",
+    )
+
+    assert dropped
+    assert request.managed_context_defer_restore_until_prefill is False
+    assert request.sampling_params.extra_args == {"other": "kept"}
+    assert released == [
+        ("reserve", "request", "restore-dropped"),
+        ("deferred", "request", "restore-dropped"),
+    ]
+
+
+def test_managed_context_keeps_unavailable_restore_by_default() -> None:
+    scheduler = object.__new__(Scheduler)
+    scheduler._release_managed_context_restore_reservation = (
+        lambda request_id, reason: None
+    )
+    scheduler._release_managed_context_deferred_restore = (
+        lambda request_id, reason: None
+    )
+    request = _request_with_restore_args()
+
+    dropped = scheduler._drop_unavailable_managed_context_restore(
+        request,
+        "span 'T0001' is not available for this trace",
+    )
+
+    assert not dropped
+    assert request.managed_context_defer_restore_until_prefill is True
+    assert "kve_restore_span_ids" in request.sampling_params.extra_args
+
+
+def test_managed_context_cpu_offload_respects_pending_store_limit() -> None:
+    scheduler = object.__new__(Scheduler)
+    scheduler._managed_context_cpu_archive_enabled = True
+    scheduler._managed_context_cpu_max_pending_store_events = 1
+    scheduler._managed_context_store_event_to_span = {
+        1: _span("T0001", "offload_pending", 1),
+    }
+    span = _span("T0002", "gpu_pinned", 1)
+    span.entries = [(SimpleNamespace(), [SimpleNamespace(block_id=7)])]
+
+    error = scheduler._start_managed_context_cpu_offload(span, "test")
+
+    assert error == (
+        "managed-context CPU store transfer limit reached: pending=1 max=1"
+    )
+    assert span.status == "gpu_pinned"
+
+
+def test_managed_context_cpu_offload_counts_request_kv_swap_store_limit() -> None:
+    scheduler = object.__new__(Scheduler)
+    scheduler._managed_context_cpu_archive_enabled = True
+    scheduler._managed_context_cpu_max_pending_store_events = 1
+    scheduler._managed_context_store_event_to_span = {}
+    scheduler._request_kv_swap_store_event_to_request_id = {1: "request"}
+    span = _span("T0002", "gpu_pinned", 1)
+    span.entries = [(SimpleNamespace(), [SimpleNamespace(block_id=7)])]
+
+    error = scheduler._start_managed_context_cpu_offload(span, "test")
+
+    assert error == (
+        "managed-context CPU store transfer limit reached: pending=1 max=1"
+    )
+    assert span.status == "gpu_pinned"
+
+
+def test_managed_context_cpu_load_limit_is_retryable() -> None:
+    scheduler = object.__new__(Scheduler)
+    scheduler._managed_context_pending_loads = {}
+    scheduler._managed_context_cpu_max_pending_load_events = 1
+    scheduler._managed_context_load_event_to_request_id = {1: "other"}
+    request = SimpleNamespace(request_id="reader")
+    span = _span("T0001", "cpu_offloaded", 1)
+
+    start = scheduler._start_managed_context_cpu_load(request, [span])
+
+    assert start.error == (
+        "managed-context CPU load transfer limit reached: pending=1 max=1"
+    )
+    assert start.retryable

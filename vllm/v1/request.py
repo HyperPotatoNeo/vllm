@@ -156,6 +156,9 @@ class Request:
         self.compaction_events: list = []
         # Flag: request was compacted and needs model runner rebuild.
         self.needs_rebuild: bool = False
+        # Managed context: model-selected retries must prefill their visible
+        # retry suffix before restored hidden KV is attached for answer decode.
+        self.managed_context_defer_restore_until_prefill: bool = False
 
         # Turn tracking (only populated when compaction_max_turns > 0).
         # Absolute positions (in the CURRENT post-eviction _all_token_ids)
