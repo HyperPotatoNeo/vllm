@@ -229,16 +229,16 @@ class KVCacheManager:
         # (`physical + position_offset * is_post_sys`) then naturally
         # rotates Q correctly without re-prefilling the inherited tail.
         if inherited_offset > 0:
-            # request.position_offset must be 0 here (fresh request — this
-            # is usually the only call to get_computed_blocks per request).
-            # A scheduler diagnostic may defer a WAITING request after this
-            # seed and retry it later; allow the retry when it rediscovers
-            # the same frame.
-            assert request.position_offset in (0, inherited_offset), (
-                f"unexpected non-zero position_offset={request.position_offset} "
-                f"on a request hitting prefix cache with inherited frame "
-                f"offset {inherited_offset}"
-            )
+            # A WAITING request can be deferred after this seed and later
+            # rediscover a different cached frame after pressure/load churn.
+            # Use the frame returned by the current prefix-cache hit.
+            if request.position_offset not in (0, inherited_offset):
+                logger.warning(
+                    "[DIAG-INHERIT-RESEED] req=%s position_offset=%d -> %d",
+                    request.request_id[:8],
+                    request.position_offset,
+                    inherited_offset,
+                )
             request.position_offset = inherited_offset
             if os.environ.get("KV_EVICTION_BUG_TRACE") == "1":
                 logger.warning(

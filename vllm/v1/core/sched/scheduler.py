@@ -4880,7 +4880,11 @@ class Scheduler(SchedulerInterface):
 
     def _pin_phase4_request_blocks(self, request: Request) -> None:
         trace_id = self._phase4_trace_id(request)
-        if not trace_id or request.status == RequestStatus.FINISHED_ABORTED:
+        if not trace_id or request.status in (
+            RequestStatus.FINISHED_ABORTED,
+            RequestStatus.FINISHED_ERROR,
+            RequestStatus.FINISHED_IGNORED,
+        ):
             return
 
         entries: list[tuple[Any, list[Any]]] = []

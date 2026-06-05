@@ -108,6 +108,32 @@ def make_kv_cache_config(block_size: int, num_blocks: int) -> KVCacheConfig:
     )
 
 
+def test_get_computed_blocks_reseeds_changed_position_offset():
+    block_size = 16
+    manager = KVCacheManager(
+        make_kv_cache_config(block_size, 4),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    req = make_request("req", [1] * 33, block_size, sha256)
+    req.position_offset = 608
+
+    class FakeCoordinator:
+        def find_longest_cache_hit(self, block_hashes, max_cache_hit_length):
+            return ([],), block_size, 576
+
+    manager.coordinator = FakeCoordinator()
+
+    _computed_blocks, num_computed_tokens, inherited_offset = (
+        manager.get_computed_blocks(req)
+    )
+
+    assert num_computed_tokens == block_size
+    assert inherited_offset == 576
+    assert req.position_offset == 576
+
+
 def make_kv_cache_config_hybrid_model(
     block_size: int,
     num_blocks: int,

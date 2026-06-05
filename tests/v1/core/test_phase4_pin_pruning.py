@@ -593,6 +593,25 @@ def test_phase4_stall_pressure_does_not_report_pending_pin_progress() -> None:
     assert scheduler._phase4_pinned_blocks["trace"].status == "store_pending"
 
 
+def test_phase4_error_request_does_not_replace_pin() -> None:
+    scheduler = _scheduler_with_requests(set())
+    scheduler._phase4_pinned_blocks = {"trace": _pin(token_count=128)}
+    scheduler._phase4_pin_order = deque(["trace"])
+    request = _request("trace", expected_cached_tokens=128)
+    request.status = RequestStatus.FINISHED_ERROR
+    released = []
+
+    def fake_release_phase4_pins(trace_id, reason, *, evict_prefix=False):
+        released.append((trace_id, reason, evict_prefix))
+
+    scheduler._release_phase4_pins = fake_release_phase4_pins
+
+    scheduler._pin_phase4_request_blocks(request)
+
+    assert released == []
+    assert scheduler._phase4_pinned_blocks["trace"].token_count == 128
+
+
 def test_phase4_stall_pressure_releases_multiple_pins(monkeypatch) -> None:
     monkeypatch.setenv("KVE_PHASE4_STALL_PRESSURE_RELEASE_MAX", "3")
     scheduler = _scheduler_with_requests(set())
