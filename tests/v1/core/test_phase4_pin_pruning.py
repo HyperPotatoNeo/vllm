@@ -3,7 +3,12 @@ from collections import deque
 from types import SimpleNamespace
 
 from vllm.v1.outputs import ManagedContextTransferOutput
-from vllm.v1.core.sched.scheduler import Phase4Pin, Scheduler
+from vllm.v1.core.sched.scheduler import (
+    ManagedContextHotGPUStats,
+    ManagedContextSpan,
+    Phase4Pin,
+    Scheduler,
+)
 from vllm.v1.request import RequestStatus
 
 
@@ -57,6 +62,10 @@ def _scheduler_with_requests(request_ids: set[str]) -> Scheduler:
     scheduler._managed_context_restore_reservations = {}
     scheduler._managed_context_archive = {}
     scheduler._managed_context_archive_order = deque()
+    scheduler._managed_context_hot_gpu_order = deque()
+    scheduler._managed_context_hot_gpu_stats = ManagedContextHotGPUStats(
+        budget_blocks=0
+    )
     scheduler._managed_context_store_events_to_submit = {}
     scheduler._managed_context_load_events_to_submit = {}
     scheduler._managed_context_store_event_to_span = {}
@@ -119,11 +128,14 @@ def _pin(
     consumed_by_request_id: str | None = None,
     consumed_at: float | None = None,
     entries=None,
+    block_count: int | None = None,
 ) -> Phase4Pin:
+    if block_count is None:
+        block_count = sum(len(blocks) for _manager, blocks in entries or [])
     return Phase4Pin(
         entries=[] if entries is None else entries,
         token_count=token_count,
-        block_count=0,
+        block_count=block_count,
         request_id="writer",
         call_idx=1,
         created_at=time.monotonic() - 100.0,
@@ -567,6 +579,148 @@ def test_phase4_pin_store_and_load_completion_round_trip(
         2,
         3,
     ]
+
+
+def test_phase4_proactive_offload_moves_nonproductive_pin_to_cpu(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_PHASE4_PROACTIVE_CPU_OFFLOAD", "1")
+    scheduler = _scheduler_with_requests(set())
+    scheduler._managed_context_cpu_archive_enabled = True
+    scheduler._managed_context_cpu_max_blocks = 16
+    scheduler._managed_context_cpu_free_block_ids = deque(range(16))
+    block_pool = _FakeBlockPool()
+    manager = SimpleNamespace(block_size=16, block_pool=block_pool)
+    blocks = [
+        SimpleNamespace(block_id=10, logical_start=128, block_hash="a"),
+        SimpleNamespace(block_id=11, logical_start=144, block_hash="b"),
+    ]
+    scheduler._phase4_pinned_blocks = {
+        "trace": _pin(token_count=128, entries=[(manager, blocks)])
+    }
+    scheduler._phase4_pin_order = deque(["trace"])
+
+    assert (
+        scheduler._proactively_offload_nonproductive_phase4_pins("test")
+        == 1
+    )
+
+    pin = scheduler._phase4_pinned_blocks["trace"]
+    assert pin.status == "store_pending"
+    assert pin.store_event_id == 0
+    assert pin.cpu_block_ids_by_group == ([0, 1],)
+    assert scheduler._managed_context_store_events_to_submit[0].gpu_block_ids == [
+        10,
+        11,
+    ]
+    assert block_pool.freed_blocks == []
+
+
+def test_phase4_proactive_offload_keeps_running_trace_gpu(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_PHASE4_PROACTIVE_CPU_OFFLOAD", "1")
+    scheduler = _scheduler_with_requests({"reader"})
+    scheduler._managed_context_cpu_archive_enabled = True
+    scheduler._managed_context_cpu_max_blocks = 16
+    scheduler._managed_context_cpu_free_block_ids = deque(range(16))
+    request = _request("trace", request_id="reader")
+    request.status = RequestStatus.RUNNING
+    scheduler.requests = {"reader": request}
+    scheduler.running = [request]
+    block_pool = _FakeBlockPool()
+    manager = SimpleNamespace(block_size=16, block_pool=block_pool)
+    blocks = [
+        SimpleNamespace(block_id=10, logical_start=128, block_hash="a"),
+        SimpleNamespace(block_id=11, logical_start=144, block_hash="b"),
+    ]
+    scheduler._phase4_pinned_blocks = {
+        "trace": _pin(token_count=128, entries=[(manager, blocks)])
+    }
+    scheduler._phase4_pin_order = deque(["trace"])
+
+    assert (
+        scheduler._proactively_offload_nonproductive_phase4_pins("test")
+        == 0
+    )
+
+    assert scheduler._phase4_pinned_blocks["trace"].status == "gpu_pinned"
+    assert scheduler._managed_context_store_events_to_submit == {}
+    assert block_pool.freed_blocks == []
+
+
+def test_phase4_proactive_releases_nonproductive_hot_gpu_span(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_PHASE4_PROACTIVE_CPU_OFFLOAD", "1")
+    scheduler = _scheduler_with_requests(set())
+    scheduler._managed_context_cpu_archive_enabled = True
+    block_pool = _FakeBlockPool()
+    manager = SimpleNamespace(block_size=16, block_pool=block_pool)
+    blocks = [
+        SimpleNamespace(block_id=10, logical_start=128, block_hash="a"),
+        SimpleNamespace(block_id=11, logical_start=144, block_hash="b"),
+    ]
+    span = ManagedContextSpan(
+        span_id="T0001",
+        trace_id="trace",
+        request_id="writer",
+        absolute_turn_start=0,
+        absolute_turn_end=1,
+        token_ids=[1, 2],
+        entries=[(manager, blocks)],
+        kv_block_count=2,
+        logical_start_by_group=[[128, 144]],
+        position_offset_frame=0,
+        evict_start=0,
+        evict_end=2,
+        created_at=time.monotonic(),
+        status="cpu_hot",
+        cpu_block_ids_by_group=([0, 1],),
+    )
+    scheduler._managed_context_archive = {("trace", "T0001"): span}
+    scheduler._managed_context_hot_gpu_order = deque([("trace", "T0001")])
+    scheduler._managed_context_hot_gpu_stats = ManagedContextHotGPUStats(
+        budget_blocks=16,
+        resident_blocks=2,
+    )
+
+    assert (
+        scheduler._proactively_release_nonproductive_hot_gpu_spans("test")
+        == 2
+    )
+
+    assert span.status == "cpu_offloaded"
+    assert span.entries == []
+    assert block_pool.freed_blocks == blocks
+    assert scheduler._managed_context_hot_gpu_stats.resident_blocks == 0
+
+
+def test_phase4_pin_load_watermark_parks_projected_high_usage(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_PHASE4_PIN_LOAD_TARGET_USAGE", "0.50")
+    scheduler = _scheduler_with_requests({"reader"})
+    scheduler._managed_context_cpu_archive_enabled = True
+    scheduler._managed_context_cpu_free_block_ids = deque(range(16))
+    block_pool = _FakeBlockPool(new_block_ids=[20, 21, 22, 23, 24])
+    block_pool.num_gpu_blocks = 10
+    manager = SimpleNamespace(block_size=16, block_pool=block_pool)
+    scheduler.kv_cache_manager = SimpleNamespace(
+        coordinator=SimpleNamespace(single_type_managers=[manager])
+    )
+    pin = _pin(token_count=128, block_count=2)
+    pin.status = "cpu_offloaded"
+    pin.cpu_block_ids_by_group = ([0, 1],)
+    pin.logical_start_by_group = ([128, 144],)
+
+    error = scheduler._start_phase4_pin_cpu_load("trace", pin, reason="test")
+
+    assert error is not None
+    assert error.startswith("Phase4 pin load is parked by GPU watermark")
+    assert Scheduler._phase4_pin_recovery_defers(error)
+    assert pin.status == "cpu_offloaded"
+    assert scheduler._managed_context_load_events_to_submit == {}
 
 
 def test_phase4_prefix_miss_reprefill_requires_explicit_opt_in(

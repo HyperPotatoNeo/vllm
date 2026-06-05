@@ -863,6 +863,19 @@ class Scheduler(SchedulerInterface):
             )
             for pending in self._managed_context_pending_loads.values()
         )
+        phase4_pin_statuses: defaultdict[str, int] = defaultdict(int)
+        phase4_pin_blocks_by_status: defaultdict[str, int] = defaultdict(int)
+        phase4_gpu_resident_statuses = {
+            "gpu_pinned",
+            "store_pending",
+            "load_pending",
+        }
+        phase4_pin_gpu_blocks = 0
+        for pin in self._phase4_pinned_blocks.values():
+            phase4_pin_statuses[pin.status] += 1
+            phase4_pin_blocks_by_status[pin.status] += pin.block_count
+            if pin.status in phase4_gpu_resident_statuses:
+                phase4_pin_gpu_blocks += pin.block_count
         return {
             "archive_spans": dict(sorted(archive_by_status.items())),
             "archive_blocks": dict(sorted(archive_blocks_by_status.items())),
@@ -889,6 +902,11 @@ class Scheduler(SchedulerInterface):
             "phase4_pin_blocks": sum(
                 pin.block_count for pin in self._phase4_pinned_blocks.values()
             ),
+            "phase4_pin_statuses": dict(sorted(phase4_pin_statuses.items())),
+            "phase4_pin_blocks_by_status": dict(
+                sorted(phase4_pin_blocks_by_status.items())
+            ),
+            "phase4_pin_gpu_blocks": phase4_pin_gpu_blocks,
             "cpu_free_blocks": len(self._managed_context_cpu_free_block_ids),
             "cpu_max_blocks": self._managed_context_cpu_max_blocks,
             "unprotected_gpu_pinned_spans": unprotected_gpu_pinned_spans,
@@ -1142,6 +1160,7 @@ class Scheduler(SchedulerInterface):
         self._prune_phase4_pins()
         self.kv_cache_manager.new_step_starts()
         self._retry_managed_context_gpu_pinned_offloads("schedule-start")
+        self._proactively_offload_nonproductive_kv("schedule-start")
         pressure_preempted_req = self._preempt_request_for_kv_swap_pressure(
             scheduled_timestamp,
             reason="schedule-start-headroom",
@@ -4332,6 +4351,182 @@ class Scheduler(SchedulerInterface):
         except ValueError:
             return 2.0
 
+    def _phase4_proactive_cpu_offload_enabled(self) -> bool:
+        if not self._managed_context_cpu_archive_enabled:
+            return False
+        raw = os.environ.get("KVE_PHASE4_PROACTIVE_CPU_OFFLOAD", "0")
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+
+    def _phase4_proactive_max_pin_offloads_per_step(self) -> int:
+        return max(
+            1,
+            self._env_int("KVE_PHASE4_PROACTIVE_MAX_PIN_OFFLOADS_PER_STEP", 8),
+        )
+
+    def _phase4_proactive_keep_queued_successors(self) -> int:
+        return max(
+            0,
+            self._env_int("KVE_PHASE4_PROACTIVE_KEEP_QUEUED_SUCCESSORS", 0),
+        )
+
+    def _phase4_request_trace_id_if_available(self, request: Any) -> str:
+        if request is None or not hasattr(request, "sampling_params"):
+            return ""
+        try:
+            return self._phase4_trace_id(request)
+        except AttributeError:
+            return ""
+
+    def _phase4_productive_gpu_trace_ids(self) -> set[str]:
+        trace_ids: set[str] = set()
+
+        def add_request(request: Any) -> None:
+            trace_id = self._phase4_request_trace_id_if_available(request)
+            if trace_id:
+                trace_ids.add(trace_id)
+
+        for request in self.running:
+            add_request(request)
+
+        for request_id in itertools.chain(
+            self._managed_context_active_restores,
+            self._managed_context_deferred_restores,
+            self._managed_context_pending_loads,
+            self._managed_context_restore_reservations,
+        ):
+            add_request(self.requests.get(request_id))
+
+        queued_budget = self._phase4_proactive_keep_queued_successors()
+        if queued_budget <= 0:
+            return trace_ids
+
+        kept = 0
+        for request_queue in (self.waiting, self.skipped_waiting):
+            for request in request_queue:
+                if kept >= queued_budget:
+                    return trace_ids
+                if getattr(request, "status", None) not in (
+                    RequestStatus.WAITING,
+                    RequestStatus.PREEMPTED,
+                ):
+                    continue
+                trace_id = self._phase4_request_trace_id_if_available(request)
+                if not trace_id:
+                    continue
+                pin = self._phase4_pinned_blocks.get(trace_id)
+                expected_cached_tokens = self._phase4_expected_cached_tokens(
+                    request
+                )
+                if (
+                    pin is None
+                    or expected_cached_tokens is None
+                    or expected_cached_tokens > pin.token_count
+                ):
+                    continue
+                trace_ids.add(trace_id)
+                kept += 1
+
+        return trace_ids
+
+    def _proactively_release_nonproductive_hot_gpu_spans(
+        self, reason: str
+    ) -> int:
+        if not self._phase4_proactive_cpu_offload_enabled():
+            return 0
+        productive_trace_ids = self._phase4_productive_gpu_trace_ids()
+        protected_keys = self._managed_context_cpu_archive_protected_keys()
+        released_blocks = 0
+        for key in list(self._managed_context_hot_gpu_order):
+            span = self._managed_context_archive.get(key)
+            if (
+                span is None
+                or span.status != "cpu_hot"
+                or key in protected_keys
+                or span.trace_id in productive_trace_ids
+            ):
+                continue
+            released_blocks += self._release_managed_context_hot_gpu_span(
+                span,
+                reason,
+            )
+        return released_blocks
+
+    def _proactively_offload_nonproductive_phase4_pins(
+        self, reason: str
+    ) -> int:
+        if not self._phase4_proactive_cpu_offload_enabled():
+            return 0
+        self._compact_phase4_pin_order()
+        productive_trace_ids = self._phase4_productive_gpu_trace_ids()
+        candidates: list[tuple[str, Phase4Pin]] = []
+        for trace_id in self._phase4_pin_order:
+            if trace_id in productive_trace_ids:
+                continue
+            pin = self._phase4_pinned_blocks.get(trace_id)
+            if pin is None or pin.status != "gpu_pinned" or not pin.entries:
+                continue
+            candidates.append((trace_id, pin))
+
+        if self._request_kv_swap_pressure_largest_first_enabled():
+            candidates.sort(key=lambda item: item[1].block_count, reverse=True)
+
+        started = 0
+        max_started = self._phase4_proactive_max_pin_offloads_per_step()
+        for trace_id, pin in candidates:
+            if started >= max_started:
+                break
+            error = self._start_phase4_pin_cpu_offload(
+                trace_id,
+                pin,
+                reason=reason,
+            )
+            if error is None:
+                started += 1
+                continue
+            if (
+                error.startswith("managed-context CPU store transfer limit reached")
+                or " CPU blocks, " in error
+            ):
+                break
+            if os.environ.get("KVE_TRACE_PHASE4_PIN") == "1":
+                logger.warning(
+                    "[PHASE4-PIN-PROACTIVE-OFFLOAD-SKIP] trace=%s "
+                    "reason=%s error=%s",
+                    trace_id,
+                    reason,
+                    error,
+                )
+        return started
+
+    def _proactively_offload_nonproductive_kv(self, reason: str) -> None:
+        if not self._phase4_proactive_cpu_offload_enabled():
+            return
+        before_pools = None
+        before_managed = None
+        trace_enabled = os.environ.get("KVE_TRACE_PHASE4_PIN") == "1"
+        if trace_enabled:
+            before_pools = self._kve_gpu_block_pool_diag_summary()
+            before_managed = self._kve_managed_context_diag_summary()
+        hot_released_blocks = self._proactively_release_nonproductive_hot_gpu_spans(
+            reason
+        )
+        pin_offloads = self._proactively_offload_nonproductive_phase4_pins(
+            reason
+        )
+        if trace_enabled and (hot_released_blocks or pin_offloads):
+            logger.warning(
+                "[PHASE4-PROACTIVE-CPU-OFFLOAD] reason=%s "
+                "hot_released_blocks=%d pin_offloads=%d pools_before=%s "
+                "managed_before=%s pools_after=%s managed_after=%s",
+                reason,
+                hot_released_blocks,
+                pin_offloads,
+                before_pools,
+                before_managed,
+                self._kve_gpu_block_pool_diag_summary(),
+                self._kve_managed_context_diag_summary(),
+            )
+
     def _release_phase4_pins(
         self, trace_id: str, reason: str, *, evict_prefix: bool = False
     ) -> None:
@@ -4577,14 +4772,9 @@ class Scheduler(SchedulerInterface):
         managers = self.kv_cache_manager.coordinator.single_type_managers
         if len(managers) != len(pin.cpu_block_ids_by_group):
             return "Phase4 pin has incomplete manager metadata"
-        free_blocks = min(
-            manager.block_pool.get_num_free_blocks() for manager in managers
-        )
-        if free_blocks < pin.block_count:
-            return (
-                "Phase4 pin load is waiting for GPU blocks: "
-                f"reload_blocks={pin.block_count} free={free_blocks}"
-            )
+        capacity_error = self._phase4_pin_load_capacity_error(pin)
+        if capacity_error is not None:
+            return capacity_error
 
         entries: list[tuple[Any, list[Any]]] = []
         gpu_block_ids: list[int] = []
@@ -4675,8 +4865,64 @@ class Scheduler(SchedulerInterface):
         return (
             reason.endswith("submitted")
             or " is waiting for " in reason
+            or " is parked by GPU watermark" in reason
             or " transfer limit reached" in reason
             or reason.startswith("insufficient GPU blocks for Phase4 pin load")
+        )
+
+    def _phase4_pin_load_headroom_blocks(self) -> int:
+        explicit_headroom = self._env_optional_int(
+            "KVE_PHASE4_PIN_LOAD_HEADROOM_BLOCKS"
+        )
+        if explicit_headroom is not None:
+            return explicit_headroom
+        return self._request_kv_swap_gpu_headroom_blocks()
+
+    def _phase4_pin_load_target_usage(self) -> float | None:
+        explicit_target = self._request_kv_swap_usage_watermark(
+            "KVE_PHASE4_PIN_LOAD_TARGET_USAGE"
+        )
+        if explicit_target is not None:
+            return explicit_target
+        return self._request_kv_swap_reload_target_usage()
+
+    def _phase4_pin_load_capacity_error(
+        self,
+        pin: Phase4Pin,
+    ) -> str | None:
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        if not managers:
+            return None
+        free_blocks = min(
+            manager.block_pool.get_num_free_blocks() for manager in managers
+        )
+        min_free = self._phase4_pin_load_headroom_blocks()
+        required_blocks = pin.block_count + min_free
+        if free_blocks < required_blocks:
+            return (
+                "Phase4 pin load is waiting for GPU blocks: "
+                f"reload_blocks={pin.block_count} free={free_blocks} "
+                f"min_free={min_free} required={required_blocks}"
+            )
+
+        target_usage = self._phase4_pin_load_target_usage()
+        if target_usage is None:
+            return None
+        total_blocks, pool_free_blocks = self._request_kv_swap_gpu_block_pool_stats()
+        if total_blocks <= 0:
+            return None
+        used_blocks = max(0, total_blocks - pool_free_blocks)
+        projected_used_blocks = used_blocks + pin.block_count
+        target_used_blocks = int(total_blocks * target_usage)
+        if projected_used_blocks <= target_used_blocks:
+            return None
+        return (
+            "Phase4 pin load is parked by GPU watermark: "
+            f"reload_blocks={pin.block_count} used={used_blocks} "
+            f"free={pool_free_blocks} total={total_blocks} "
+            f"min_free={min_free} target_usage={target_usage:.3f} "
+            f"target_used={target_used_blocks} "
+            f"projected_used={projected_used_blocks}"
         )
 
     def _phase4_try_load_pin_for_prefix_miss(
