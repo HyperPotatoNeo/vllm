@@ -274,6 +274,38 @@ def test_compacted_preempt_request_kv_swap_store_queue_full_defers_without_repre
     assert list(scheduler._managed_context_cpu_free_block_ids) == [0, 1, 2, 3]
 
 
+def test_compacted_preempt_request_kv_swap_cpu_capacity_defers_without_reprefill(
+    monkeypatch,
+) -> None:
+    scheduler, manager, request = _request_kv_swap_test_scheduler(monkeypatch)
+    _make_request_running_for_preempt_test(request)
+    scheduler._managed_context_cpu_free_block_ids = deque([0])
+    scheduler._managed_context_cpu_max_blocks = 1
+
+    def fail_reprefill(*args, **kwargs):
+        raise AssertionError("compact re-prefill must not run")
+
+    scheduler._preempt_request_for_reprefill = fail_reprefill
+
+    result = scheduler._preempt_request(request, 123.0)
+
+    assert result.kind == "deferred"
+    assert result.error == "request KV swap needs 2 CPU blocks, available=1 max=1"
+    assert request.status == RequestStatus.RUNNING
+    assert request.num_preemptions == 0
+    assert request.num_computed_tokens == 64
+    assert request.num_cached_tokens == 64
+    assert request.position_offset == 128
+    assert request.spec_token_ids == [99]
+    assert list(scheduler.waiting) == []
+    assert scheduler._request_kv_swaps == {}
+    assert scheduler._managed_context_store_events_to_submit == {}
+    assert [block.block_id for block in manager.req_to_blocks["req"]] == [10, 11]
+    assert manager.num_cached_block == {"req": 1}
+    assert manager.block_pool.freed_block_ids == []
+    assert list(scheduler._managed_context_cpu_free_block_ids) == [0]
+
+
 def test_compacted_preempt_current_step_request_defers_without_async_swap(
     monkeypatch,
 ) -> None:

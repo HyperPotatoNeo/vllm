@@ -4702,6 +4702,10 @@ class Scheduler(SchedulerInterface):
         }
         return (
             error in exactness_or_backpressure_errors
+            or (
+                error.startswith("request KV swap needs ")
+                and " CPU blocks, " in error
+            )
             or error.startswith("managed-context CPU store transfer limit reached")
         )
 
