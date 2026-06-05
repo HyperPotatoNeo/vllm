@@ -5820,6 +5820,7 @@ class Scheduler(SchedulerInterface):
         )
         if capacity_error is not None:
             return capacity_error
+        min_free = self._request_kv_swap_gpu_headroom_blocks()
 
         entries: list[tuple[Any, list[Any]]] = []
         gpu_block_ids: list[int] = []

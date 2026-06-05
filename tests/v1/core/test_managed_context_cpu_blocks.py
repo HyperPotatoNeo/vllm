@@ -543,6 +543,7 @@ def test_request_kv_swap_reload_watermark_allows_projected_safe_usage(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("KVE_REQUEST_KV_SWAP_RELOAD_TARGET_USAGE", "0.80")
+    monkeypatch.setenv("KVE_TRACE_REQUEST_KV_SWAP", "1")
     scheduler, _manager, request = _request_kv_swap_test_scheduler(
         monkeypatch,
         gpu_free_blocks=5,
@@ -551,9 +552,14 @@ def test_request_kv_swap_reload_watermark_allows_projected_safe_usage(
     swap = SimpleNamespace(
         status="swapped",
         created_at=time.monotonic(),
+        cpu_block_ids_by_group=([0, 1],),
         kv_block_count=2,
         logical_start_by_group=([0, 16],),
         num_computed_tokens=request.num_computed_tokens,
+        position_offset=request.position_offset,
+        entries=[],
+        store_event_id=None,
+        load_event_id=None,
         last_error=None,
     )
     scheduler._request_kv_swaps["req"] = swap
@@ -562,6 +568,11 @@ def test_request_kv_swap_reload_watermark_allows_projected_safe_usage(
         swap,
         extra_required_gpu_blocks=1,
     ) is None
+    assert scheduler._start_request_kv_swap_load(
+        request,
+        extra_required_gpu_blocks=1,
+    ) is None
+    assert scheduler._request_kv_swaps["req"].status == "load_pending"
 
 
 def test_request_kv_swap_load_completion_restores_request_and_frees_cpu(
