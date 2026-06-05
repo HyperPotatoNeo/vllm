@@ -129,6 +129,7 @@ def _pin(
     consumed_at: float | None = None,
     entries=None,
     block_count: int | None = None,
+    last_loaded_at: float | None = None,
 ) -> Phase4Pin:
     if block_count is None:
         block_count = sum(len(blocks) for _manager, blocks in entries or [])
@@ -141,6 +142,7 @@ def _pin(
         created_at=time.monotonic() - 100.0,
         consumed_by_request_id=consumed_by_request_id,
         consumed_at=consumed_at,
+        last_loaded_at=last_loaded_at,
     )
 
 
@@ -560,6 +562,7 @@ def test_phase4_pin_store_and_load_completion_round_trip(
     )
 
     assert pin.status == "gpu_pinned"
+    assert pin.last_loaded_at is not None
     assert pin.cpu_block_ids_by_group == ()
     assert [block.block_id for _manager, group in pin.entries for block in group] == [
         20,
@@ -636,6 +639,108 @@ def test_phase4_proactive_offload_keeps_running_trace_gpu(
     ]
     scheduler._phase4_pinned_blocks = {
         "trace": _pin(token_count=128, entries=[(manager, blocks)])
+    }
+    scheduler._phase4_pin_order = deque(["trace"])
+
+    assert (
+        scheduler._proactively_offload_nonproductive_phase4_pins("test")
+        == 0
+    )
+
+    assert scheduler._phase4_pinned_blocks["trace"].status == "gpu_pinned"
+    assert scheduler._managed_context_store_events_to_submit == {}
+    assert block_pool.freed_blocks == []
+
+
+def test_phase4_proactive_wrapper_skips_below_start_watermark(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_PHASE4_PROACTIVE_CPU_OFFLOAD", "1")
+    monkeypatch.setenv("KVE_PHASE4_PROACTIVE_OFFLOAD_START_USAGE", "0.90")
+    scheduler = _scheduler_with_requests(set())
+    scheduler._managed_context_cpu_archive_enabled = True
+    scheduler._managed_context_cpu_max_blocks = 16
+    scheduler._managed_context_cpu_free_block_ids = deque(range(16))
+    block_pool = _FakeBlockPool(new_block_ids=list(range(50)))
+    block_pool.num_gpu_blocks = 100
+    manager = SimpleNamespace(block_size=16, block_pool=block_pool)
+    scheduler.kv_cache_manager = SimpleNamespace(
+        coordinator=SimpleNamespace(single_type_managers=[manager])
+    )
+    blocks = [
+        SimpleNamespace(block_id=10, logical_start=128, block_hash="a"),
+        SimpleNamespace(block_id=11, logical_start=144, block_hash="b"),
+    ]
+    scheduler._phase4_pinned_blocks = {
+        "trace": _pin(token_count=128, entries=[(manager, blocks)])
+    }
+    scheduler._phase4_pin_order = deque(["trace"])
+
+    scheduler._proactively_offload_nonproductive_kv("test")
+
+    assert scheduler._phase4_pinned_blocks["trace"].status == "gpu_pinned"
+    assert scheduler._managed_context_store_events_to_submit == {}
+    assert block_pool.freed_blocks == []
+
+
+def test_phase4_proactive_wrapper_offloads_above_start_watermark(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_PHASE4_PROACTIVE_CPU_OFFLOAD", "1")
+    monkeypatch.setenv("KVE_PHASE4_PROACTIVE_OFFLOAD_START_USAGE", "0.90")
+    monkeypatch.setenv("KVE_PHASE4_PROACTIVE_OFFLOAD_STOP_USAGE", "0.78")
+    scheduler = _scheduler_with_requests(set())
+    scheduler._managed_context_cpu_archive_enabled = True
+    scheduler._managed_context_cpu_max_blocks = 16
+    scheduler._managed_context_cpu_free_block_ids = deque(range(16))
+    block_pool = _FakeBlockPool(new_block_ids=list(range(5)))
+    block_pool.num_gpu_blocks = 100
+    manager = SimpleNamespace(block_size=16, block_pool=block_pool)
+    scheduler.kv_cache_manager = SimpleNamespace(
+        coordinator=SimpleNamespace(single_type_managers=[manager])
+    )
+    blocks = [
+        SimpleNamespace(block_id=10, logical_start=128, block_hash="a"),
+        SimpleNamespace(block_id=11, logical_start=144, block_hash="b"),
+    ]
+    scheduler._phase4_pinned_blocks = {
+        "trace": _pin(token_count=128, entries=[(manager, blocks)])
+    }
+    scheduler._phase4_pin_order = deque(["trace"])
+
+    scheduler._proactively_offload_nonproductive_kv("test")
+
+    pin = scheduler._phase4_pinned_blocks["trace"]
+    assert pin.status == "store_pending"
+    assert pin.store_event_id == 0
+    assert scheduler._managed_context_store_events_to_submit[0].gpu_block_ids == [
+        10,
+        11,
+    ]
+
+
+def test_phase4_proactive_keeps_recent_loaded_queued_successor(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_PHASE4_PROACTIVE_CPU_OFFLOAD", "1")
+    monkeypatch.setenv("KVE_PHASE4_PROACTIVE_PIN_LOAD_GRACE_SECONDS", "60")
+    scheduler = _scheduler_with_requests({"reader"})
+    scheduler._managed_context_cpu_archive_enabled = True
+    scheduler._managed_context_cpu_max_blocks = 16
+    scheduler._managed_context_cpu_free_block_ids = deque(range(16))
+    scheduler.waiting.append(_request("trace", request_id="reader"))
+    block_pool = _FakeBlockPool()
+    manager = SimpleNamespace(block_size=16, block_pool=block_pool)
+    blocks = [
+        SimpleNamespace(block_id=10, logical_start=128, block_hash="a"),
+        SimpleNamespace(block_id=11, logical_start=144, block_hash="b"),
+    ]
+    scheduler._phase4_pinned_blocks = {
+        "trace": _pin(
+            token_count=128,
+            entries=[(manager, blocks)],
+            last_loaded_at=time.monotonic(),
+        )
     }
     scheduler._phase4_pin_order = deque(["trace"])
 
