@@ -4713,7 +4713,11 @@ class Scheduler(SchedulerInterface):
             # A managed-context retry can arrive immediately after the first
             # pass consumes the Phase4 pin. Keep it while the consumer is
             # still live. After that, keep a short grace window for client-side
-            # retry creation and then keep only actual queued same-trace demand.
+            # retry creation, but do not drop the pin just because no successor
+            # is queued at this instant. Under high concurrency, the next
+            # same-trace turn can arrive much later, and this pin is the only
+            # recoverable retained prefix until a successor publishes a
+            # replacement pin.
             if pin.consumed_by_request_id in self.requests:
                 return False
             grace_seconds = self._phase4_consumed_pin_grace_seconds()
@@ -4722,7 +4726,9 @@ class Scheduler(SchedulerInterface):
                 return False
             if self._phase4_has_queued_successor(trace_id, pin):
                 return False
-            return True
+            if ttl_seconds <= 0:
+                return False
+            return now - pin.created_at >= ttl_seconds
         if ttl_seconds <= 0:
             return False
         return now - pin.created_at >= ttl_seconds

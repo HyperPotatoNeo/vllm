@@ -141,15 +141,31 @@ def test_phase4_consumed_pin_is_kept_while_consumer_is_live() -> None:
     )
 
 
-def test_phase4_consumed_pin_prunes_after_consumer_grace(
+def test_phase4_consumed_pin_survives_after_consumer_grace(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("KVE_PHASE4_CONSUMED_PIN_GRACE_SECONDS", "1")
     scheduler = _scheduler_with_requests(set())
     pin = _pin(consumed_by_request_id="reader", consumed_at=time.monotonic() - 2.0)
 
-    assert scheduler._phase4_pin_is_prunable(
+    assert not scheduler._phase4_pin_is_prunable(
         "trace", pin, time.monotonic(), ttl_seconds=1800.0
+    )
+
+
+def test_phase4_consumed_pin_prunes_after_regular_ttl(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_PHASE4_CONSUMED_PIN_GRACE_SECONDS", "1")
+    scheduler = _scheduler_with_requests(set())
+    pin = _pin(
+        consumed_by_request_id="reader",
+        consumed_at=time.monotonic() - 60.0,
+    )
+    pin.created_at = time.monotonic() - 60.0
+
+    assert scheduler._phase4_pin_is_prunable(
+        "trace", pin, time.monotonic(), ttl_seconds=30.0
     )
 
 
@@ -200,7 +216,7 @@ def test_phase4_consumed_pin_keeps_queued_successor_after_ttl(
     )
 
 
-def test_phase4_consumed_pin_ignores_queued_request_without_expected_tokens(
+def test_phase4_consumed_pin_without_expected_tokens_prunes_after_ttl(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("KVE_PHASE4_CONSUMED_PIN_GRACE_SECONDS", "1")
@@ -211,13 +227,14 @@ def test_phase4_consumed_pin_ignores_queued_request_without_expected_tokens(
         consumed_by_request_id="reader",
         consumed_at=time.monotonic() - 2.0,
     )
+    pin.created_at = time.monotonic() - 60.0
 
     assert scheduler._phase4_pin_is_prunable(
-        "trace", pin, time.monotonic(), ttl_seconds=1800.0
+        "trace", pin, time.monotonic(), ttl_seconds=30.0
     )
 
 
-def test_phase4_consumed_pin_ignores_unsatisfied_queued_successor(
+def test_phase4_consumed_pin_unsatisfied_successor_prunes_after_ttl(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("KVE_PHASE4_CONSUMED_PIN_GRACE_SECONDS", "1")
@@ -228,13 +245,14 @@ def test_phase4_consumed_pin_ignores_unsatisfied_queued_successor(
         consumed_by_request_id="reader",
         consumed_at=time.monotonic() - 2.0,
     )
+    pin.created_at = time.monotonic() - 60.0
 
     assert scheduler._phase4_pin_is_prunable(
-        "trace", pin, time.monotonic(), ttl_seconds=1800.0
+        "trace", pin, time.monotonic(), ttl_seconds=30.0
     )
 
 
-def test_phase4_consumed_pin_ttl_zero_still_prunes_after_grace(
+def test_phase4_consumed_pin_ttl_zero_disables_prune_after_grace(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("KVE_PHASE4_CONSUMED_PIN_GRACE_SECONDS", "1")
@@ -244,7 +262,7 @@ def test_phase4_consumed_pin_ttl_zero_still_prunes_after_grace(
         consumed_at=time.monotonic() - 2.0,
     )
 
-    assert scheduler._phase4_pin_is_prunable(
+    assert not scheduler._phase4_pin_is_prunable(
         "trace", pin, time.monotonic(), ttl_seconds=0.0
     )
 
