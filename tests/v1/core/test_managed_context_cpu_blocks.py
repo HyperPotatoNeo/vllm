@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
 from collections import deque
 from types import SimpleNamespace
 
@@ -622,6 +623,110 @@ def test_request_kv_swap_ready_waiting_is_prioritized(monkeypatch) -> None:
     assert scheduler.skipped_waiting.peek_request() is request
     assert list(scheduler.skipped_waiting)[1:] == [other]
     assert list(scheduler.waiting) == []
+
+
+def test_request_kv_swap_resident_first_prefers_ordinary_waiting(
+    monkeypatch,
+) -> None:
+    scheduler, _manager, request = _request_kv_swap_test_scheduler(monkeypatch)
+    other = _Request(request_id="other", status=RequestStatus.WAITING)
+    scheduler.requests["other"] = other
+    scheduler.waiting = scheduler_mod.create_request_queue(
+        scheduler_mod.SchedulingPolicy.FCFS
+    )
+    scheduler.skipped_waiting = scheduler_mod.create_request_queue(
+        scheduler_mod.SchedulingPolicy.FCFS
+    )
+    scheduler.skipped_waiting.add_request(request)
+    scheduler.waiting.add_request(other)
+    scheduler._request_kv_swaps["req"] = SimpleNamespace(
+        status="swapped",
+        created_at=time.monotonic(),
+        kv_block_count=2,
+        logical_start_by_group=([0, 16],),
+        num_computed_tokens=request.num_computed_tokens,
+        last_error=None,
+    )
+
+    assert scheduler._select_waiting_queue_for_scheduling() is scheduler.waiting
+
+    monkeypatch.setenv("KVE_REQUEST_KV_SWAP_RESIDENT_FIRST", "0")
+    assert (
+        scheduler._select_waiting_queue_for_scheduling()
+        is scheduler.skipped_waiting
+    )
+
+
+def test_request_kv_swap_resident_first_parks_while_running(
+    monkeypatch,
+) -> None:
+    scheduler, _manager, request = _request_kv_swap_test_scheduler(monkeypatch)
+    scheduler.running = [_Request(request_id="running", status=RequestStatus.RUNNING)]
+    scheduler._request_kv_swaps["req"] = SimpleNamespace(
+        status="swapped",
+        created_at=time.monotonic(),
+        kv_block_count=2,
+        logical_start_by_group=([0, 16],),
+        num_computed_tokens=request.num_computed_tokens,
+        last_error=None,
+    )
+
+    assert scheduler._request_kv_swap_should_park_waiting_request(
+        request,
+        token_budget=128,
+    )
+    assert "parked behind GPU-resident work" in (
+        scheduler._request_kv_swaps["req"].last_error
+    )
+
+
+def test_request_kv_swap_resident_first_starvation_allows_reload(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_REQUEST_KV_SWAP_RELOAD_STARVATION_SECONDS", "0")
+    scheduler, _manager, request = _request_kv_swap_test_scheduler(
+        monkeypatch,
+        gpu_free_blocks=8,
+    )
+    scheduler.running = [_Request(request_id="running", status=RequestStatus.RUNNING)]
+    scheduler._request_kv_swaps["req"] = SimpleNamespace(
+        status="swapped",
+        created_at=time.monotonic(),
+        kv_block_count=2,
+        logical_start_by_group=([0, 16],),
+        num_computed_tokens=request.num_computed_tokens,
+        last_error=None,
+    )
+
+    assert not scheduler._request_kv_swap_should_park_waiting_request(
+        request,
+        token_budget=128,
+    )
+
+
+def test_request_kv_swap_resident_first_starvation_waits_for_gpu_room(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_REQUEST_KV_SWAP_RELOAD_STARVATION_SECONDS", "0")
+    monkeypatch.setenv("KVE_REQUEST_KV_SWAP_GPU_HEADROOM_BLOCKS", "4")
+    scheduler, _manager, request = _request_kv_swap_test_scheduler(
+        monkeypatch,
+        gpu_free_blocks=2,
+    )
+    scheduler.running = [_Request(request_id="running", status=RequestStatus.RUNNING)]
+    scheduler._request_kv_swaps["req"] = SimpleNamespace(
+        status="swapped",
+        created_at=time.monotonic(),
+        kv_block_count=2,
+        logical_start_by_group=([0, 16],),
+        num_computed_tokens=request.num_computed_tokens,
+        last_error=None,
+    )
+
+    assert scheduler._request_kv_swap_should_park_waiting_request(
+        request,
+        token_budget=128,
+    )
 
 
 def test_finish_request_kv_swap_in_flight_store_releases_on_completion(

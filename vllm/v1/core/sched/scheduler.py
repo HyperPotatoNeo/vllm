@@ -1446,7 +1446,8 @@ class Scheduler(SchedulerInterface):
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
-                self._request_kv_swap_prioritize_ready_waiting()
+                if not self._request_kv_swap_resident_first_enabled():
+                    self._request_kv_swap_prioritize_ready_waiting()
                 request_queue = self._select_waiting_queue_for_scheduling()
                 assert request_queue is not None
 
@@ -1493,10 +1494,24 @@ class Scheduler(SchedulerInterface):
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
                     request.status
-                ) and not self._try_promote_blocked_waiting_request(
-                    request,
-                    token_budget=token_budget,
                 ):
+                    if self._request_kv_swap_should_park_waiting_request(
+                        request,
+                        token_budget=token_budget,
+                    ):
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+                    promoted_blocked_request = (
+                        self._try_promote_blocked_waiting_request(
+                            request,
+                            token_budget=token_budget,
+                        )
+                    )
+                else:
+                    promoted_blocked_request = True
+
+                if not promoted_blocked_request:
                     block_waiting_admission = (
                         self._request_kv_swap_should_block_waiting_admission(
                             request
@@ -5053,6 +5068,19 @@ class Scheduler(SchedulerInterface):
             "off",
         )
 
+    def _request_kv_swap_resident_first_enabled(self) -> bool:
+        raw = os.environ.get("KVE_REQUEST_KV_SWAP_RESIDENT_FIRST", "1")
+        return self._request_kv_swap_enabled() and raw.strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+
+    def _request_kv_swap_reload_starvation_seconds(self) -> float:
+        value = self._env_float("KVE_REQUEST_KV_SWAP_RELOAD_STARVATION_SECONDS", 30.0)
+        return max(0.0, value)
+
     def _request_kv_swap_preempt_error_defers(self, error: str) -> bool:
         if not self._request_kv_swap_strict_preempt_enabled():
             return False
@@ -5156,6 +5184,124 @@ class Scheduler(SchedulerInterface):
         if self._request_kv_swap_ready_head() != request.request_id:
             return False
         return self._request_kv_swap_gpu_wait_error(swap.last_error)
+
+    def _request_kv_swap_load_is_admissible(
+        self,
+        request: Request,
+        swap: RequestKVSwap,
+        *,
+        token_budget: int | None = None,
+    ) -> bool:
+        if swap.status != "swapped":
+            return False
+        if self._request_kv_swap_pending_loads() >= (
+            self._request_kv_swap_max_pending_loads()
+        ):
+            return False
+        if self._managed_context_cpu_load_transfer_limit_error() is not None:
+            return False
+
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        if len(managers) != len(getattr(swap, "logical_start_by_group", ())):
+            return False
+        if token_budget is None:
+            token_budget = int(
+                getattr(
+                    self,
+                    "max_num_scheduled_tokens",
+                    getattr(request, "num_tokens", 0),
+                )
+                or 0
+            )
+        extra_required_gpu_blocks = (
+            self._request_kv_swap_next_allocation_block_demand(
+                request,
+                swap,
+                token_budget=token_budget,
+            )
+        )
+        min_free = self._request_kv_swap_gpu_headroom_blocks()
+        free_blocks = min(
+            manager.block_pool.get_num_free_blocks() for manager in managers
+        )
+        required_blocks = (
+            int(getattr(swap, "kv_block_count", 0) or 0)
+            + max(0, extra_required_gpu_blocks)
+            + min_free
+        )
+        return free_blocks >= required_blocks
+
+    def _request_kv_swap_should_park_waiting_request(
+        self,
+        request: Request,
+        *,
+        token_budget: int | None = None,
+    ) -> bool:
+        if not self._request_kv_swap_resident_first_enabled():
+            return False
+        if request.status != RequestStatus.WAITING_FOR_REMOTE_KVS:
+            return False
+        swap = self._request_kv_swaps.get(request.request_id)
+        if swap is None:
+            return False
+        if swap.status == "load_pending":
+            return (
+                request.request_id
+                not in self._request_kv_swap_finished_load_req_ids
+            )
+        if swap.status == "store_pending":
+            return bool(self.running or self.waiting)
+        if swap.status != "swapped":
+            return False
+
+        # If no GPU-resident or ordinary waiting work can make progress, this
+        # parked request is the work. Let the normal load path try and report
+        # the exact admission reason.
+        if not self.running and not self.waiting:
+            return False
+
+        age = time.monotonic() - swap.created_at
+        if age >= self._request_kv_swap_reload_starvation_seconds() and (
+            self._request_kv_swap_load_is_admissible(
+                request,
+                swap,
+                token_budget=token_budget,
+            )
+        ):
+            return False
+
+        if token_budget is not None and token_budget <= 0:
+            return True
+        swap.last_error = (
+            "request KV swap load parked behind GPU-resident work: "
+            f"age={age:.3f}s"
+        )
+        return True
+
+    def _request_kv_swap_should_prefer_waiting_queue(self) -> bool:
+        if (
+            not self._request_kv_swap_resident_first_enabled()
+            or not self.waiting
+            or not self.skipped_waiting
+        ):
+            return False
+        request = self.skipped_waiting.peek_request()
+        if request.status != RequestStatus.WAITING_FOR_REMOTE_KVS:
+            return False
+        swap = self._request_kv_swaps.get(request.request_id)
+        if swap is None:
+            return False
+        if swap.status == "load_pending":
+            return (
+                request.request_id
+                not in self._request_kv_swap_finished_load_req_ids
+            )
+        if swap.status == "store_pending":
+            return True
+        if swap.status != "swapped":
+            return False
+        age = time.monotonic() - swap.created_at
+        return age < self._request_kv_swap_reload_starvation_seconds()
 
     def _request_kv_swap_prioritize_ready_waiting(self) -> None:
         if (
@@ -8642,6 +8788,8 @@ class Scheduler(SchedulerInterface):
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:
+            if self._request_kv_swap_should_prefer_waiting_queue():
+                return self.waiting
             return self.skipped_waiting or self.waiting or None
 
         # PRIORITY mode: compare queue heads when both queues are non-empty.
