@@ -292,6 +292,104 @@ def test_phase4_pressure_release_skips_queued_successor(
     assert released == []
 
 
+def test_phase4_running_pressure_keeps_unconsumed_pin_without_cpu() -> None:
+    scheduler = _scheduler_with_requests(set())
+    scheduler._phase4_pinned_blocks = {
+        "trace": _pin(token_count=128, consumed_by_request_id=None)
+    }
+    scheduler._phase4_pin_order = deque(["trace"])
+    released = []
+
+    def fake_release_phase4_pins(trace_id, reason, *, evict_prefix=False):
+        released.append((trace_id, reason, evict_prefix))
+
+    scheduler._release_phase4_pins = fake_release_phase4_pins
+
+    assert not scheduler._release_phase4_pressure_pin("running-alloc-pressure")
+    assert released == []
+    assert "trace" in scheduler._phase4_pinned_blocks
+
+
+def test_phase4_running_pressure_offloads_unconsumed_pin_async(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_PHASE4_CONSUMED_PIN_GRACE_SECONDS", "1")
+    scheduler = _scheduler_with_requests(set())
+    scheduler._managed_context_cpu_archive_enabled = True
+    scheduler._managed_context_cpu_max_blocks = 16
+    scheduler._managed_context_cpu_free_block_ids = deque(range(16))
+    block_pool = _FakeBlockPool()
+    manager = SimpleNamespace(block_size=16, block_pool=block_pool)
+    blocks = [
+        SimpleNamespace(block_id=10, logical_start=128, block_hash="a"),
+        SimpleNamespace(block_id=11, logical_start=144, block_hash="b"),
+        SimpleNamespace(block_id=12, logical_start=160, block_hash="c"),
+        SimpleNamespace(block_id=13, logical_start=176, block_hash="d"),
+    ]
+    scheduler._phase4_pinned_blocks = {
+        "trace": _pin(
+            token_count=128,
+            consumed_by_request_id=None,
+            entries=[(manager, blocks)],
+        )
+    }
+    scheduler._phase4_pin_order = deque(["trace"])
+
+    assert not scheduler._release_phase4_pressure_pin("running-alloc-pressure")
+
+    pin = scheduler._phase4_pinned_blocks["trace"]
+    assert pin.status == "store_pending"
+    assert pin.store_event_id == 0
+    assert pin.cpu_block_ids_by_group == ([0, 1, 2, 3],)
+    assert scheduler._phase4_pin_store_event_to_trace_id == {0: "trace"}
+    assert scheduler._managed_context_store_events_to_submit[0].gpu_block_ids == [
+        10,
+        11,
+        12,
+        13,
+    ]
+    assert block_pool.freed_blocks == []
+
+
+def test_phase4_stall_pressure_offloads_unconsumed_pin_without_successor(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_PHASE4_CONSUMED_PIN_GRACE_SECONDS", "1")
+    scheduler = _scheduler_with_requests(set())
+    scheduler._managed_context_cpu_archive_enabled = True
+    scheduler._managed_context_cpu_max_blocks = 16
+    scheduler._managed_context_cpu_free_block_ids = deque(range(16))
+    block_pool = _FakeBlockPool()
+    manager = SimpleNamespace(block_size=16, block_pool=block_pool)
+    blocks = [
+        SimpleNamespace(block_id=10, logical_start=128, block_hash="a"),
+        SimpleNamespace(block_id=11, logical_start=144, block_hash="b"),
+        SimpleNamespace(block_id=12, logical_start=160, block_hash="c"),
+        SimpleNamespace(block_id=13, logical_start=176, block_hash="d"),
+    ]
+    scheduler._phase4_pinned_blocks = {
+        "trace": _pin(
+            token_count=128,
+            consumed_by_request_id=None,
+            entries=[(manager, blocks)],
+        )
+    }
+    scheduler._phase4_pin_order = deque(["trace"])
+
+    assert scheduler._release_phase4_pressure_pin("scheduler-stall-pressure")
+
+    pin = scheduler._phase4_pinned_blocks["trace"]
+    assert pin.status == "store_pending"
+    assert pin.store_event_id == 0
+    assert scheduler._managed_context_store_events_to_submit[0].gpu_block_ids == [
+        10,
+        11,
+        12,
+        13,
+    ]
+    assert block_pool.freed_blocks == []
+
+
 def test_phase4_stall_pressure_offloads_queued_successor_pin(
     monkeypatch,
 ) -> None:
@@ -477,6 +575,24 @@ def test_phase4_stall_pressure_does_not_replay_when_pin_offload_unavailable() ->
     assert not scheduler.waiting[0]._kve_reprefill_after_flush
 
 
+def test_phase4_stall_pressure_does_not_report_pending_pin_progress() -> None:
+    scheduler = _scheduler_with_requests(set())
+    pin = _pin(token_count=128, consumed_by_request_id=None)
+    pin.status = "store_pending"
+    scheduler._phase4_pinned_blocks = {"trace": pin}
+    scheduler._phase4_pin_order = deque(["trace"])
+    released = []
+
+    def fake_release_phase4_pins(trace_id, reason, *, evict_prefix=False):
+        released.append((trace_id, reason, evict_prefix))
+
+    scheduler._release_phase4_pins = fake_release_phase4_pins
+
+    assert not scheduler._release_phase4_pressure_pin("scheduler-stall-pressure")
+    assert released == []
+    assert scheduler._phase4_pinned_blocks["trace"].status == "store_pending"
+
+
 def test_phase4_stall_pressure_releases_multiple_pins(monkeypatch) -> None:
     monkeypatch.setenv("KVE_PHASE4_STALL_PRESSURE_RELEASE_MAX", "3")
     scheduler = _scheduler_with_requests(set())
@@ -595,7 +711,7 @@ def test_managed_context_unavailable_restore_drop_is_opt_in(
     )
 
 
-def test_phase4_pressure_release_evicts_safe_stale_prefix(
+def test_phase4_pressure_release_keeps_stale_prefix_without_cpu(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("KVE_PHASE4_CONSUMED_PIN_GRACE_SECONDS", "1")
@@ -616,9 +732,9 @@ def test_phase4_pressure_release_evicts_safe_stale_prefix(
 
     scheduler._release_phase4_pins = fake_release_phase4_pins
 
-    assert scheduler._release_phase4_pressure_pin("pressure")
-    assert released == [("trace", "pressure", True)]
-    assert "trace" not in scheduler._phase4_pinned_blocks
+    assert not scheduler._release_phase4_pressure_pin("pressure")
+    assert released == []
+    assert "trace" in scheduler._phase4_pinned_blocks
 
 
 def test_phase4_stall_pressure_release_requires_no_progress(monkeypatch) -> None:

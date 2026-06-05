@@ -4680,6 +4680,28 @@ class Scheduler(SchedulerInterface):
                     successors.append(request)
         return successors
 
+    def _phase4_pin_has_live_demand(
+        self,
+        trace_id: str,
+        pin: Phase4Pin,
+        *,
+        now: float,
+        grace_seconds: float,
+        queued_successors: list[Request] | None = None,
+    ) -> bool:
+        if pin.consumed_by_request_id is None:
+            # The published retained-state pin has not been consumed by the
+            # next Phase4 request yet. Dropping it would force an unsafe replay.
+            return True
+        if pin.consumed_by_request_id in self.requests:
+            return True
+        consumed_at = pin.consumed_at or pin.created_at
+        if grace_seconds > 0 and now - consumed_at < grace_seconds:
+            return True
+        if queued_successors is None:
+            queued_successors = self._phase4_queued_successors(trace_id, pin)
+        return bool(queued_successors)
+
     def _phase4_pin_is_prunable(
         self,
         trace_id: str,
@@ -4772,41 +4794,41 @@ class Scheduler(SchedulerInterface):
             pin = self._phase4_pinned_blocks.get(trace_id)
             if pin is None:
                 continue
-            if pin.consumed_by_request_id in {
-                request.request_id for request in self.running
-            }:
-                continue
             queued_successors = self._phase4_queued_successors(trace_id, pin)
-            if queued_successors:
-                if reason != "scheduler-stall-pressure":
-                    continue
-                offload_error = self._start_phase4_pin_cpu_offload(
-                    trace_id,
-                    pin,
-                    reason=reason,
-                )
-                if offload_error is not None:
-                    logger.warning(
-                        "[PHASE4-PIN-OFFLOAD-DEFER] trace=%s reason=%s "
-                        "queued_successors=%d error=%s",
-                        trace_id,
-                        reason,
-                        len(queued_successors),
-                        offload_error,
-                    )
-                    continue
-                return True
-            consumed_at = pin.consumed_at or pin.created_at
-            if (
-                pin.consumed_by_request_id is not None
-                and grace_seconds > 0
-                and now - consumed_at < grace_seconds
-            ):
-                continue
-            self._release_phase4_pins(
-                trace_id, reason, evict_prefix=True
+            live_demand = self._phase4_pin_has_live_demand(
+                trace_id,
+                pin,
+                now=now,
+                grace_seconds=grace_seconds,
+                queued_successors=queued_successors,
             )
-            return True
+            if not live_demand and reason != "scheduler-stall-pressure":
+                continue
+            if pin.status != "gpu_pinned":
+                continue
+            offload_error = self._start_phase4_pin_cpu_offload(
+                trace_id,
+                pin,
+                reason=reason,
+            )
+            if offload_error is not None:
+                logger.warning(
+                    "[PHASE4-PIN-OFFLOAD-DEFER] trace=%s reason=%s "
+                    "queued_successors=%d live_demand=%s status=%s error=%s",
+                    trace_id,
+                    reason,
+                    len(queued_successors),
+                    live_demand,
+                    pin.status,
+                    offload_error,
+                )
+                continue
+            if reason == "scheduler-stall-pressure":
+                return True
+            # The D2H copy will free GPU blocks only after the transfer
+            # completion is observed, so allocation-pressure callers must
+            # not immediately retry slot allocation.
+            return False
         return False
 
     def _maybe_release_phase4_stall_pressure_pin(
