@@ -1491,6 +1491,35 @@ class Scheduler(SchedulerInterface):
                             offload_error,
                         )
 
+                trace_admission_error = (
+                    self._request_kv_swap_active_trace_admission_error(
+                        request,
+                        restore_spans,
+                        token_budget=token_budget,
+                    )
+                )
+                if trace_admission_error is not None:
+                    setattr(
+                        request,
+                        "_kve_request_kv_swap_trace_admission_deferred",
+                        True,
+                    )
+                    setattr(
+                        request,
+                        "_kve_request_kv_swap_trace_admission_error",
+                        trace_admission_error,
+                    )
+                    if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
+                        logger.warning(
+                            "[REQUEST-KV-SWAP-TRACE-ADMISSION-DEFER] "
+                            "req=%s %s",
+                            request_id[:8],
+                            trace_admission_error,
+                        )
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
                     request.status
@@ -5123,6 +5152,208 @@ class Scheduler(SchedulerInterface):
             return self._request_kv_swap_offload_start_usage() is not None
         return raw.strip().lower() not in ("0", "false", "no", "off")
 
+    def _request_kv_swap_active_trace_admission_enabled(self) -> bool:
+        if not self._request_kv_swap_enabled():
+            return False
+        raw = os.environ.get("KVE_REQUEST_KV_SWAP_ACTIVE_TRACE_ADMISSION")
+        if raw is not None:
+            return raw.strip().lower() not in ("0", "false", "no", "off")
+        return (
+            self._request_kv_swap_max_active_traces() is not None
+            or self._request_kv_swap_active_trace_target_usage() is not None
+        )
+
+    def _request_kv_swap_max_active_traces(self) -> int | None:
+        value = self._env_optional_int(
+            "KVE_REQUEST_KV_SWAP_MAX_ACTIVE_TRACES"
+        )
+        if value is None or value <= 0:
+            return None
+        return value
+
+    def _request_kv_swap_active_trace_target_usage(self) -> float | None:
+        return self._request_kv_swap_usage_watermark(
+            "KVE_REQUEST_KV_SWAP_ACTIVE_TRACE_TARGET_USAGE"
+        )
+
+    @staticmethod
+    def _request_kv_swap_trace_admission_is_deferred(
+        request: Request,
+    ) -> bool:
+        return bool(
+            getattr(
+                request,
+                "_kve_request_kv_swap_trace_admission_deferred",
+                False,
+            )
+        )
+
+    def _request_kv_swap_live_managed_trace_ids(self) -> set[str]:
+        trace_ids: set[str] = set()
+
+        def add_request(request: Request | None) -> None:
+            if request is None:
+                return
+            trace_id = self._managed_context_trace_id(request)
+            if trace_id:
+                trace_ids.add(trace_id)
+
+        for request in self.running:
+            add_request(request)
+
+        for request_id, swap in self._request_kv_swaps.items():
+            if swap.status != "expired":
+                add_request(self.requests.get(request_id))
+
+        for request_id in itertools.chain(
+            self._managed_context_active_restores,
+            self._managed_context_deferred_restores,
+            self._managed_context_pending_loads,
+            self._managed_context_restore_reservations,
+        ):
+            add_request(self.requests.get(request_id))
+
+        return trace_ids
+
+    def _request_kv_swap_protected_managed_trace_ids(self) -> set[str]:
+        trace_ids = self._request_kv_swap_live_managed_trace_ids()
+        for trace_id, pin in getattr(
+            self, "_phase4_pinned_blocks", {}
+        ).items():
+            if trace_id and pin.status != "expired":
+                trace_ids.add(trace_id)
+        for span in self._managed_context_archive.values():
+            if span.trace_id and span.status != "expired":
+                trace_ids.add(span.trace_id)
+        return trace_ids
+
+    def _request_kv_swap_estimated_waiting_request_blocks(
+        self,
+        request: Request,
+        *,
+        token_budget: int,
+    ) -> int:
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        if not managers:
+            return 0
+        block_size = max(
+            1,
+            min(int(getattr(manager, "block_size", 1) or 1) for manager in managers),
+        )
+        computed_tokens = max(0, int(getattr(request, "num_computed_tokens", 0) or 0))
+        tokens_with_spec = getattr(request, "num_tokens_with_spec", None)
+        if tokens_with_spec is None:
+            tokens_with_spec = int(getattr(request, "num_tokens", 0) or 0) + len(
+                getattr(request, "spec_token_ids", []) or []
+            )
+        num_new_tokens = (
+            int(tokens_with_spec)
+            + int(getattr(request, "num_output_placeholders", 0) or 0)
+            - computed_tokens
+        )
+        if num_new_tokens <= 0:
+            return 0
+        threshold = int(
+            getattr(
+                getattr(self, "scheduler_config", None),
+                "long_prefill_token_threshold",
+                0,
+            )
+            or 0
+        )
+        if 0 < threshold < num_new_tokens:
+            num_new_tokens = threshold
+        num_new_tokens = min(num_new_tokens, max(0, token_budget))
+        if num_new_tokens <= 0:
+            return 0
+
+        max_sched_len = int(getattr(self, "max_model_len", 0) or 0)
+        if max_sched_len > 0 and not getattr(request, "padding_pending", False):
+            max_sched_len -= 1
+        tokens_needing_slots = (
+            computed_tokens
+            + num_new_tokens
+            + max(0, int(getattr(self, "num_lookahead_tokens", 0) or 0))
+        )
+        if max_sched_len > 0:
+            tokens_needing_slots = min(tokens_needing_slots, max_sched_len)
+        required_blocks = (tokens_needing_slots + block_size - 1) // block_size
+        current_blocks = self._request_kv_swap_gpu_block_count(request.request_id)
+        return max(0, required_blocks - current_blocks)
+
+    def _request_kv_swap_active_trace_admission_error(
+        self,
+        request: Request,
+        restore_spans: list[ManagedContextSpan],
+        *,
+        token_budget: int,
+    ) -> str | None:
+        if not self._request_kv_swap_active_trace_admission_enabled():
+            return None
+        trace_id = self._managed_context_trace_id(request)
+        if not trace_id:
+            return None
+
+        active_trace_ids = self._request_kv_swap_protected_managed_trace_ids()
+        if trace_id in active_trace_ids:
+            setattr(
+                request,
+                "_kve_request_kv_swap_trace_admission_deferred",
+                False,
+            )
+            return None
+
+        live_trace_ids = self._request_kv_swap_live_managed_trace_ids()
+        max_active_traces = self._request_kv_swap_max_active_traces()
+        if (
+            max_active_traces is not None
+            and len(active_trace_ids) >= max_active_traces
+            and live_trace_ids
+        ):
+            return (
+                "request KV swap trace admission is waiting for active trace "
+                f"budget: trace={trace_id} active={len(active_trace_ids)} "
+                f"live={len(live_trace_ids)} max={max_active_traces}"
+            )
+
+        target_usage = self._request_kv_swap_active_trace_target_usage()
+        if target_usage is not None:
+            total_blocks, free_blocks = self._request_kv_swap_gpu_block_pool_stats()
+            if total_blocks > 0:
+                visible_blocks = self._request_kv_swap_estimated_waiting_request_blocks(
+                    request,
+                    token_budget=token_budget,
+                )
+                restore_blocks = _managed_context_cpu_reload_block_demand(
+                    restore_spans
+                )
+                extra_blocks = visible_blocks + restore_blocks
+                used_blocks = max(0, total_blocks - free_blocks)
+                projected_used_blocks = used_blocks + extra_blocks
+                target_used_blocks = int(total_blocks * target_usage)
+                if (
+                    projected_used_blocks > target_used_blocks
+                    and (live_trace_ids or self.running)
+                ):
+                    return (
+                        "request KV swap trace admission is parked by GPU "
+                        f"watermark: trace={trace_id} active="
+                        f"{len(active_trace_ids)} live={len(live_trace_ids)} "
+                        f"visible_blocks={visible_blocks} "
+                        f"restore_blocks={restore_blocks} used={used_blocks} "
+                        f"free={free_blocks} total={total_blocks} "
+                        f"target_usage={target_usage:.3f} "
+                        f"target_used={target_used_blocks} "
+                        f"projected_used={projected_used_blocks}"
+                    )
+
+        setattr(
+            request,
+            "_kve_request_kv_swap_trace_admission_deferred",
+            False,
+        )
+        return None
+
     @staticmethod
     def _request_kv_swap_usage_free_blocks(
         total_blocks: int,
@@ -5403,6 +5634,15 @@ class Scheduler(SchedulerInterface):
         return True
 
     def _request_kv_swap_should_prefer_waiting_queue(self) -> bool:
+        if (
+            self._request_kv_swap_active_trace_admission_enabled()
+            and self.waiting
+            and self.skipped_waiting
+            and self._request_kv_swap_trace_admission_is_deferred(
+                self.skipped_waiting.peek_request()
+            )
+        ):
+            return True
         if (
             not self._request_kv_swap_resident_first_enabled()
             or not self.waiting

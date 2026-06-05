@@ -182,6 +182,9 @@ def _request_kv_swap_test_scheduler(
     scheduler.kv_cache_manager = SimpleNamespace(
         coordinator=SimpleNamespace(single_type_managers=[manager])
     )
+    scheduler.cache_config = SimpleNamespace(enable_prefix_caching=True)
+    scheduler._compaction_enabled = True
+    scheduler._compaction_max_turns = 6
     scheduler._managed_context_enabled = False
     scheduler._managed_context_cpu_archive_enabled = True
     scheduler._managed_context_cpu_offload_immediate = False
@@ -213,6 +216,7 @@ def _request_kv_swap_test_scheduler(
     scheduler._request_kv_swap_load_event_to_request_id = {}
     scheduler._request_kv_swap_finished_load_req_ids = set()
     scheduler._request_kv_swap_suspended = False
+    scheduler._phase4_pinned_blocks = {}
     scheduler.requests = {}
     scheduler.finished_req_ids = set()
     scheduler.finished_req_ids_dict = None
@@ -243,6 +247,12 @@ def _request_kv_swap_test_scheduler(
         skip_reading_prefix_cache=False,
         _kve_reprefill_after_flush=False,
         _kve_phase4_reprefill_after_pin_release=False,
+        sampling_params=SimpleNamespace(
+            extra_args={
+                "kve_phase4_trace_id": "trace",
+                "kve_phase4_call_idx": 0,
+            }
+        ),
         spec_token_ids=[],
         num_preemptions=0,
     )
@@ -753,6 +763,113 @@ def test_request_kv_swap_pressure_counts_pending_store_blocks_toward_stop(
     ) is None
     assert scheduler.running == [request]
     assert set(scheduler._request_kv_swaps) == {"pending"}
+
+
+def test_request_kv_swap_active_trace_admission_limits_new_traces(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_REQUEST_KV_SWAP_MAX_ACTIVE_TRACES", "1")
+    scheduler, _manager, request = _request_kv_swap_test_scheduler(monkeypatch)
+    scheduler._managed_context_enabled = True
+    running = _running_request("running")
+    running.sampling_params = SimpleNamespace(
+        extra_args={
+            "kve_phase4_trace_id": "active",
+            "kve_phase4_call_idx": 0,
+        }
+    )
+    scheduler.requests["running"] = running
+    scheduler.running = [running]
+    scheduler._phase4_pinned_blocks["active"] = SimpleNamespace(
+        status="gpu_pinned",
+        block_count=2,
+    )
+
+    request.sampling_params.extra_args["kve_phase4_trace_id"] = "new"
+    error = scheduler._request_kv_swap_active_trace_admission_error(
+        request,
+        [],
+        token_budget=128,
+    )
+
+    assert error is not None
+    assert "active trace budget" in error
+
+    request.sampling_params.extra_args["kve_phase4_trace_id"] = "active"
+    assert (
+        scheduler._request_kv_swap_active_trace_admission_error(
+            request,
+            [],
+            token_budget=128,
+        )
+        is None
+    )
+
+
+def test_request_kv_swap_active_trace_admission_parks_projected_high_usage(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_REQUEST_KV_SWAP_ACTIVE_TRACE_TARGET_USAGE", "0.80")
+    scheduler, manager, request = _request_kv_swap_test_scheduler(
+        monkeypatch,
+        gpu_free_blocks=2,
+        gpu_total_blocks=10,
+    )
+    scheduler._managed_context_enabled = True
+    running = _running_request("running")
+    running.sampling_params = SimpleNamespace(
+        extra_args={
+            "kve_phase4_trace_id": "active",
+            "kve_phase4_call_idx": 0,
+        }
+    )
+    scheduler.requests["running"] = running
+    scheduler.running = [running]
+    request.sampling_params.extra_args["kve_phase4_trace_id"] = "new"
+
+    error = scheduler._request_kv_swap_active_trace_admission_error(
+        request,
+        [],
+        token_budget=128,
+    )
+
+    assert error is not None
+    assert "parked by GPU watermark" in error
+    assert "projected_used=" in error
+
+    manager.block_pool._free_blocks = 8
+    assert (
+        scheduler._request_kv_swap_active_trace_admission_error(
+            request,
+            [],
+            token_budget=128,
+        )
+        is None
+    )
+
+
+def test_request_kv_swap_active_trace_admission_deferred_prefers_waiting(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KVE_REQUEST_KV_SWAP_ACTIVE_TRACE_ADMISSION", "1")
+    scheduler, _manager, request = _request_kv_swap_test_scheduler(monkeypatch)
+    other = _Request(request_id="other", status=RequestStatus.WAITING)
+    scheduler.requests["other"] = other
+    scheduler.waiting = scheduler_mod.create_request_queue(
+        scheduler_mod.SchedulingPolicy.FCFS
+    )
+    scheduler.skipped_waiting = scheduler_mod.create_request_queue(
+        scheduler_mod.SchedulingPolicy.FCFS
+    )
+    setattr(
+        request,
+        "_kve_request_kv_swap_trace_admission_deferred",
+        True,
+    )
+    scheduler.skipped_waiting.add_request(request)
+    scheduler.waiting.add_request(other)
+
+    assert scheduler._select_waiting_queue_for_scheduling() is scheduler.waiting
 
 
 def test_request_kv_swap_ready_queue_discards_stale_ids(monkeypatch) -> None:
