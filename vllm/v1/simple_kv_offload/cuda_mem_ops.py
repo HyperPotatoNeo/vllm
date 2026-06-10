@@ -22,7 +22,14 @@ def pin_tensor(tensor: torch.Tensor) -> None:
     """
     err = torch.cuda.cudart().cudaHostRegister(tensor.data_ptr(), tensor.nbytes, 0)
     if err.value != 0:
-        raise RuntimeError(f"cudaHostRegister failed: {err}")
+        # torch's cudaError pybind enum only names `success`, so any failure
+        # reprs as `cudaError.???` — always include the numeric code.
+        # 712 = cudaErrorHostMemoryAlreadyRegistered (range already pinned),
+        # 2 = cudaErrorMemoryAllocation (page-locking limit/OOM).
+        raise RuntimeError(
+            f"cudaHostRegister failed: code={err.value} ({err}), "
+            f"nbytes={tensor.nbytes}"
+        )
 
 
 class _CUmemLocation(ctypes.Structure):

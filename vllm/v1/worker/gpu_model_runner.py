@@ -500,6 +500,32 @@ class ManagedContextCPUTransferWorker:
                 "[MANAGED-CONTEXT-CPU] pinned memory unavailable; transfers may be slow"
             )
 
+        # Idempotency: re-registration (e.g. any future re-init path) REUSES
+        # the existing pinned CPU pool when geometry matches. Never drop the
+        # old pool while its pages are still cudaHostRegister'ed — freeing
+        # registered memory is undefined behavior and re-pinning the reused
+        # VA range fails with cudaErrorHostMemoryAlreadyRegistered.
+        if self.cpu_kv_caches is not None and self.cpu_kv_caches:
+            existing = self.cpu_kv_caches
+            compatible = set(existing) == set(unique_gpu_caches) and all(
+                existing[name].shape[1:] == gpu_tensor.shape[1:]
+                and existing[name].dtype == gpu_tensor.dtype
+                for name, gpu_tensor in unique_gpu_caches.items()
+            )
+            if not compatible:
+                raise RuntimeError(
+                    "managed-context CPU pool re-registration with "
+                    "incompatible geometry; refusing to reallocate a "
+                    "still-pinned pool"
+                )
+            self.gpu_kv_caches = unique_gpu_caches
+            logger.warning(
+                "[MANAGED-CONTEXT-CPU] reusing existing pinned CPU pool "
+                "(%d tensors) for re-registration",
+                len(existing),
+            )
+            return
+
         self.gpu_kv_caches = unique_gpu_caches
         self.cpu_kv_caches = {}
         for name, gpu_tensor in unique_gpu_caches.items():
@@ -6755,7 +6781,7 @@ class GPUModelRunner(
         )
         self.cache_config.num_gpu_blocks_override = saved_override
 
-        self.initialize_kv_cache(minimal_config)
+        self.initialize_kv_cache(minimal_config, register_offload_workers=False)
         self.cache_config.num_gpu_blocks = minimal_config.num_blocks
 
         logger.debug("Initialized minimal KV cache for CUDA graph profiling")
@@ -7709,7 +7735,12 @@ class GPUModelRunner(
                 else:
                     break
 
-    def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+    def initialize_kv_cache(
+        self,
+        kv_cache_config: KVCacheConfig,
+        *,
+        register_offload_workers: bool = True,
+    ) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
         Args:
@@ -7740,7 +7771,18 @@ class GPUModelRunner(
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )
-        if self.managed_context_cpu_transfer_worker is not None:
+        # register_offload_workers=False is used by the CUDA-graph memory
+        # profiler's minimal re-init (_init_minimal_kv_cache_for_profiling):
+        # registering there double-allocated and double-cudaHostRegister'ed the
+        # ~hundreds-of-GiB pinned CPU pool (never unregistered), and the second
+        # registration failed with cudaErrorHostMemoryAlreadyRegistered when
+        # mmap reused the freed VA range — the enforce_eager=False boot crash.
+        # The transfer worker is never exercised during profiling, so skipping
+        # is free (and avoids zeroing the huge pool twice at boot).
+        if (
+            self.managed_context_cpu_transfer_worker is not None
+            and register_offload_workers
+        ):
             self.managed_context_cpu_transfer_worker.register_kv_caches(
                 kv_caches, kv_cache_config
             )
