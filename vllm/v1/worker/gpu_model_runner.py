@@ -587,6 +587,45 @@ class ManagedContextCPUTransferWorker:
         is_store: bool,
         event_idx: int,
     ) -> None:
+        # Defensive OOB guard. A swap's block list has intermittently carried an
+        # out-of-bounds / -1 GPU block id (latent bug under investigation): the
+        # index_select fast path ASSERTS on it (engine death) and the slice path
+        # silently wraps a negative index. Clamp + log loudly so it can't crash
+        # the engine and so the anomaly is captured for root-cause. The clamped
+        # transfer is wrong for that (rare) rollout, but the run survives.
+        if (
+            self.gpu_kv_caches is not None
+            and self.cpu_kv_caches is not None
+            and src_blocks
+        ):
+            gpu_pool = next(iter(self.gpu_kv_caches.values())).shape[0]
+            cpu_pool = next(iter(self.cpu_kv_caches.values())).shape[0]
+            src_pool = gpu_pool if is_store else cpu_pool
+            dst_pool = cpu_pool if is_store else gpu_pool
+            if (
+                min(src_blocks) < 0
+                or max(src_blocks) >= src_pool
+                or min(dst_blocks) < 0
+                or max(dst_blocks) >= dst_pool
+            ):
+                logger.warning(
+                    "[MANAGED-CONTEXT-OOB-BLOCK] dir=%s event=%d n=%d "
+                    "src[min=%d max=%d pool=%d] dst[min=%d max=%d pool=%d] "
+                    "src_ids=%s dst_ids=%s",
+                    "D2H" if is_store else "H2D",
+                    event_idx,
+                    len(src_blocks),
+                    min(src_blocks),
+                    max(src_blocks),
+                    src_pool,
+                    min(dst_blocks),
+                    max(dst_blocks),
+                    dst_pool,
+                    src_blocks[:32],
+                    dst_blocks[:32],
+                )
+                src_blocks = [min(max(b, 0), src_pool - 1) for b in src_blocks]
+                dst_blocks = [min(max(b, 0), dst_pool - 1) for b in dst_blocks]
         try:
             ranges = _coalesce_managed_context_block_ranges(src_blocks, dst_blocks)
         except ValueError as exc:
@@ -598,26 +637,73 @@ class ManagedContextCPUTransferWorker:
         assert self.gpu_kv_caches is not None and self.cpu_kv_caches is not None
         src_caches = self.gpu_kv_caches if is_store else self.cpu_kv_caches
         dst_caches = self.cpu_kv_caches if is_store else self.gpu_kv_caches
+        # The CPU archive side is allocated as a contiguous increasing run
+        # (see _pop_contiguous_managed_context_cpu_blocks); the GPU side is
+        # scattered. Fast path: collapse the per-(tensor, block-range) copy_
+        # loop into one index_select gather (store) / index_copy_ scatter
+        # (load) per cache tensor. The old loop fired num_tensors * num_ranges
+        # copy_ calls per event (~72 * 61 ~= 4400), costing ~25ms of CPU-side
+        # enqueue per transfer; the gather/scatter is num_tensors calls.
+        # NOTE: the fast path is gated on cpu_contiguous because index_select/
+        # index_copy_ ASSERT on an out-of-bounds GPU block id, whereas the
+        # per-range slice fallback silently tolerates it. A scattered-CPU
+        # transfer was observed to carry an out-of-bounds GPU id (latent issue,
+        # under investigation); until that is understood the scattered case
+        # stays on the slice path. See plans/request_kv_swap_preemption.md.
+        num_blocks = len(src_blocks)
+        cpu_blocks = dst_blocks if is_store else src_blocks
+        gpu_blocks = src_blocks if is_store else dst_blocks
+        cpu_contiguous = num_blocks > 0 and cpu_blocks == list(
+            range(cpu_blocks[0], cpu_blocks[0] + num_blocks)
+        )
+        gpu_device = next(iter(self.gpu_kv_caches.values())).device
         num_bytes = 0
+        used_fast_path = False
         submit_start = time.perf_counter()
         with torch.cuda.stream(stream):
-            for name, src_cache in src_caches.items():
-                dst_cache = dst_caches[name]
-                for src_start, dst_start, length in ranges:
-                    if length == 1:
-                        dst_cache[dst_start].copy_(
-                            src_cache[src_start],
+            if cpu_contiguous:
+                used_fast_path = True
+                gpu_idx = torch.tensor(
+                    gpu_blocks, device=gpu_device, dtype=torch.long
+                )
+                cpu_start = cpu_blocks[0]
+                for name, src_cache in src_caches.items():
+                    dst_cache = dst_caches[name]
+                    if is_store:
+                        # gather scattered GPU blocks -> contiguous CPU slice
+                        dst_cache[cpu_start : cpu_start + num_blocks].copy_(
+                            src_cache.index_select(0, gpu_idx),
                             non_blocking=True,
                         )
                     else:
-                        dst_cache[dst_start : dst_start + length].copy_(
-                            src_cache[src_start : src_start + length],
-                            non_blocking=True,
-                        )
+                        # contiguous CPU slice -> H2D staging -> scatter to GPU
+                        staging = src_cache[
+                            cpu_start : cpu_start + num_blocks
+                        ].to(gpu_device, non_blocking=True)
+                        dst_cache.index_copy_(0, gpu_idx, staging)
                     num_bytes += (
-                        int(length) * int(src_cache.stride(0))
+                        num_blocks * int(src_cache.stride(0))
                         * int(src_cache.element_size())
                     )
+            else:
+                # Fallback (scattered CPU side): original per-range copy_ loop.
+                for name, src_cache in src_caches.items():
+                    dst_cache = dst_caches[name]
+                    for src_start, dst_start, length in ranges:
+                        if length == 1:
+                            dst_cache[dst_start].copy_(
+                                src_cache[src_start],
+                                non_blocking=True,
+                            )
+                        else:
+                            dst_cache[dst_start : dst_start + length].copy_(
+                                src_cache[src_start : src_start + length],
+                                non_blocking=True,
+                            )
+                        num_bytes += (
+                            int(length) * int(src_cache.stride(0))
+                            * int(src_cache.element_size())
+                        )
             event = torch.Event()
             event.record(stream)
         state = ManagedContextTransferEventState(
@@ -625,11 +711,15 @@ class ManagedContextCPUTransferWorker:
             event=event,
             submitted_at=submit_start,
             direction="D2H" if is_store else "H2D",
-            num_blocks=len(src_blocks),
+            num_blocks=num_blocks,
             num_cache_tensors=len(src_caches),
             num_ranges=len(ranges),
-            num_copy_calls=len(src_caches) * len(ranges),
-            num_block_copy_calls=len(src_caches) * len(src_blocks),
+            num_copy_calls=(
+                len(src_caches)
+                if used_fast_path
+                else len(src_caches) * len(ranges)
+            ),
+            num_block_copy_calls=len(src_caches) * num_blocks,
             num_bytes=num_bytes,
         )
         if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
@@ -855,7 +945,11 @@ class GPUModelRunner(
                 os.environ.get("KVE_MANAGED_CONTEXT_ARCHIVE_DEVICE", "gpu")
                 .strip()
                 .lower()
-                == "cpu"
+                # Accept the whole CPU device family the scheduler recognizes:
+                # cpu (immediate) + cpu_explicit / cpu_deferred (lazy/deferred
+                # offload). Worker must agree with the scheduler or it will
+                # receive CPU-transfer metadata it can't service -> RuntimeError.
+                .startswith("cpu")
                 or os.environ.get("KVE_MANAGED_CONTEXT_CPU_OFFLOAD", "0") == "1"
             )
             and managed_context_cpu_blocks > 0
@@ -1724,6 +1818,9 @@ class GPUModelRunner(
                     )
                 req_state.hidden_kv_num_tokens = (
                     req_data.hidden_kv_num_tokens.get(req_id, 0)
+                )
+                req_state.compact_replay_data = req_data.compact_replay_data.get(
+                    req_id
                 )
                 # Update prompt length if prompt tokens were evicted
                 # (turn-based eviction with protected prefix).
@@ -2898,6 +2995,45 @@ class GPUModelRunner(
             is_prefilling=is_prefilling,
         )
 
+        compact_replay_death_indices = None
+        compact_replay_active_reqs = None
+        if not for_cudagraph_capture:
+            compact_replay_items = []
+            max_replay_len = 0
+            for req_id in self.input_batch.req_ids[:num_reqs]:
+                replay_data = self.requests[req_id].compact_replay_data
+                compact_replay_items.append(replay_data)
+                if replay_data is not None:
+                    max_replay_len = max(
+                        max_replay_len,
+                        len(replay_data.death_indices),
+                    )
+            if max_replay_len > 0:
+                compact_replay_death_indices = torch.full(
+                    (num_reqs_padded, max_replay_len),
+                    max_replay_len,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                compact_replay_active_reqs = torch.zeros(
+                    num_reqs_padded,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                for req_idx, replay_data in enumerate(compact_replay_items):
+                    if replay_data is None:
+                        continue
+                    deaths = torch.tensor(
+                        replay_data.death_indices,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    compact_replay_death_indices[
+                        req_idx,
+                        : deaths.numel(),
+                    ] = deaths
+                    compact_replay_active_reqs[req_idx] = True
+
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
                 attn_seq_lens_cpu[:num_reqs],
@@ -2980,6 +3116,19 @@ class GPUModelRunner(
                 )
                 if builder.supports_update_block_table:
                     cached_attn_metadata[cache_key] = attn_metadata_i
+
+            if hasattr(attn_metadata_i, "compact_replay_death_indices"):
+                attn_metadata_i.compact_replay_death_indices = (
+                    compact_replay_death_indices
+                )
+                attn_metadata_i.compact_replay_active_reqs = (
+                    compact_replay_active_reqs
+                )
+            elif compact_replay_death_indices is not None:
+                raise RuntimeError(
+                    "Compact replay full refill requires the FlexAttention "
+                    "backend so death-index liveness can be enforced."
+                )
 
             if ubid is None:
                 assert isinstance(attn_metadata, dict)

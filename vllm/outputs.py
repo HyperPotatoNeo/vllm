@@ -123,6 +123,7 @@ class RequestOutput:
         kv_transfer_params: dict[str, Any] | None = None,
         compaction_events: list[Any] | None = None,
         padding_token_ids: list[int] | None = None,
+        managed_context_restore_kind: dict | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -157,6 +158,9 @@ class RequestOutput:
         # the next call's submitted prompt so vLLM's prefix cache hits the
         # padded blocks.
         self.padding_token_ids = padding_token_ids
+        # Managed-context recall movement verdict (or None). Pure metadata,
+        # echoed to the client for the [MANAGED-CONTEXT-CLIENT-RESTORE] log.
+        self.managed_context_restore_kind = managed_context_restore_kind
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
@@ -170,6 +174,10 @@ class RequestOutput:
         # delta that doesn't include them).
         if next_output.compaction_events is not None:
             self.compaction_events = next_output.compaction_events
+        if getattr(next_output, "managed_context_restore_kind", None) is not None:
+            self.managed_context_restore_kind = (
+                next_output.managed_context_restore_kind
+            )
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):

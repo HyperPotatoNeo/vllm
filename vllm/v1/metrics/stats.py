@@ -274,6 +274,7 @@ class PromptTokenStats:
         prompt_len: int,
     ) -> None:
         """Update stats from a prefill output."""
+        num_cached_tokens = max(0, num_cached_tokens)
         # When all tokens are cached, the scheduler reduces num_cached_tokens
         # by 1 to force the model to recompute the last token, since the model
         # needs at least one input token to run a forward pass.

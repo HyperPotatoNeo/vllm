@@ -142,10 +142,8 @@ class CompactingKVCacheManager(FullAttentionManager):
 
         if explicit_block_range is not None:
             start, end = explicit_block_range
-            assert 0 <= start <= end <= len(blocks), (
-                f"explicit_block_range=({start},{end}) out of bounds for "
-                f"req={request_id[:8]} (len={len(blocks)})"
-            )
+            if not 0 <= start <= end <= len(blocks):
+                return 0
             evict_indices = list(range(start, end))
         elif self.eviction_fn is not None:
             evict_indices = self.eviction_fn(

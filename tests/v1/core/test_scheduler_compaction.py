@@ -79,6 +79,36 @@ def test_turn_mode_compaction_does_not_require_token_window():
     )
 
 
+def test_explicit_out_of_bounds_compaction_range_is_refused():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        block_size=16,
+        num_blocks=64,
+        max_model_len=2048,
+        compaction_window_size=0,
+        compaction_stride=0,
+        compaction_max_turns=6,
+        compaction_eviction_turn_stride=2,
+        compaction_turn_end_token_id=50256,
+    )
+    manager = next(
+        m for m in scheduler.kv_cache_manager.coordinator.single_type_managers
+        if isinstance(m, CompactingKVCacheManager)
+    )
+    blocks = [object(), object()]
+    manager.req_to_blocks["req"] = blocks
+
+    assert manager.compact_request(
+        "req",
+        0,
+        explicit_block_range=(0, 3),
+    ) == 0
+    assert manager.req_to_blocks["req"] == blocks
+
+
 def test_compaction_window_and_turn_modes_are_mutually_exclusive():
     with pytest.raises(AssertionError, match="mutually exclusive"):
         create_scheduler(

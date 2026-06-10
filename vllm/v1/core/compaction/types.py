@@ -103,3 +103,9 @@ class CompactionEvent(
     # captured during this eviction. Empty unless KVE_MANAGED_CONTEXT=1 and
     # the request is Phase4/turn-compaction eligible.
     archived_span_ids: list[str] = msgspec.field(default_factory=list)
+
+    # Full replay fallback: length of the untrimmed writer timeline when
+    # this eviction fired. This is the exact death index for the evicted
+    # KV rows under the compact replay mask. Appended for array_like wire
+    # compatibility with older CompactionEvent readers.
+    writer_len_at_compaction: int = 0

@@ -148,6 +148,23 @@ class NewRequestData:
 
 
 @dataclass
+class CompactReplayData:
+    token_ids: tuple[int, ...]
+    death_indices: tuple[int, ...]
+    live_writer_indices: tuple[int, ...]
+    evictions: int
+
+    @classmethod
+    def from_snapshot(cls, snapshot) -> "CompactReplayData":
+        return cls(
+            token_ids=tuple(snapshot.token_ids),
+            death_indices=tuple(snapshot.death_indices),
+            live_writer_indices=tuple(snapshot.live_writer_indices),
+            evictions=int(snapshot.evictions),
+        )
+
+
+@dataclass
 class CachedRequestData:
     req_ids: list[str]
     # For request ids not in resumed_req_ids, new_block_ids will be appended to
@@ -180,6 +197,9 @@ class CachedRequestData:
     # already-running request. The worker also needs the token count so its
     # physical positions and attention lengths match the rebuilt block table.
     hidden_kv_num_tokens: dict[str, int] = field(default_factory=dict)
+    # Compact replay: scheduler-side writer timeline needed by a future
+    # FlexAttention refill to replay dead and live rows with exact liveness.
+    compact_replay_data: dict[str, CompactReplayData] = field(default_factory=dict)
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -196,7 +216,8 @@ class CachedRequestData:
             f"new_block_ids={self.new_block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"num_output_tokens={self.num_output_tokens},"
-            f"hidden_kv_num_tokens={self.hidden_kv_num_tokens}"
+            f"hidden_kv_num_tokens={self.hidden_kv_num_tokens},"
+            f"compact_replay_reqs={list(self.compact_replay_data)}"
             f")"
         )
 

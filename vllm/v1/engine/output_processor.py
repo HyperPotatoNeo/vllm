@@ -180,6 +180,9 @@ class RequestState:
         # The scheduler sends the full cumulative list on each EngineCoreOutput,
         # so we use overwrite-on-update semantics (see process_outputs).
         self.compaction_events: list[CompactionEvent] | None = None
+        # Managed-context recall movement verdict (overwrite-on-update like
+        # compaction_events). dict or None. Pure metadata.
+        self.managed_context_restore_kind: dict | None = None
 
         # Stream Interval
         self.stream_interval = stream_interval
@@ -282,6 +285,7 @@ class RequestState:
         routed_experts: np.ndarray | None = None,
         compaction_events: list[CompactionEvent] | None = None,
         padding_token_ids: list[int] | None = None,
+        managed_context_restore_kind: dict | None = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
@@ -336,7 +340,7 @@ class RequestState:
 
         return self._new_request_output(
             external_req_id, outputs, finished, kv_transfer_params,
-            compaction_events, padding_token_ids,
+            compaction_events, padding_token_ids, managed_context_restore_kind,
         )
 
     def _new_request_output(
@@ -347,6 +351,7 @@ class RequestState:
         kv_transfer_params: dict[str, Any] | None = None,
         compaction_events: list[CompactionEvent] | None = None,
         padding_token_ids: list[int] | None = None,
+        managed_context_restore_kind: dict | None = None,
     ) -> RequestOutput | PoolingRequestOutput:
         # If prompt embeds were used, put placeholder prompt token ids
         prompt_token_ids = self.prompt_token_ids
@@ -384,6 +389,7 @@ class RequestState:
             metrics=self.stats,
             compaction_events=compaction_events,
             padding_token_ids=padding_token_ids,
+            managed_context_restore_kind=managed_context_restore_kind,
         )
 
     def _new_completion_output(
@@ -639,6 +645,11 @@ class OutputProcessor:
             # is unset for a request that had events in a prior step).
             if engine_core_output.compaction_events is not None:
                 req_state.compaction_events = engine_core_output.compaction_events
+            # Same overwrite-on-non-None semantics for the recall verdict.
+            if engine_core_output.managed_context_restore_kind is not None:
+                req_state.managed_context_restore_kind = (
+                    engine_core_output.managed_context_restore_kind
+                )
 
             if pooling_output is None:
                 assert req_state.detokenizer is not None
@@ -665,6 +676,7 @@ class OutputProcessor:
                 routed_experts,
                 req_state.compaction_events,
                 engine_core_output.padding_token_ids,
+                req_state.managed_context_restore_kind,
             ):
                 if req_state.streaming_input:
                     request_output.finished = False

@@ -172,6 +172,11 @@ class EngineCoreOutput(
     # overwrite semantics are safe. None when compaction is disabled or when
     # the request has had no compaction events yet.
     compaction_events: list[CompactionEvent] | None = None
+    # Managed-context recall movement verdict for this request (or None if the
+    # request triggered no recall): {"kind": str, "spans": int, "resident": int,
+    # "h2d": int}. Echoed to the client so its [MANAGED-CONTEXT-CLIENT-RESTORE]
+    # log can show CPU->GPU(H2D) vs GPU-RESIDENT(NO-MOVE). Pure metadata.
+    managed_context_restore_kind: dict | None = None
     # KV cache compaction auto-pad: filler token ids appended to this
     # request's KV cache at finish-time so the trailing block lands in the
     # prefix cache. Emitted on the same EngineCoreOutput that carries

@@ -1614,6 +1614,22 @@ class OpenAIServingChat(OpenAIServing):
         compaction_events_payload = None
         compaction_events = getattr(final_res, "compaction_events", None)
         if compaction_events:
+            replay_mode = os.environ.get(
+                "KVE_COMPACT_REPLAY_REFILL_MODE", ""
+            ).strip().lower()
+            include_evicted_token_ids = (
+                os.environ.get("KVE_OPENAI_INCLUDE_EVICTED_TOKEN_IDS", "0")
+                == "1"
+                or replay_mode not in ("", "0", "false", "no", "off")
+                or os.environ.get(
+                    "KVE_MANAGED_CONTEXT_REPLAY_ONLY_ARCHIVE", "0"
+                ).strip().lower()
+                in ("1", "true", "yes", "on")
+                or os.environ.get(
+                    "KVE_MANAGED_CONTEXT_SKIP_CPU_ARCHIVE_FOR_REPLAY", "0"
+                ).strip().lower()
+                in ("1", "true", "yes", "on")
+            )
             compaction_events_payload = [
                 CompactionEventPayload(
                     num_output_tokens_at_compaction=e.num_output_tokens_at_compaction,
@@ -1623,10 +1639,7 @@ class OpenAIServingChat(OpenAIServing):
                     evict_start=e.evict_start,
                     evicted_token_ids=(
                         list(getattr(e, "evicted_token_ids", []) or [])
-                        if os.environ.get(
-                            "KVE_OPENAI_INCLUDE_EVICTED_TOKEN_IDS", "0"
-                        )
-                        == "1"
+                        if include_evicted_token_ids
                         else []
                     ),
                     last_turn_evicted=int(
@@ -1643,6 +1656,9 @@ class OpenAIServingChat(OpenAIServing):
                     archived_span_ids=[
                         str(x) for x in getattr(e, "archived_span_ids", []) or []
                     ],
+                    writer_len_at_compaction=int(
+                        getattr(e, "writer_len_at_compaction", 0) or 0
+                    ),
                 )
                 for e in compaction_events
             ]
@@ -1654,6 +1670,12 @@ class OpenAIServingChat(OpenAIServing):
         # prefix cache hits the padded blocks).
         padding_token_ids_payload = (
             list(getattr(final_res, "padding_token_ids", None) or []) or None
+        )
+
+        # Managed-context recall movement verdict (vLLM extension). Already a
+        # plain dict (or None) on final_res; pass it straight through.
+        managed_context_restore_kind_payload = getattr(
+            final_res, "managed_context_restore_kind", None
         )
 
         response = ChatCompletionResponse(
@@ -1669,6 +1691,7 @@ class OpenAIServingChat(OpenAIServing):
             kv_transfer_params=final_res.kv_transfer_params,
             compaction_events=compaction_events_payload,
             padding_token_ids=padding_token_ids_payload,
+            managed_context_restore_kind=managed_context_restore_kind_payload,
         )
 
         # Log complete response if output logging is enabled

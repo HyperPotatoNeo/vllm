@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
 import os
 import time
 from collections import defaultdict, deque
@@ -42,6 +43,7 @@ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
+    CompactReplayData,
     GrammarOutput,
     ManagedContextCopyEvent,
     ManagedContextTransferMetadata,
@@ -66,7 +68,12 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.core.compaction.manager import CompactingKVCacheManager
 from vllm.v1.core.compaction.types import CompactionEvent
-from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.request import (
+    CompactReplaySnapshot,
+    Request,
+    RequestStatus,
+    StreamingUpdate,
+)
 from vllm.v1.utils import ConstantList
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
@@ -166,6 +173,11 @@ class ManagedContextSpan:
     offload_event_id: int | None = None
     last_error: str | None = None
     pending_load_count: int = 0
+    # How many times this span has been recalled (CPU->GPU load submitted).
+    # Used by recall-frequency-aware capacity eviction: a span the model keeps
+    # retrieving is a poor eviction victim (dropping it forces re-recall misses);
+    # never-recalled spans are dropped first. See _alloc_managed_context_cpu_blocks.
+    recall_count: int = 0
 
 
 @dataclass
@@ -215,6 +227,23 @@ class ManagedContextCPULoadStart:
 
 
 @dataclass
+class CompactReplayFullRefillState:
+    prompt_token_ids: list[int] | None
+    output_token_ids: list[int]
+    all_token_ids: list[int]
+    num_prompt_tokens: int
+    num_computed_tokens: int
+    num_cached_tokens: int
+    position_offset: int
+    block_hashes: list[Any]
+    turn_end_positions: list[int]
+    last_turn_scan_pos: int
+    num_turns_evicted: int
+    live_token_count: int
+    dead_ranges: list[tuple[int, int]]
+
+
+@dataclass
 class RequestKVSwap:
     request_id: str
     cpu_block_ids_by_group: tuple[list[int], ...]
@@ -228,6 +257,33 @@ class RequestKVSwap:
     store_event_id: int | None = None
     load_event_id: int | None = None
     last_error: str | None = None
+    # Shared-prefix-resident swap: blocks with ref_cnt>1 at swap-out are NOT
+    # spilled/freed (other rollouts hold them → freeing gives zero relief and
+    # the reload would redundantly re-allocate+H2D them). They stay resident
+    # (this request keeps its ref) and are re-spliced on load. Per group:
+    # kept_blocks_by_group[g] = [(position_in_full_list, block_obj), ...];
+    # total_blocks_by_group[g] = full block count (template length for splice).
+    # cpu_block_ids_by_group / logical_start_by_group / entries cover ONLY the
+    # spilled (ref_cnt==1) blocks. Empty tuples = legacy whole-rollout spill.
+    kept_blocks_by_group: tuple[list[tuple[int, Any]], ...] = ()
+    total_blocks_by_group: tuple[int, ...] = ()
+    # Partial reload (KVE_REQUEST_KV_SWAP_PARTIAL_RELOAD): on swap-in we restore
+    # only the protected sys prefix + the most recent window of blocks; the
+    # MIDDLE (old turns) stays parked on CPU in the swap store, recallable on
+    # demand. parked_*_by_group hold the parked middle's CPU block ids and their
+    # absolute logical_starts (per group), so a later recall can H2D exactly
+    # those blocks back. Empty = no parked prefix (whole-rollout reload).
+    parked_cpu_block_ids_by_group: tuple[list[int], ...] = ()
+    parked_logical_start_by_group: tuple[list[int], ...] = ()
+    # Partial-reload eviction scalars (the middle range parked on this reload),
+    # applied via _apply_trim + smart bump at load completion to reproduce the
+    # compaction post-eviction state. partial_reload gates the whole path.
+    partial_reload: bool = False
+    partial_evict_start: int = 0
+    partial_evict_end: int = 0
+    partial_total_evicted: int = 0
+    partial_stride: int = 0
+    partial_num_turns_after: int = 0
 
 
 _PREEMPTION_FREED = "freed"
@@ -662,9 +718,52 @@ class Scheduler(SchedulerInterface):
         self._request_kv_swap_store_event_to_request_id: dict[int, str] = {}
         self._request_kv_swap_load_event_to_request_id: dict[int, str] = {}
         self._request_kv_swap_finished_load_req_ids: set[str] = set()
+        # Persistent parked-prefix store for partial reload: survives the swap
+        # pop at load completion. request_id -> per-group
+        # (cpu_block_ids, logical_starts) of the middle that stayed on CPU and
+        # is recallable on demand (P3) / droppable under CPU pressure (P2).
+        self._request_kv_swap_parked: dict[
+            str, tuple[tuple[list[int], ...], tuple[list[int], ...]]
+        ] = {}
         self._request_kv_swap_suspended = False
+        # Env-gated capture of compact-replay re-prefill snapshots for the
+        # offline flex-vs-sequential replay harness (write-only; no-op unless
+        # KVE_DUMP_REPLAY_SNAPSHOTS is set). See
+        # plans/request_kv_swap_preemption.md.
+        self._kve_replay_dump_fh = None
+        _kve_replay_dump_dir = os.environ.get("KVE_DUMP_REPLAY_SNAPSHOTS")
+        if _kve_replay_dump_dir:
+            try:
+                os.makedirs(_kve_replay_dump_dir, exist_ok=True)
+                _kve_replay_dump_file = os.path.join(
+                    _kve_replay_dump_dir,
+                    f"replay_snapshots_{os.getpid()}.jsonl",
+                )
+                self._kve_replay_dump_fh = open(
+                    _kve_replay_dump_file, "a", buffering=1
+                )
+                logger.warning(
+                    "[KVE-DUMP-REPLAY-SNAPSHOT] writing snapshots to %s",
+                    _kve_replay_dump_file,
+                )
+            except Exception as _kve_dump_err:  # noqa: BLE001
+                logger.warning(
+                    "[KVE-DUMP-REPLAY-SNAPSHOT] init failed: %s",
+                    _kve_dump_err,
+                )
+                self._kve_replay_dump_fh = None
         self._phase4_pin_store_event_to_trace_id: dict[int, str] = {}
         self._phase4_pin_load_event_to_trace_id: dict[int, str] = {}
+        # Pin prefetch (KVE_PHASE4_PIN_PREFETCH=1, default off): start the
+        # CPU->GPU reload of an offloaded Phase4 pin as soon as its successor
+        # request is seen in the waiting queue, instead of waiting for the
+        # admission-time prefix-miss match. Overlaps the reload with the
+        # request's queue wait.
+        self._phase4_pin_prefetch_enabled = os.environ.get(
+            "KVE_PHASE4_PIN_PREFETCH", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        self._phase4_pin_prefetch_attempted: set[str] = set()
+        self._phase4_pin_prefetch_started = 0
         self._managed_context_restore_reservations: dict[
             str, set[tuple[str, str]]
         ] = {}
@@ -1032,10 +1131,12 @@ class Scheduler(SchedulerInterface):
         if not self._kve_diag_enabled():
             return
         waiting_count = len(self.waiting) + len(self.skipped_waiting)
-        stall_like = (
-            total_num_scheduled_tokens == 0
-            and not self.running
-            and waiting_count > 0
+        # Flag a stall whenever a step scheduled zero tokens but there is work
+        # pending -- either waiting requests that can't admit (original case) OR
+        # running requests that can't advance (the fix3 C==T tail stall, which
+        # the old `not self.running` condition could never detect).
+        stall_like = total_num_scheduled_tokens == 0 and (
+            len(self.running) > 0 or waiting_count > 0
         )
         always = os.environ.get("KVE_SCHED_LIVENESS_ALWAYS", "0") == "1"
         if not stall_like and not always:
@@ -1171,6 +1272,7 @@ class Scheduler(SchedulerInterface):
         )
         if pressure_preempted_req is not None:
             preempted_reqs.append(pressure_preempted_req)
+        self._phase4_pin_prefetch_queued_requests()
 
         # First, schedule the RUNNING requests.
         if self._compaction_block_aligned_finish:
@@ -1184,6 +1286,15 @@ class Scheduler(SchedulerInterface):
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             self._activate_deferred_managed_context_restore_if_ready(request)
+            if self._managed_context_deferred_restore_blocked_by_admission(
+                request
+            ):
+                req_index += 1
+                continue
+            while self._advance_compact_replay_segmented_refill(
+                request, reason="schedule-running"
+            ):
+                pass
             if request.is_finished():
                 req_index += 1
                 continue
@@ -1203,6 +1314,12 @@ class Scheduler(SchedulerInterface):
                 # partial draft tokens since this prevents uniform decode optimizations.
                 req_index += 1
                 continue
+
+            # Liveness backstop: rescue a RUNNING request stuck fully-computed
+            # (C==T) so it is not silently skipped at the num_new_tokens==0
+            # check below and stalls the engine. No-op for healthy requests.
+            # See plans/request_kv_swap_preemption.md (Phase A).
+            self._kve_force_decode_stuck_running_request(request)
 
             num_new_tokens = (
                 request.num_tokens_with_spec
@@ -1245,6 +1362,11 @@ class Scheduler(SchedulerInterface):
                     num_computed_tokens=request.num_computed_tokens,
                     num_new_tokens=num_new_tokens,
                 )
+            )
+            num_new_tokens = self._cap_compact_replay_segmented_prefill_tokens(
+                request,
+                num_computed_tokens=request.num_computed_tokens,
+                num_new_tokens=num_new_tokens,
             )
 
             # Schedule encoder inputs.
@@ -1295,6 +1417,11 @@ class Scheduler(SchedulerInterface):
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        delay_cache_blocks=getattr(
+                            request,
+                            "_kve_compact_replay_full_refill_active",
+                            False,
+                        ),
                     )
 
                     if new_blocks is not None:
@@ -1322,22 +1449,63 @@ class Scheduler(SchedulerInterface):
                         preempted_reqs.append(pressure_preempted_req)
                         break
 
-                    if self._release_phase4_pressure_pin(
-                        "running-alloc-pressure"
+                    needed_blocks = max(
+                        1,
+                        (
+                            num_new_tokens
+                            + self.num_lookahead_tokens
+                            + self.block_size
+                            - 1
+                        )
+                        // self.block_size,
+                    )
+                    if self._release_phase4_pressure_pins_for_blocks(
+                        needed_blocks,
+                        reason="running-alloc-pressure",
                     ):
                         continue
 
                     # Preempt the lowest-priority request.
                     if self.policy == SchedulingPolicy.PRIORITY:
-                        preempted_req = max(
-                            self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
+                        preemptable_indices = [
+                            idx
+                            for idx, candidate in enumerate(self.running)
+                            if not getattr(
+                                candidate, "padding_pending", False
+                            )
+                            and not getattr(
+                                candidate, "num_output_placeholders", 0
+                            )
+                        ]
+                        if not preemptable_indices:
+                            break
+                        preempted_req_index = max(
+                            preemptable_indices,
+                            key=lambda idx: (
+                                self.running[idx].priority,
+                                self.running[idx].arrival_time,
+                            ),
                         )
-                        preempted_req_index = self.running.index(preempted_req)
-                        self.running.pop(preempted_req_index)
+                        preempted_req = self.running.pop(preempted_req_index)
                     else:
-                        preempted_req_index = len(self.running) - 1
-                        preempted_req = self.running.pop()
+                        preempted_req_index = None
+                        for candidate_index in range(
+                            len(self.running) - 1,
+                            -1,
+                            -1,
+                        ):
+                            candidate = self.running[candidate_index]
+                            if getattr(
+                                candidate, "padding_pending", False
+                            ) or getattr(
+                                candidate, "num_output_placeholders", 0
+                            ):
+                                continue
+                            preempted_req_index = candidate_index
+                            break
+                        if preempted_req_index is None:
+                            break
+                        preempted_req = self.running.pop(preempted_req_index)
 
                     was_scheduled_this_step = (
                         preempted_req in scheduled_running_reqs
@@ -1541,6 +1709,40 @@ class Scheduler(SchedulerInterface):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
+
+                restore_admission_error = (
+                    self._managed_context_restore_admission_error(
+                        request,
+                        restore_spans,
+                    )
+                )
+                if restore_admission_error is not None:
+                    self._set_managed_context_restore_admission_deferred(
+                        request,
+                        restore_admission_error,
+                    )
+                    self._release_managed_context_restore_reservation(
+                        request_id,
+                        "restore-admission-defer",
+                    )
+                    if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+                        logger.warning(
+                            "[MANAGED-CONTEXT-RESTORE-ADMISSION-DEFER] "
+                            "req=%s %s",
+                            request_id[:8],
+                            restore_admission_error,
+                        )
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+                self._set_managed_context_restore_admission_deferred(
+                    request,
+                    None,
+                )
+                while self._advance_compact_replay_segmented_refill(
+                    request, reason="schedule-waiting"
+                ):
+                    pass
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -2194,6 +2396,31 @@ class Scheduler(SchedulerInterface):
                                 new_user_fragment_len=nuf_len,
                             )
 
+                    restore_replay_prefill_reason = (
+                        self._managed_context_restore_replay_prefill_reason(
+                            request,
+                            restore_spans,
+                        )
+                    )
+                    if restore_replay_prefill_reason is not None:
+                        if self._mark_request_for_full_reprefill(
+                            request,
+                            "managed-context-restore-replay-prefill",
+                            phase4_pin_release=True,
+                            free_request_kv=True,
+                            skip_log_reason=restore_replay_prefill_reason,
+                        ):
+                            logger.warning(
+                                "[MANAGED-CONTEXT-RESTORE-REPLAY-REPREFILL] "
+                                "req=%s %s",
+                                request.request_id[:8],
+                                restore_replay_prefill_reason,
+                            )
+                            request_queue.pop_request()
+                            clear_pending_phase4_pin_consumed()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
                         ext_tokens, load_kv_async = (
@@ -2294,6 +2521,13 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = min(num_new_tokens, token_budget)
                     num_new_tokens = (
                         self._cap_managed_context_deferred_prefill_tokens(
+                            request,
+                            num_computed_tokens=num_computed_tokens,
+                            num_new_tokens=num_new_tokens,
+                        )
+                    )
+                    num_new_tokens = (
+                        self._cap_compact_replay_segmented_prefill_tokens(
                             request,
                             num_computed_tokens=num_computed_tokens,
                             num_new_tokens=num_new_tokens,
@@ -2551,6 +2785,21 @@ class Scheduler(SchedulerInterface):
                             request,
                             computed_tokens=num_computed_tokens,
                         )
+                        if (
+                            self._managed_context_deferred_restore_blocked_by_admission(
+                                request,
+                                computed_tokens=num_computed_tokens,
+                            )
+                        ):
+                            if pending_inherit_event is not None:
+                                request.position_offset = 0
+                            elif restore_position_aligned:
+                                request.position_offset = (
+                                    position_offset_before_restore_align
+                                )
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -2559,7 +2808,14 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
                     num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
+                    delay_cache_blocks=(
+                        load_kv_async
+                        or getattr(
+                            request,
+                            "_kve_compact_replay_full_refill_active",
+                            False,
+                        )
+                    ),
                     num_encoder_tokens=num_encoder_tokens,
                 )
 
@@ -2677,7 +2933,16 @@ class Scheduler(SchedulerInterface):
                         preempted_reqs.append(pressure_preempted_req)
                         break
                     if (
+                        self._phase4_pressure_replay_enabled()
+                        and self._release_phase4_pressure_pins_for_blocks(
+                            visible_allocation_demand,
+                            reason="waiting-alloc-pressure",
+                        )
+                    ):
+                        continue
+                    if (
                         not self.running
+                        and not self._phase4_pressure_replay_enabled()
                         and self._release_phase4_pressure_pin(
                             "waiting-alloc-pressure"
                         )
@@ -2772,6 +3037,9 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                # Stamp for swap min-progress protection (see
+                # _request_kv_swap_pressure_candidate_error).
+                request._kve_admit_computed = num_computed_tokens
                 # Count the number of prefix cached tokens.
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = num_computed_tokens
@@ -3061,6 +3329,11 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        if request.padding_pending or request.num_output_placeholders:
+            return PreemptionResult(
+                _PREEMPTION_DEFERRED,
+                "request has pending output or auto-padding",
+            )
         # Compacted requests carry a trimmed token view plus a non-zero RoPE
         # frame. Flush and re-prefill that compacted state instead of treating
         # this as ordinary preemption.
@@ -3237,6 +3510,17 @@ class Scheduler(SchedulerInterface):
             skip_log_reason=reason,
         ):
             return False
+        # Layer-2 pressure flush: actively free THIS victim's own phase-4 pin so
+        # its pinned prefix blocks are reclaimed. vanilla free() and
+        # _mark_request_for_full_reprefill free only the request's own live KV,
+        # NOT the trace's pin (the "pins hugging GPU" residual) -- so without
+        # this the flush frees less GPU than it should. The victim re-prefills
+        # its full timeline on bring-back and does not need the pin; a same-trace
+        # successor may pay a one-time re-prefill, the accepted cost under
+        # pressure. See plans/request_kv_swap_preemption.md (Layer-2 Gap A).
+        flush_trace_id = self._phase4_trace_id(request)
+        if flush_trace_id:
+            self._release_phase4_pins(flush_trace_id, "reprefill-preempt-flush")
         self.waiting.prepend_request(request)
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
@@ -3294,6 +3578,65 @@ class Scheduler(SchedulerInterface):
                 )
                 return False
 
+        replay_snapshot = None
+        compact_replay_snapshot = getattr(
+            request, "compact_replay_snapshot", None
+        )
+        if callable(compact_replay_snapshot):
+            replay_snapshot = compact_replay_snapshot()
+        if (
+            replay_snapshot is None
+            and self._compact_replay_refill_enabled()
+        ):
+            replay_snapshot = self._compact_replay_snapshot_from_xargs(
+                request
+            )
+
+        segmented_deletions = None
+        segmented_without_full_fallback = (
+            replay_snapshot is not None
+            and replay_snapshot.evictions > 0
+            and self._compact_replay_segmented_refill_enabled()
+            and not self._compact_replay_segmented_full_fallback_enabled()
+        )
+        if segmented_without_full_fallback:
+            compaction_mgr = self._compact_replay_compaction_manager()
+            if compaction_mgr is None:
+                logger.warning(
+                    "[COMPACT-REPLAY-SEGMENTED-UNSUPPORTED] req=%s "
+                    "reason=%s no CompactingKVCacheManager",
+                    request_id[:8],
+                    skip_log_reason or reason,
+                )
+                return False
+            segmented_deletions = (
+                self._plan_compact_replay_segmented_deletions(
+                    request,
+                    replay_snapshot,
+                    block_size=compaction_mgr.block_size,
+                )
+            )
+            if not segmented_deletions:
+                logger.warning(
+                    "[COMPACT-REPLAY-SEGMENTED-UNSUPPORTED] req=%s "
+                    "reason=%s writer_tokens=%d live_rows=%d evictions=%d",
+                    request_id[:8],
+                    skip_log_reason or reason,
+                    int(getattr(replay_snapshot, "final_writer_len", 0)),
+                    len(
+                        tuple(
+                            getattr(
+                                replay_snapshot,
+                                "live_writer_indices",
+                                (),
+                            )
+                            or ()
+                        )
+                    ),
+                    int(getattr(replay_snapshot, "evictions", 0)),
+                )
+                return False
+
         preserve_phase4_reprefill = (
             phase4_pin_release
             or self._phase4_pin_release_reprefill_active(request)
@@ -3321,11 +3664,259 @@ class Scheduler(SchedulerInterface):
         request.is_prefill_chunk = False
         request.needs_rebuild = True
         request.skip_reading_prefix_cache = True
+        request._kve_compact_replay_refill_snapshot = replay_snapshot  # type: ignore[attr-defined]
+        request._kve_compact_replay_refill_active = (  # type: ignore[attr-defined]
+            replay_snapshot is not None and replay_snapshot.evictions > 0
+        )
         request._kve_reprefill_after_flush = True  # type: ignore[attr-defined]
         request._kve_phase4_reprefill_after_pin_release = (  # type: ignore[attr-defined]
             preserve_phase4_reprefill
         )
+        if (
+            replay_snapshot is not None
+            and replay_snapshot.evictions > 0
+            and self._compact_replay_refill_enabled()
+        ):
+            activated = False
+            if self._compact_replay_segmented_refill_enabled():
+                activated = self._activate_compact_replay_segmented_refill(
+                    request,
+                    replay_snapshot,
+                    reason=skip_log_reason or reason,
+                    deletions=segmented_deletions,
+                )
+                if (
+                    not activated
+                    and not self._compact_replay_segmented_full_fallback_enabled()
+                ):
+                    logger.error(
+                        "[COMPACT-REPLAY-SEGMENTED-ABORT] req=%s "
+                        "reason=%s activation failed after preflight",
+                        request_id[:8],
+                        skip_log_reason or reason,
+                    )
+                    return False
+            if not activated:
+                self._activate_compact_replay_full_refill(
+                    request,
+                    replay_snapshot,
+                    reason=skip_log_reason or reason,
+                )
+        if (
+            replay_snapshot is not None
+            and replay_snapshot.evictions > 0
+            and os.environ.get("KVE_TRACE_COMPACT_REPREFILL") == "1"
+        ):
+            logger.warning(
+                "[COMPACT-REPLAY-REFILL-ARM] req=%s reason=%s "
+                "writer_tokens=%d live_rows=%d evictions=%d",
+                request_id[:8],
+                skip_log_reason or reason,
+                replay_snapshot.final_writer_len,
+                len(replay_snapshot.live_writer_indices),
+                replay_snapshot.evictions,
+            )
         return True
+
+    def _compact_replay_snapshot_from_xargs(
+        self,
+        request: Request,
+    ) -> CompactReplaySnapshot | None:
+        if request.prompt_token_ids is None:
+            return None
+        extra_args = getattr(
+            getattr(request, "sampling_params", None),
+            "extra_args",
+            None,
+        )
+        if not isinstance(extra_args, dict):
+            return None
+        raw_spans = extra_args.get("kve_compact_replay_spans")
+        if isinstance(raw_spans, str):
+            try:
+                raw_spans = json.loads(raw_spans)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(raw_spans, list) or not raw_spans:
+            return None
+
+        spans: list[tuple[int, int, int, str, list[int], int]] = []
+        for raw_span in raw_spans:
+            if not isinstance(raw_span, dict):
+                return None
+            raw_tokens = raw_span.get("evicted_token_ids")
+            if not isinstance(raw_tokens, list) or not raw_tokens:
+                return None
+            try:
+                token_ids = [int(tok) for tok in raw_tokens]
+                evict_start = int(raw_span.get("evict_start", 0))
+                writer_len_at_compaction = int(
+                    raw_span.get("writer_len_at_compaction", 0)
+                )
+            except (TypeError, ValueError):
+                return None
+            if evict_start < 0 or writer_len_at_compaction <= 0:
+                return None
+            tokens_evicted = raw_span.get("tokens_evicted", len(token_ids))
+            try:
+                if int(tokens_evicted) != len(token_ids):
+                    return None
+            except (TypeError, ValueError):
+                return None
+            span_id = str(raw_span.get("span_id", ""))
+            try:
+                original_turn_start = int(
+                    raw_span.get("original_turn_start", -1)
+                )
+            except (TypeError, ValueError):
+                original_turn_start = -1
+            turn_sort = (
+                original_turn_start
+                if original_turn_start >= 0
+                else writer_len_at_compaction
+            )
+            spans.append(
+                (
+                    evict_start,
+                    turn_sort,
+                    writer_len_at_compaction,
+                    span_id,
+                    token_ids,
+                    writer_len_at_compaction,
+                )
+            )
+
+        if not spans:
+            return None
+        spans.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+        visible_tokens = [int(tok) for tok in request.prompt_token_ids]
+
+        replay_tokens: list[int] = []
+        death_indices: list[int] = []
+        live_writer_indices: list[int] = []
+        visible_cursor = 0
+
+        for (
+            evict_start,
+            _turn_sort,
+            _writer_len,
+            _span_id,
+            token_ids,
+            death_idx,
+        ) in spans:
+            if evict_start > len(visible_tokens):
+                return None
+            anchor = evict_start
+            if anchor < visible_cursor:
+                return None
+            if anchor > visible_cursor:
+                visible_slice = visible_tokens[visible_cursor:anchor]
+                slice_start = len(replay_tokens)
+                replay_tokens.extend(visible_slice)
+                death_indices.extend([0] * len(visible_slice))
+                live_writer_indices.extend(
+                    range(slice_start, len(replay_tokens))
+                )
+                visible_cursor = anchor
+            replay_tokens.extend(token_ids)
+            death_indices.extend([death_idx] * len(token_ids))
+            if death_idx < len(replay_tokens):
+                return None
+
+        tail_start = len(replay_tokens)
+        visible_tail = visible_tokens[visible_cursor:]
+        replay_tokens.extend(visible_tail)
+        death_indices.extend([0] * len(visible_tail))
+        live_writer_indices.extend(range(tail_start, len(replay_tokens)))
+
+        final_len = len(replay_tokens)
+        for writer_idx in live_writer_indices:
+            death_indices[writer_idx] = final_len
+        live_writer_index_set = set(live_writer_indices)
+        for idx, death_idx in enumerate(death_indices):
+            if idx in live_writer_index_set:
+                continue
+            if death_idx > final_len:
+                death_indices[idx] = final_len
+
+        snapshot = CompactReplaySnapshot(
+            token_ids=tuple(replay_tokens),
+            death_indices=tuple(death_indices),
+            live_writer_indices=tuple(live_writer_indices),
+            evictions=len(spans),
+        )
+        if not snapshot.is_valid():
+            if os.environ.get("KVE_TRACE_COMPACT_REPREFILL") == "1":
+                logger.warning(
+                    "[COMPACT-REPLAY-XARGS-SKIP] req=%s spans=%d "
+                    "prompt=%d replay=%d reason=invalid-snapshot",
+                    request.request_id[:8],
+                    len(spans),
+                    len(visible_tokens),
+                    len(replay_tokens),
+                )
+            return None
+        if os.environ.get("KVE_TRACE_COMPACT_REPREFILL") == "1":
+            logger.warning(
+                "[COMPACT-REPLAY-XARGS-ARM] req=%s spans=%d prompt=%d "
+                "replay=%d insert_at=%d live=%d",
+                request.request_id[:8],
+                len(spans),
+                len(visible_tokens),
+                len(replay_tokens),
+                min(item[0] for item in spans),
+                len(live_writer_indices),
+            )
+        return snapshot
+
+    @staticmethod
+    def _compact_replay_span_ids_from_xargs(request: Request) -> set[str]:
+        extra_args = getattr(
+            getattr(request, "sampling_params", None),
+            "extra_args",
+            None,
+        )
+        if not isinstance(extra_args, dict):
+            return set()
+        raw_spans = extra_args.get("kve_compact_replay_spans")
+        if isinstance(raw_spans, str):
+            try:
+                raw_spans = json.loads(raw_spans)
+            except json.JSONDecodeError:
+                return set()
+        if not isinstance(raw_spans, list):
+            return set()
+        span_ids: set[str] = set()
+        for raw_span in raw_spans:
+            if not isinstance(raw_span, dict):
+                continue
+            span_id = str(raw_span.get("span_id", ""))
+            if span_id:
+                span_ids.add(span_id)
+        return span_ids
+
+    def _managed_context_restore_replay_prefill_reason(
+        self,
+        request: Request,
+        restore_spans: list[ManagedContextSpan],
+    ) -> str | None:
+        if (
+            not restore_spans
+            or not self._managed_context_restore_replay_prefill_enabled()
+            or getattr(request, "_kve_compact_replay_full_refill_active", False)
+        ):
+            return None
+        if not self._managed_context_restore_needs_cpu_load(restore_spans):
+            return None
+        replay_snapshot = self._compact_replay_snapshot_from_xargs(request)
+        if replay_snapshot is None or replay_snapshot.evictions <= 0:
+            return None
+        return (
+            "managed-context restore replay prefill: "
+            f"spans={[span.span_id for span in restore_spans]} "
+            f"replay_tokens={replay_snapshot.final_writer_len} "
+            f"live_tokens={len(replay_snapshot.live_writer_indices)}"
+        )
 
     def _restamp_reprefill_logical_starts(
         self,
@@ -3374,6 +3965,8 @@ class Scheduler(SchedulerInterface):
             return
         if request.num_computed_tokens < request.num_prompt_tokens:
             return
+        if getattr(request, "_kve_compact_replay_full_refill_active", False):
+            return
         request._kve_reprefill_after_flush = False  # type: ignore[attr-defined]
         if getattr(
             request,
@@ -3381,16 +3974,853 @@ class Scheduler(SchedulerInterface):
             False,
         ):
             request._kve_phase4_reprefill_after_pin_release = False  # type: ignore[attr-defined]
+        replay_active = getattr(
+            request, "_kve_compact_replay_refill_active", False
+        )
+        if replay_active:
+            request._kve_compact_replay_refill_active = False  # type: ignore[attr-defined]
+            retry_managed_offloads = getattr(
+                self, "_retry_managed_context_gpu_pinned_offloads", None
+            )
+            if callable(retry_managed_offloads):
+                retry_managed_offloads("compact-replay-refill-done")
+            proactive_offload = getattr(
+                self, "_proactively_offload_nonproductive_kv", None
+            )
+            if callable(proactive_offload):
+                proactive_offload("compact-replay-refill-done")
         if os.environ.get("KVE_TRACE_COMPACT_REPREFILL") == "1":
             logger.warning(
                 "[COMPACT-REPREFILL-DONE] req=%s reason=%s "
-                "computed=%d prompt=%d position_offset=%d",
+                "computed=%d prompt=%d position_offset=%d replay_active=%s",
                 request.request_id[:8],
                 reason,
                 request.num_computed_tokens,
                 request.num_prompt_tokens,
                 request.position_offset,
+                replay_active,
             )
+
+    @staticmethod
+    def _compact_replay_refill_mode() -> str:
+        raw = os.environ.get("KVE_COMPACT_REPLAY_REFILL_MODE", "")
+        return raw.strip().lower()
+
+    @classmethod
+    def _compact_replay_full_refill_enabled(cls) -> bool:
+        return cls._compact_replay_refill_mode() in (
+            "full",
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    @classmethod
+    def _compact_replay_segmented_refill_enabled(cls) -> bool:
+        return cls._compact_replay_refill_mode() in (
+            "segmented",
+            "segment",
+            "flash_segmented",
+            "flash-segmented",
+        )
+
+    @staticmethod
+    def _compact_replay_segmented_full_fallback_enabled() -> bool:
+        raw = os.environ.get(
+            "KVE_COMPACT_REPLAY_SEGMENTED_FULL_FALLBACK", "0"
+        )
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+
+    @classmethod
+    def _compact_replay_refill_enabled(cls) -> bool:
+        return (
+            cls._compact_replay_full_refill_enabled()
+            or cls._compact_replay_segmented_refill_enabled()
+        )
+
+    def _compact_replay_consumes_restore_spans_enabled(self) -> bool:
+        raw = os.environ.get("KVE_COMPACT_REPLAY_CONSUME_RESTORE_SPANS")
+        if raw is not None:
+            return (
+                self._compact_replay_refill_enabled()
+                and raw.strip().lower() not in ("0", "false", "no", "off")
+            )
+        return self._compact_replay_refill_enabled()
+
+    def _managed_context_restore_replay_prefill_enabled(self) -> bool:
+        raw = os.environ.get("KVE_MANAGED_CONTEXT_RESTORE_REPLAY_PREFILL")
+        if raw is not None:
+            return (
+                self._compact_replay_refill_enabled()
+                and raw.strip().lower() not in ("0", "false", "no", "off")
+            )
+        return self._compact_replay_refill_enabled()
+
+    def _managed_context_replay_only_archive_enabled(self) -> bool:
+        raw = os.environ.get("KVE_MANAGED_CONTEXT_REPLAY_ONLY_ARCHIVE")
+        if raw is None:
+            raw = os.environ.get(
+                "KVE_MANAGED_CONTEXT_SKIP_CPU_ARCHIVE_FOR_REPLAY"
+            )
+        if raw is None or raw.strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            return False
+        return (
+            self._managed_context_enabled
+            and self._compact_replay_refill_enabled()
+            and self._managed_context_restore_replay_prefill_enabled()
+        )
+
+    def _compact_replay_compaction_manager(
+        self,
+    ) -> "CompactingKVCacheManager | None":
+        for mgr in self.kv_cache_manager.coordinator.single_type_managers:
+            if isinstance(mgr, CompactingKVCacheManager):
+                return mgr
+        return None
+
+    @staticmethod
+    def _compact_replay_dead_ranges(
+        *,
+        total_len: int,
+        live_writer_indices: Iterable[int],
+    ) -> list[tuple[int, int]]:
+        live = sorted(int(idx) for idx in live_writer_indices)
+        dead_ranges: list[tuple[int, int]] = []
+        cursor = 0
+        for idx in live:
+            if idx < cursor:
+                continue
+            if idx > cursor:
+                dead_ranges.append((cursor, idx))
+            cursor = idx + 1
+        if cursor < total_len:
+            dead_ranges.append((cursor, total_len))
+        return dead_ranges
+
+    @staticmethod
+    def _compact_replay_ranges_block_aligned(
+        ranges: list[tuple[int, int]],
+        block_size: int,
+    ) -> bool:
+        return all(
+            start % block_size == 0 and end % block_size == 0
+            for start, end in ranges
+        )
+
+    def _clear_restore_xargs_for_compact_replay(
+        self,
+        request: Request,
+        *,
+        reason: str,
+    ) -> None:
+        if (
+            not self._compact_replay_consumes_restore_spans_enabled()
+            or request.sampling_params is None
+        ):
+            return
+        extra_args = dict(request.sampling_params.extra_args or {})
+        if "kve_restore_span_ids" not in extra_args:
+            return
+        restore_span_ids = extra_args.get("kve_restore_span_ids")
+        for key in (
+            "kve_restore_span_ids",
+            "kve_restore_defer_until_prefill",
+            "kve_restore_after_visible_tokens",
+        ):
+            extra_args.pop(key, None)
+        request.sampling_params.extra_args = extra_args or None
+        request.managed_context_defer_restore_until_prefill = False
+        self._release_managed_context_restore_reservation(
+            request.request_id,
+            "compact-replay-consume-restore",
+        )
+        self._release_managed_context_deferred_restore(
+            request.request_id,
+            "compact-replay-consume-restore",
+        )
+        if os.environ.get("KVE_TRACE_COMPACT_REPREFILL") == "1":
+            logger.warning(
+                "[COMPACT-REPLAY-CONSUME-RESTORE] req=%s reason=%s "
+                "restore=%s",
+                request.request_id[:8],
+                reason,
+                restore_span_ids,
+            )
+
+    def _activate_compact_replay_full_refill(
+        self,
+        request: Request,
+        replay_snapshot: Any,
+        *,
+        reason: str,
+    ) -> bool:
+        token_ids = list(getattr(replay_snapshot, "token_ids", ()) or ())
+        live_writer_indices = tuple(
+            getattr(replay_snapshot, "live_writer_indices", ()) or ()
+        )
+        if not token_ids or not live_writer_indices:
+            return False
+        compaction_mgr = self._compact_replay_compaction_manager()
+        if compaction_mgr is None:
+            logger.warning(
+                "[COMPACT-REPLAY-FULL-SKIP] req=%s reason=%s "
+                "no CompactingKVCacheManager",
+                request.request_id[:8],
+                reason,
+            )
+            return False
+        dead_ranges = self._compact_replay_dead_ranges(
+            total_len=len(token_ids),
+            live_writer_indices=live_writer_indices,
+        )
+        if not self._compact_replay_ranges_block_aligned(
+            dead_ranges,
+            compaction_mgr.block_size,
+        ):
+            logger.warning(
+                "[COMPACT-REPLAY-FULL-SKIP] req=%s reason=%s "
+                "dead_ranges=%s block_size=%d not block-aligned",
+                request.request_id[:8],
+                reason,
+                dead_ranges,
+                compaction_mgr.block_size,
+            )
+            return False
+
+        request._kve_compact_replay_full_refill_state = (  # type: ignore[attr-defined]
+            CompactReplayFullRefillState(
+                prompt_token_ids=(
+                    list(request.prompt_token_ids)
+                    if request.prompt_token_ids is not None
+                    else None
+                ),
+                output_token_ids=list(request._output_token_ids),
+                all_token_ids=list(request._all_token_ids),
+                num_prompt_tokens=request.num_prompt_tokens,
+                num_computed_tokens=request.num_computed_tokens,
+                num_cached_tokens=request.num_cached_tokens,
+                position_offset=request.position_offset,
+                block_hashes=list(request.block_hashes),
+                turn_end_positions=list(
+                    getattr(request, "turn_end_positions", [])
+                ),
+                last_turn_scan_pos=int(
+                    getattr(request, "last_turn_scan_pos", 0)
+                ),
+                num_turns_evicted=int(
+                    getattr(request, "num_turns_evicted", 0)
+                ),
+                live_token_count=len(live_writer_indices),
+                dead_ranges=dead_ranges,
+            )
+        )
+        request.prompt_token_ids = token_ids.copy()
+        request._output_token_ids = []
+        request.output_token_ids = ConstantList(request._output_token_ids)
+        request._all_token_ids = token_ids.copy()
+        request.all_token_ids = ConstantList(request._all_token_ids)
+        request.num_prompt_tokens = len(token_ids)
+        request.num_computed_tokens = 0
+        request.num_cached_tokens = -1
+        request.position_offset = 0
+        request.block_hashes.clear()
+        request.update_block_hashes()
+        request._kve_compact_replay_full_refill_active = True  # type: ignore[attr-defined]
+        request._kve_compact_replay_full_refill_drop_sample = True  # type: ignore[attr-defined]
+        request.skip_reading_prefix_cache = True
+        self._clear_restore_xargs_for_compact_replay(request, reason=reason)
+        if os.environ.get("KVE_TRACE_COMPACT_REPREFILL") == "1":
+            logger.warning(
+                "[COMPACT-REPLAY-FULL-ARM] req=%s reason=%s writer_tokens=%d "
+                "live_tokens=%d dead_ranges=%s",
+                request.request_id[:8],
+                reason,
+                len(token_ids),
+                len(live_writer_indices),
+                dead_ranges,
+            )
+        return True
+
+    def _plan_compact_replay_segmented_deletions(
+        self,
+        request: Request,
+        replay_snapshot: Any,
+        *,
+        block_size: int,
+    ) -> list[tuple[int, int, int, int]] | None:
+        token_ids = tuple(getattr(replay_snapshot, "token_ids", ()) or ())
+        death_indices = tuple(
+            int(idx)
+            for idx in (getattr(replay_snapshot, "death_indices", ()) or ())
+        )
+        live_writer_indices = tuple(
+            int(idx)
+            for idx in (
+                getattr(replay_snapshot, "live_writer_indices", ()) or ()
+            )
+        )
+        final_len = len(token_ids)
+        if (
+            final_len == 0
+            or len(death_indices) != final_len
+            or block_size <= 0
+        ):
+            return None
+
+        protected_prefix_len = self._worker_protected_prefix_len(request)
+        current_live = list(range(final_len))
+        deletions: list[tuple[int, int, int, int]] = []
+        deleted_before = 0
+        live_writer_index_set = set(live_writer_indices)
+        boundaries = sorted(
+            {
+                death_idx
+                for writer_idx, death_idx in enumerate(death_indices)
+                if (
+                    writer_idx not in live_writer_index_set
+                    and death_idx <= final_len
+                )
+            }
+        )
+        for writer_boundary in boundaries:
+            if writer_boundary % block_size != 0:
+                return None
+            delete_positions = [
+                pos
+                for pos, writer_idx in enumerate(current_live)
+                if (
+                    writer_idx not in live_writer_index_set
+                    and death_indices[writer_idx] == writer_boundary
+                )
+            ]
+            if not delete_positions:
+                continue
+            start = delete_positions[0]
+            end = delete_positions[-1] + 1
+            if delete_positions != list(range(start, end)):
+                return None
+            if start < protected_prefix_len:
+                return None
+            if start % block_size != 0 or end % block_size != 0:
+                return None
+            physical_boundary = writer_boundary - deleted_before
+            if physical_boundary < end or physical_boundary % block_size != 0:
+                return None
+            deletions.append((physical_boundary, start, end, writer_boundary))
+            del current_live[start:end]
+            deleted_before += end - start
+
+        if tuple(current_live) != live_writer_indices:
+            return None
+        return deletions
+
+    def _activate_compact_replay_segmented_refill(
+        self,
+        request: Request,
+        replay_snapshot: Any,
+        *,
+        reason: str,
+        deletions: list[tuple[int, int, int, int]] | None = None,
+    ) -> bool:
+        token_ids = list(getattr(replay_snapshot, "token_ids", ()) or ())
+        live_writer_indices = tuple(
+            getattr(replay_snapshot, "live_writer_indices", ()) or ()
+        )
+        if not token_ids or not live_writer_indices:
+            return False
+        compaction_mgr = self._compact_replay_compaction_manager()
+        if compaction_mgr is None:
+            logger.warning(
+                "[COMPACT-REPLAY-SEGMENTED-SKIP] req=%s reason=%s "
+                "no CompactingKVCacheManager",
+                request.request_id[:8],
+                reason,
+            )
+            return False
+
+        if deletions is None:
+            deletions = self._plan_compact_replay_segmented_deletions(
+                request,
+                replay_snapshot,
+                block_size=compaction_mgr.block_size,
+            )
+        if deletions is None or not deletions:
+            logger.warning(
+                "[COMPACT-REPLAY-SEGMENTED-SKIP] req=%s reason=%s "
+                "unsupported replay shape",
+                request.request_id[:8],
+                reason,
+            )
+            return False
+
+        dead_ranges = self._compact_replay_dead_ranges(
+            total_len=len(token_ids),
+            live_writer_indices=live_writer_indices,
+        )
+        request._kve_compact_replay_full_refill_state = (  # type: ignore[attr-defined]
+            CompactReplayFullRefillState(
+                prompt_token_ids=(
+                    list(request.prompt_token_ids)
+                    if request.prompt_token_ids is not None
+                    else None
+                ),
+                output_token_ids=list(request._output_token_ids),
+                all_token_ids=list(request._all_token_ids),
+                num_prompt_tokens=request.num_prompt_tokens,
+                num_computed_tokens=request.num_computed_tokens,
+                num_cached_tokens=request.num_cached_tokens,
+                position_offset=request.position_offset,
+                block_hashes=list(request.block_hashes),
+                turn_end_positions=list(
+                    getattr(request, "turn_end_positions", [])
+                ),
+                last_turn_scan_pos=int(
+                    getattr(request, "last_turn_scan_pos", 0)
+                ),
+                num_turns_evicted=int(
+                    getattr(request, "num_turns_evicted", 0)
+                ),
+                live_token_count=len(live_writer_indices),
+                dead_ranges=dead_ranges,
+            )
+        )
+        request.prompt_token_ids = token_ids.copy()
+        request._output_token_ids = []
+        request.output_token_ids = ConstantList(request._output_token_ids)
+        request._all_token_ids = token_ids.copy()
+        request.all_token_ids = ConstantList(request._all_token_ids)
+        request.num_prompt_tokens = len(token_ids)
+        request.num_computed_tokens = 0
+        request.num_cached_tokens = -1
+        request.position_offset = 0
+        request.block_hashes.clear()
+        request.update_block_hashes()
+        request._kve_compact_replay_refill_active = True  # type: ignore[attr-defined]
+        request._kve_compact_replay_full_refill_active = True  # type: ignore[attr-defined]
+        request._kve_compact_replay_segmented_refill_active = True  # type: ignore[attr-defined]
+        request._kve_compact_replay_segmented_deletions = list(deletions)  # type: ignore[attr-defined]
+        request._kve_compact_replay_full_refill_drop_sample = True  # type: ignore[attr-defined]
+        request.skip_reading_prefix_cache = True
+        self._clear_restore_xargs_for_compact_replay(request, reason=reason)
+        if os.environ.get("KVE_TRACE_COMPACT_REPREFILL") == "1":
+            logger.warning(
+                "[COMPACT-REPLAY-SEGMENTED-ARM] req=%s reason=%s "
+                "writer_tokens=%d live_tokens=%d deletions=%s",
+                request.request_id[:8],
+                reason,
+                len(token_ids),
+                len(live_writer_indices),
+                deletions,
+            )
+        self._kve_dump_replay_snapshot(
+            request,
+            replay_snapshot,
+            variant="segmented",
+            reason=reason,
+            deletions=deletions,
+            dead_ranges=dead_ranges,
+        )
+        return True
+
+    def _restore_compact_replay_live_request_state(
+        self,
+        request: Request,
+        state: CompactReplayFullRefillState,
+    ) -> None:
+        request.prompt_token_ids = (
+            list(state.prompt_token_ids)
+            if state.prompt_token_ids is not None
+            else None
+        )
+        request._output_token_ids = list(state.output_token_ids)
+        request.output_token_ids = ConstantList(request._output_token_ids)
+        request._all_token_ids = list(state.all_token_ids)
+        request.all_token_ids = ConstantList(request._all_token_ids)
+        request.num_prompt_tokens = state.num_prompt_tokens
+        request.num_computed_tokens = state.live_token_count
+        request.num_cached_tokens = 0
+        request.position_offset = state.position_offset
+        request.block_hashes.clear()
+        request.block_hashes.extend(state.block_hashes)
+        request.turn_end_positions = list(state.turn_end_positions)
+        request.last_turn_scan_pos = state.last_turn_scan_pos
+        request.num_turns_evicted = state.num_turns_evicted
+        request.needs_rebuild = True
+        request.skip_reading_prefix_cache = True
+        self.prev_step_scheduled_req_ids.discard(request.request_id)
+
+    def _kve_dump_replay_snapshot(
+        self,
+        request: Request,
+        replay_snapshot: Any,
+        *,
+        variant: str,
+        reason: str,
+        deletions: Any = None,
+        dead_ranges: Any = None,
+    ) -> None:
+        """Env-gated dump of one re-prefill snapshot to JSONL.
+
+        Write-only; no-op unless KVE_DUMP_REPLAY_SNAPSHOTS opened a handle in
+        __init__. Captures a self-contained record (token_ids, death_indices,
+        live_writer_indices, the sequential deletion plan, and the pre-reset
+        position_offset / protected_prefix_len / block_size) so the offline
+        flex-vs-sequential replay harness can drive BOTH paths from the SAME
+        snapshot. See plans/request_kv_swap_preemption.md.
+        """
+        fh = getattr(self, "_kve_replay_dump_fh", None)
+        if fh is None:
+            return
+        try:
+            state = getattr(
+                request, "_kve_compact_replay_full_refill_state", None
+            )
+            position_offset = int(
+                getattr(state, "position_offset", 0)
+                if state is not None
+                else getattr(request, "position_offset", 0)
+            )
+            compaction_mgr = self._compact_replay_compaction_manager()
+            block_size = int(getattr(compaction_mgr, "block_size", 0) or 0)
+            try:
+                protected_prefix_len = int(
+                    self._worker_protected_prefix_len(request)
+                )
+            except Exception:  # noqa: BLE001
+                protected_prefix_len = -1
+            try:
+                is_valid = bool(replay_snapshot.is_valid())
+            except Exception:  # noqa: BLE001
+                is_valid = None
+            record = {
+                "request_id": request.request_id,
+                "variant": variant,
+                "reason": reason,
+                "token_ids": [
+                    int(t)
+                    for t in (getattr(replay_snapshot, "token_ids", ()) or ())
+                ],
+                "death_indices": [
+                    int(d)
+                    for d in (
+                        getattr(replay_snapshot, "death_indices", ()) or ()
+                    )
+                ],
+                "live_writer_indices": [
+                    int(i)
+                    for i in (
+                        getattr(replay_snapshot, "live_writer_indices", ())
+                        or ()
+                    )
+                ],
+                "evictions": int(
+                    getattr(replay_snapshot, "evictions", 0) or 0
+                ),
+                "deletions": [
+                    [int(x) for x in tup] for tup in (deletions or [])
+                ],
+                "dead_ranges": [
+                    [int(x) for x in rng] for rng in (dead_ranges or [])
+                ],
+                "position_offset": position_offset,
+                "protected_prefix_len": protected_prefix_len,
+                "block_size": block_size,
+                "is_valid": is_valid,
+            }
+            fh.write(json.dumps(record) + "\n")
+        except Exception as _kve_dump_err:  # noqa: BLE001
+            logger.warning(
+                "[KVE-DUMP-REPLAY-SNAPSHOT] dump failed req=%s: %s",
+                request.request_id[:8],
+                _kve_dump_err,
+            )
+
+    def _kve_force_decode_stuck_running_request(
+        self,
+        request: Request,
+    ) -> bool:
+        """Liveness backstop for a RUNNING request stuck fully-computed (C==T).
+
+        A request whose whole prompt is computed with no sampled token -- a full
+        phase-4 prefix hit, or a re-prefill that reached C==T off the scheduled
+        path -- yields num_new_tokens == 0 and is then skipped forever at the
+        num_new_tokens==0 check, idling the GPU (the fix3 tail stall). Force one
+        decode so it can sample. No-op for healthy decoding requests (C == T-1),
+        for prefilling requests (C < T), and for requests with legitimate pending
+        work. See plans/request_kv_swap_preemption.md (Phase A).
+        """
+        num_tokens = int(getattr(request, "num_tokens", 0) or 0)
+        if num_tokens <= 0 or request.num_computed_tokens != num_tokens:
+            return False
+        if getattr(request, "num_output_placeholders", 0):
+            return False
+        if getattr(request, "padding_pending", False):
+            return False
+        # A request awaiting a managed-context hidden-KV restore must not sample
+        # before its restored memory is attached.
+        rid = request.request_id
+        if rid in getattr(self, "_managed_context_active_restores", {}):
+            return False
+        if rid in getattr(self, "_managed_context_deferred_restores", {}):
+            return False
+        if rid in getattr(self, "_managed_context_pending_loads", {}):
+            return False
+        # A compact-replay refill that reached C==T off the scheduled path
+        # deadlocks: its completion only runs in update_from_output (which needs
+        # the request scheduled), but C==T makes num_new_tokens==0 so it is never
+        # scheduled. If the refill has no pending deletions it is effectively done
+        # -> complete it here to break the deadlock, then force one decode below.
+        # Requests that still have pending deletions are genuinely mid-refill;
+        # leave them to the segmented-advance loop.
+        if getattr(
+            request, "_kve_compact_replay_full_refill_active", False
+        ) or getattr(
+            request, "_kve_compact_replay_segmented_refill_active", False
+        ):
+            if getattr(request, "_kve_compact_replay_segmented_deletions", None):
+                return False
+            if not self._complete_compact_replay_full_refill(
+                request, reason="schedule-c-equals-t-rescue"
+            ):
+                return False
+            num_tokens = int(getattr(request, "num_tokens", 0) or 0)
+            if num_tokens <= 0 or request.num_computed_tokens != num_tokens:
+                return False
+        forced = self._force_compact_replay_decode_if_fully_computed(request)
+        if forced and self._kve_diag_enabled():
+            logger.warning(
+                "[SCHED-FORCE-DECODE-STUCK] req=%s C==T->forced decode "
+                "num_tokens=%d",
+                request.request_id[:8],
+                num_tokens,
+            )
+        return forced
+
+    def _force_compact_replay_decode_if_fully_computed(
+        self,
+        request: Request,
+    ) -> bool:
+        """Force sampling after a replay that ended as a full prompt hit."""
+        num_tokens = int(getattr(request, "num_tokens", 0) or 0)
+        if num_tokens <= 0 or request.num_computed_tokens != num_tokens:
+            return False
+        request.num_computed_tokens = num_tokens - 1
+        if request.num_cached_tokens > request.num_computed_tokens:
+            request.num_cached_tokens = request.num_computed_tokens
+        request.needs_rebuild = True
+        request.skip_reading_prefix_cache = True
+        self.prev_step_scheduled_req_ids.discard(request.request_id)
+        if os.environ.get("KVE_TRACE_COMPACT_REPREFILL") == "1":
+            logger.warning(
+                "[COMPACT-REPLAY-FORCE-DECODE] req=%s "
+                "num_computed=%d num_tokens=%d",
+                request.request_id[:8],
+                request.num_computed_tokens,
+                num_tokens,
+            )
+        return True
+
+    def _cap_compact_replay_segmented_prefill_tokens(
+        self,
+        request: Request,
+        *,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+    ) -> int:
+        if not getattr(
+            request, "_kve_compact_replay_segmented_refill_active", False
+        ):
+            return num_new_tokens
+        deletions = getattr(
+            request, "_kve_compact_replay_segmented_deletions", []
+        )
+        if not deletions:
+            return num_new_tokens
+        next_boundary = int(deletions[0][0])
+        if num_computed_tokens >= next_boundary:
+            return 0
+        return min(num_new_tokens, next_boundary - num_computed_tokens)
+
+    def _advance_compact_replay_segmented_refill(
+        self,
+        request: Request,
+        *,
+        reason: str,
+    ) -> bool:
+        if not getattr(
+            request, "_kve_compact_replay_segmented_refill_active", False
+        ):
+            return False
+        deletions = getattr(
+            request, "_kve_compact_replay_segmented_deletions", None
+        )
+        if not deletions:
+            return False
+        next_boundary, evict_start, evict_end, writer_boundary = deletions[0]
+        if request.num_computed_tokens < next_boundary:
+            return False
+        compaction_mgr = self._compact_replay_compaction_manager()
+        if compaction_mgr is None:
+            logger.warning(
+                "[COMPACT-REPLAY-SEGMENTED-SKIP] req=%s reason=%s "
+                "no CompactingKVCacheManager at boundary",
+                request.request_id[:8],
+                reason,
+            )
+            return False
+        if evict_start % compaction_mgr.block_size != 0 or (
+            evict_end % compaction_mgr.block_size != 0
+        ):
+            logger.warning(
+                "[COMPACT-REPLAY-SEGMENTED-SKIP] req=%s reason=%s "
+                "unaligned evict=[%d,%d) block_size=%d",
+                request.request_id[:8],
+                reason,
+                evict_start,
+                evict_end,
+                compaction_mgr.block_size,
+            )
+            return False
+        tokens_evicted = compaction_mgr.compact_request(
+            request.request_id,
+            0,
+            explicit_block_range=(
+                evict_start // compaction_mgr.block_size,
+                evict_end // compaction_mgr.block_size,
+            ),
+        )
+        expected = evict_end - evict_start
+        if tokens_evicted != expected:
+            logger.warning(
+                "[COMPACT-REPLAY-SEGMENTED-COMPACT-MISMATCH] req=%s "
+                "boundary=%d writer_boundary=%d evict=[%d,%d) "
+                "expected=%d got=%d",
+                request.request_id[:8],
+                next_boundary,
+                writer_boundary,
+                evict_start,
+                evict_end,
+                expected,
+                tokens_evicted,
+            )
+            return False
+
+        self._apply_trim(
+            request,
+            evict_start=evict_start,
+            evict_end=evict_end,
+            total_evicted=expected,
+            stride_used=0,
+            num_turns_evicted_after=int(
+                getattr(request, "num_turns_evicted", 0)
+            ),
+            trim_prompt_token_ids=True,
+        )
+        del deletions[0]
+        request.needs_rebuild = True
+        request.skip_reading_prefix_cache = True
+        self.prev_step_scheduled_req_ids.discard(request.request_id)
+        if os.environ.get("KVE_TRACE_COMPACT_REPREFILL") == "1":
+            logger.warning(
+                "[COMPACT-REPLAY-SEGMENTED-ADVANCE] req=%s reason=%s "
+                "boundary=%d writer_boundary=%d evicted=%d "
+                "computed=%d prompt=%d remaining=%d position_offset=%d",
+                request.request_id[:8],
+                reason,
+                next_boundary,
+                writer_boundary,
+                expected,
+                request.num_computed_tokens,
+                request.num_prompt_tokens,
+                len(deletions),
+                request.position_offset,
+            )
+        return True
+
+    def _complete_compact_replay_full_refill(
+        self,
+        request: Request,
+        *,
+        reason: str,
+    ) -> bool:
+        state = getattr(
+            request,
+            "_kve_compact_replay_full_refill_state",
+            None,
+        )
+        if state is None:
+            return False
+        compaction_mgr = self._compact_replay_compaction_manager()
+        if compaction_mgr is None:
+            return False
+        segmented_active = getattr(
+            request, "_kve_compact_replay_segmented_refill_active", False
+        )
+        if segmented_active:
+            pending_deletions = getattr(
+                request, "_kve_compact_replay_segmented_deletions", []
+            )
+            if pending_deletions:
+                return False
+        else:
+            for start, end in reversed(state.dead_ranges):
+                if start == end:
+                    continue
+                tokens_evicted = compaction_mgr.compact_request(
+                    request.request_id,
+                    0,
+                    explicit_block_range=(
+                        start // compaction_mgr.block_size,
+                        end // compaction_mgr.block_size,
+                    ),
+                )
+                expected = end - start
+                if tokens_evicted != expected:
+                    logger.warning(
+                        "[COMPACT-REPLAY-FULL-COMPACT-MISMATCH] req=%s "
+                        "range=[%d,%d) expected=%d got=%d",
+                        request.request_id[:8],
+                        start,
+                        end,
+                        expected,
+                        tokens_evicted,
+                    )
+                    return False
+
+        self._restore_compact_replay_live_request_state(request, state)
+        request._kve_reprefill_after_flush = False  # type: ignore[attr-defined]
+        request._kve_phase4_reprefill_after_pin_release = False  # type: ignore[attr-defined]
+        request._kve_compact_replay_refill_active = False  # type: ignore[attr-defined]
+        request._kve_compact_replay_full_refill_active = False  # type: ignore[attr-defined]
+        request._kve_compact_replay_segmented_refill_active = False  # type: ignore[attr-defined]
+        request._kve_compact_replay_full_refill_drop_sample = False  # type: ignore[attr-defined]
+        request._kve_compact_replay_refill_snapshot = None  # type: ignore[attr-defined]
+        if hasattr(request, "_kve_compact_replay_full_refill_state"):
+            delattr(request, "_kve_compact_replay_full_refill_state")
+        if hasattr(request, "_kve_compact_replay_segmented_deletions"):
+            delattr(request, "_kve_compact_replay_segmented_deletions")
+        self._retry_managed_context_gpu_pinned_offloads(
+            "compact-replay-full-refill-done"
+        )
+        self._proactively_offload_nonproductive_kv(
+            "compact-replay-full-refill-done"
+        )
+        if os.environ.get("KVE_TRACE_COMPACT_REPREFILL") == "1":
+            logger.warning(
+                "[COMPACT-REPLAY-FULL-DONE] req=%s reason=%s "
+                "live_tokens=%d dead_ranges=%s",
+                request.request_id[:8],
+                reason,
+                state.live_token_count,
+                state.dead_ranges,
+            )
+        return True
 
     def _phase4_requeue_prefix_miss_for_reprefill(
         self,
@@ -3407,6 +4837,7 @@ class Scheduler(SchedulerInterface):
             request,
             "phase4-prefix-miss-reprefill",
             phase4_pin_release=True,
+            free_request_kv=self._compact_replay_refill_enabled(),
             skip_log_reason=reason,
         ):
             return False
@@ -3504,6 +4935,75 @@ class Scheduler(SchedulerInterface):
             return 0
         return (n - 1) // 2
 
+    def _compaction_synthetic_live_turns(self, request: Request) -> int:
+        """Number of SYNTHETIC (recall-handshake control) turns currently live
+        in this request, as reported by the client via the
+        ``kve_compaction_synthetic_live_turns`` extra_arg.
+
+        The managed-context recall handshake injects synthetic user turns (the
+        "your previous assistant message ... / restored memory" control
+        messages) into the token stream. They carry <|im_end|> so the turn
+        scanner counts them, but they are MACHINERY, not game turns. The client
+        counts how many are currently in the (post-eviction) live window and
+        passes the count so the compaction budget can be measured in GAME turns.
+        Returns 0 when absent (no recall handshake / older client).
+        """
+        ea = getattr(request.sampling_params, "extra_args", None)
+        if not isinstance(ea, dict):
+            return 0
+        try:
+            n = int(ea.get("kve_compaction_synthetic_live_turns", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+        # Cannot exclude more synthetic turns than there are live turns.
+        return max(0, min(n, self._num_live_completed_turns(request)))
+
+    def _compaction_protect_oldest_turns(self) -> int:
+        """KVE_COMPACTION_PROTECT_OLDEST_TURNS=P: turn-mode eviction never
+        evicts the P oldest live turns — they stay in the visible kept stream
+        (an everlasting anchor), so recall of the earliest context needs no
+        hidden-restore machinery: the kept prompt + phase4 pin carry the
+        original KV through every compaction with zero recompute. 0 = off."""
+        raw = os.environ.get("KVE_COMPACTION_PROTECT_OLDEST_TURNS")
+        if not raw:
+            return 0
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return 0
+
+    def _compaction_recalled_turns(self, request: Request) -> int:
+        """Number of RECALLED spans currently attached to this request, as
+        reported by the client via ``kve_compaction_recalled_turns``. Under the
+        unified turn budget (recall-at-compaction design), each persistent
+        recalled span occupies one turn slot: the trigger ceiling and the evict
+        stride both shrink by this count, so visible turns + recalled spans
+        never exceed compaction_max_turns. 0 when absent (recalls don't count).
+        """
+        ea = getattr(request.sampling_params, "extra_args", None)
+        if not isinstance(ea, dict):
+            return 0
+        try:
+            n = int(ea.get("kve_compaction_recalled_turns", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, min(n, self._compaction_max_turns - 1))
+
+    def _effective_compaction_max_turns(self, request: Request) -> int:
+        """Compaction ceiling measured in GAME turns: the configured
+        ``compaction_max_turns`` plus the count of live synthetic handshake
+        turns (machinery exchanges don't consume budget) minus the count of
+        attached recalled spans (recalls DO consume budget — the unified cap
+        includes them). Self-correcting: more visible game history -> fewer
+        recalls -> fewer synthetic turns -> ceiling returns to the base.
+        """
+        eff = (
+            self._compaction_max_turns
+            + self._compaction_synthetic_live_turns(request)
+            - self._compaction_recalled_turns(request)
+        )
+        return max(1, eff)
+
     def _effective_prompt_tokens(self, request: Request) -> int:
         """Eviction boundary: protected prefix if set, else full prompt.
 
@@ -3582,7 +5082,7 @@ class Scheduler(SchedulerInterface):
             self._scan_new_turn_boundaries(request)
             return (
                 self._num_live_completed_turns(request)
-                >= self._compaction_max_turns
+                >= self._effective_compaction_max_turns(request)
             )
         for mgr in self.kv_cache_manager.coordinator.single_type_managers:
             if isinstance(mgr, CompactingKVCacheManager) and mgr.needs_compaction(
@@ -3625,7 +5125,7 @@ class Scheduler(SchedulerInterface):
             self._scan_new_turn_boundaries(request)
             if (
                 self._num_live_completed_turns(request)
-                < self._compaction_max_turns
+                < self._effective_compaction_max_turns(request)
             ):
                 break
             evicted = self._compact_request(
@@ -3800,6 +5300,80 @@ class Scheduler(SchedulerInterface):
 
         return total_num_scheduled_tokens + delta_total, any_evicted
 
+    def _apply_smart_position_offset_bump(
+        self,
+        request: Request,
+        compaction_mgr: Any,
+        block_size: int,
+        prompt_tokens_evicted: int,
+    ) -> None:
+        """Piecewise position_offset fix after evicting a MIDDLE token range.
+
+        Ensures new K writes after the eviction land at logical positions ABOVE
+        all surviving K: bumps position_offset to max(simple_bump,
+        max_survivor_logical + 1 - num_computed_post), then re-stamps the
+        future-K (pre-allocated, unwritten) blocks so a later prefix-cache
+        inheritor reads the correct seed offset. Relies on per-block
+        logical_start (plans/piecewise_position_offset.md). Gate on
+        prompt_tokens_evicted > 0: mid-gen evicts OUTPUT, whose survivor K share
+        the decode offset, so the simple bump suffices there.
+
+        Shared by _compact_request (eviction) and partial KV-swap reload
+        (restore sys-prefix + window survivors, park the middle) — both produce
+        the identical post-eviction offset state, which is correctness-critical
+        for RoPE / bit-exactness.
+        """
+        if not (prompt_tokens_evicted > 0 and request.num_computed_tokens > 0):
+            return
+        blocks = compaction_mgr.req_to_blocks[request.request_id]
+        # Only scan blocks that ACTUALLY have K written; blocks beyond
+        # num_cached_blocks are pre-allocated empty slots for upcoming prefill.
+        num_cached_blocks = (
+            request.num_computed_tokens + block_size - 1
+        ) // block_size
+        max_survivor_logical = -1
+        for b in blocks[:num_cached_blocks]:
+            if b.logical_start >= 0:
+                max_survivor_logical = max(
+                    max_survivor_logical,
+                    b.logical_start + block_size - 1,
+                )
+        if max_survivor_logical >= 0:
+            required_offset = (
+                max_survivor_logical + 1 - request.num_computed_tokens
+            )
+            if required_offset > request.position_offset:
+                logger.warning(
+                    "[COMPACT-SMART] req=%s position_offset %d -> %d "
+                    "(max_survivor_logical=%d, num_computed_post=%d). "
+                    "Survivors kept in cache; new writes above all survivors.",
+                    request.request_id[:8],
+                    request.position_offset,
+                    required_offset,
+                    max_survivor_logical,
+                    request.num_computed_tokens,
+                )
+                request.position_offset = required_offset
+
+        # Re-stamp logical_start on the future-K blocks (past num_cached_blocks):
+        # stamped at allocate time with the pre-bump offset; must match the new
+        # offset or a future inheritor computes the wrong seed offset.
+        new_offset = request.position_offset
+        for new_idx, b in enumerate(
+            blocks[num_cached_blocks:], start=num_cached_blocks
+        ):
+            if b.logical_start >= 0:
+                correct_logical_start = new_idx * block_size + new_offset
+                if b.logical_start != correct_logical_start:
+                    if os.environ.get("KV_EVICTION_BUG_TRACE") == "1":
+                        logger.warning(
+                            "[COMPACT-RESTAMP] req=%s block_id=%d idx=%d "
+                            "logical_start %d -> %d (post-eviction new-K block)",
+                            request.request_id[:8], b.block_id,
+                            new_idx, b.logical_start, correct_logical_start,
+                        )
+                    b.logical_start = correct_logical_start
+
     def _compact_request(
         self,
         request: Request,
@@ -3856,6 +5430,34 @@ class Scheduler(SchedulerInterface):
                 evict_start // block_size, evict_end // block_size
             )
             total_evicted = evict_end - evict_start
+            if (
+                self._compact_replay_segmented_refill_enabled()
+                and not self._compact_replay_segmented_full_fallback_enabled()
+                and self._managed_context_replay_only_archive_enabled()
+                and block_size > 0
+            ):
+                replay_token_ids = getattr(
+                    request, "_kve_compact_replay_token_ids", None
+                )
+                writer_len_for_replay = (
+                    len(replay_token_ids)
+                    if replay_token_ids is not None
+                    else len(request._all_token_ids)
+                )
+                if writer_len_for_replay % block_size != 0:
+                    if os.environ.get("KVE_TRACE_COMPACT_REPREFILL") == "1":
+                        logger.warning(
+                            "[COMPACT-REPLAY-SEGMENTED-DEFER-UNALIGNED] "
+                            "req=%s writer_tokens=%d block_size=%d "
+                            "evict=[%d,%d) generated=%d",
+                            request.request_id[:8],
+                            writer_len_for_replay,
+                            block_size,
+                            evict_start,
+                            evict_end,
+                            request.num_total_generated,
+                        )
+                    return 0
             archived_span_ids = self._archive_managed_context_span(
                 request,
                 compaction_mgr=compaction_mgr,
@@ -3893,11 +5495,17 @@ class Scheduler(SchedulerInterface):
             ) * block_size
             evict_end = evict_start + total_evicted
 
-        # Debug-only: snapshot the actual evicted token ids for inspection.
-        # Gated on an env var so we don't pay the serialization cost in
-        # production runs. Consumer can detokenize via `tokenizer.decode`.
+        # Snapshot the actual evicted token ids when an external consumer
+        # asks for them. Full replay needs the ids to reconstruct compacted
+        # hidden spans from the client-visible request representation; the
+        # legacy debug flag keeps the old inspection path working.
         evicted_token_ids: list[int] = []
-        if os.environ.get("VLLM_COMPACTION_DEBUG_TOKENS"):
+        if (
+            os.environ.get("VLLM_COMPACTION_DEBUG_TOKENS")
+            or os.environ.get("KVE_OPENAI_INCLUDE_EVICTED_TOKEN_IDS") == "1"
+            or self._compact_replay_refill_enabled()
+            or self._managed_context_replay_only_archive_enabled()
+        ):
             evicted_token_ids = list(
                 request._all_token_ids[evict_start:evict_end]
             )
@@ -3916,6 +5524,30 @@ class Scheduler(SchedulerInterface):
             list(request._all_token_ids[0:evict_start])
             + list(request._all_token_ids[evict_end:pre_event_len])
         )
+        writer_len_at_compaction = pre_event_len
+        mark_replay_eviction = getattr(
+            request, "mark_compact_replay_eviction", None
+        )
+        if callable(mark_replay_eviction):
+            replay_marked = mark_replay_eviction(evict_start, total_evicted)
+            replay_token_ids = getattr(
+                request, "_kve_compact_replay_token_ids", None
+            )
+            if replay_token_ids is not None:
+                writer_len_at_compaction = len(replay_token_ids)
+            if (
+                not replay_marked
+                and os.environ.get("KVE_TRACE_COMPACT_REPREFILL") == "1"
+            ):
+                logger.warning(
+                    "[COMPACT-REPLAY-SKIP] req=%s evict=[%d,%d) "
+                    "live_pre=%d error=%s",
+                    request.request_id[:8],
+                    evict_start,
+                    evict_end,
+                    pre_event_len,
+                    getattr(request, "_kve_compact_replay_last_error", None),
+                )
 
         # Compute event metadata that we'll use AFTER _apply_trim and
         # smart-bump. The event itself is emitted later so that
@@ -3936,9 +5568,27 @@ class Scheduler(SchedulerInterface):
             request, evict_end
         ) if post_prefill_admission else 0
 
+        # DEBUG (1-trace schedule probe): how many EXCHANGES this fire actually
+        # removes vs the configured stride. An exchange k ends at positions[2*k];
+        # it is fully evicted iff positions[2*k] <= evict_end. block-alignment
+        # snaps evict_end DOWN, so the last targeted exchange can get clamped off
+        # -> ex_evicted < stride. live_before is the trigger value.
+        _pos_dbg = request.turn_end_positions
+        _live_before_dbg = self._num_live_completed_turns(request)
+        _synth_dbg = self._compaction_synthetic_live_turns(request)
+        _recalled_dbg = self._compaction_recalled_turns(request)
+        _protect_dbg = self._compaction_protect_oldest_turns()
+        _eff_max_dbg = self._effective_compaction_max_turns(request)
+        _ex_evicted_dbg = sum(
+            1 for _k in range(1, len(_pos_dbg) // 2 + 1)
+            if 2 * _k < len(_pos_dbg)
+            and evict_start < _pos_dbg[2 * _k] <= evict_end
+        )
         logger.warning(
             "[COMPACT] req=%s effective_prompt=%d num_prompt=%d "
-            "evict=[%d,%d) total=%d generated=%d turn_mode=%s last_turn=%d",
+            "evict=[%d,%d) total=%d generated=%d turn_mode=%s last_turn=%d "
+            "stride=%d live_before=%d ex_evicted=%d synth=%d recalled=%d "
+            "protect=%d eff_max=%d game_turns=%d",
             request.request_id[:8],
             effective_prompt,
             request.num_prompt_tokens,
@@ -3947,6 +5597,14 @@ class Scheduler(SchedulerInterface):
             request.num_total_generated,
             self._compaction_max_turns > 0,
             last_turn_evicted,
+            stride_used,
+            _live_before_dbg,
+            _ex_evicted_dbg,
+            _synth_dbg,
+            _recalled_dbg,
+            _protect_dbg,
+            _eff_max_dbg,
+            _live_before_dbg - _synth_dbg,
         )
 
         # --- Mutate request to look like a shorter sequence ---
@@ -3978,82 +5636,13 @@ class Scheduler(SchedulerInterface):
                 request.position_offset,
             )
 
-        # ──── Smart position_offset bump (piecewise position fix) ────
-        # Goal: ensure new K writes after this admission land at
-        # logical positions ABOVE all surviving K. Achieved by bumping
-        # position_offset to max(simple_bump, max_survivor_logical + 1
-        # - num_computed_post). Survivors STAY in cache (no re-prefill).
-        #
-        # This relies on per-block logical_start being populated at
-        # allocation time (Phase A of plans/piecewise_position_offset.md).
-        # The GPU's position computation must apply the bumped offset
-        # ONLY to physical positions >= protected_prefix_len (Phase D),
-        # so sys K at logical [0..protected_prefix_len) keeps offset=0
-        # and stays correct.
-        #
-        # Gate on prompt_tokens_evicted > 0 to apply only on admission
-        # (mid-gen evicts OUTPUT; its survivor K share the same offset
-        # as subsequent decode writes, so the simple bump is sufficient).
-        if prompt_tokens_evicted > 0 and request.num_computed_tokens > 0:
-            blocks = compaction_mgr.req_to_blocks[request.request_id]
-            # Only scan blocks that ACTUALLY have K written. Blocks beyond
-            # num_cached_blocks are pre-allocated empty slots for upcoming
-            # prefill — they have logical_start stamped (from Phase A) but
-            # no K vectors yet, so they shouldn't constrain the offset.
-            num_cached_blocks = (
-                request.num_computed_tokens + block_size - 1
-            ) // block_size
-            max_survivor_logical = -1
-            for b in blocks[:num_cached_blocks]:
-                if b.logical_start >= 0:
-                    max_survivor_logical = max(
-                        max_survivor_logical,
-                        b.logical_start + block_size - 1,
-                    )
-            if max_survivor_logical >= 0:
-                required_offset = (
-                    max_survivor_logical + 1
-                    - request.num_computed_tokens
-                )
-                if required_offset > request.position_offset:
-                    logger.warning(
-                        "[COMPACT-SMART] req=%s position_offset %d -> %d "
-                        "(max_survivor_logical=%d, num_computed_post=%d). "
-                        "Survivors kept in cache; new prefill writes "
-                        "above all survivor positions.",
-                        request.request_id[:8],
-                        request.position_offset,
-                        required_offset,
-                        max_survivor_logical,
-                        request.num_computed_tokens,
-                    )
-                    request.position_offset = required_offset
-
-            # Re-stamp logical_start on the "future-K" blocks (those past
-            # num_cached_blocks — pre-allocated for upcoming prefill but
-            # not yet written). They were stamped at allocate_new_blocks
-            # time with the PRE-admission position_offset. After admission
-            # bumps position_offset, the worker's forward will rotate K at
-            # the NEW offset, so logical_start must match — otherwise a
-            # FUTURE inheritor that hits these blocks via prefix-cache
-            # will compute the wrong seed offset, causing accumulated
-            # Q-K rotation drift across inheritance generations.
-            new_offset = request.position_offset
-            for new_idx, b in enumerate(blocks[num_cached_blocks:],
-                                        start=num_cached_blocks):
-                if b.logical_start >= 0:
-                    correct_logical_start = new_idx * block_size + new_offset
-                    if b.logical_start != correct_logical_start:
-                        if os.environ.get("KV_EVICTION_BUG_TRACE") == "1":
-                            logger.warning(
-                                "[COMPACT-RESTAMP] req=%s block_id=%d "
-                                "idx=%d logical_start %d -> %d "
-                                "(post-admission new-K block)",
-                                request.request_id[:8], b.block_id,
-                                new_idx, b.logical_start,
-                                correct_logical_start,
-                            )
-                        b.logical_start = correct_logical_start
+        # Smart position_offset bump (piecewise position fix). Factored into a
+        # shared helper so partial KV-swap reload reproduces the SAME offset
+        # bookkeeping when it restores sys-prefix + window survivors and parks
+        # the middle. See _apply_smart_position_offset_bump.
+        self._apply_smart_position_offset_bump(
+            request, compaction_mgr, block_size, prompt_tokens_evicted
+        )
 
         # Emit the CompactionEvent NOW — after _apply_trim and the smart
         # bump have both run. `request.position_offset` is the final
@@ -4078,6 +5667,7 @@ class Scheduler(SchedulerInterface):
             num_turns_evicted_after=num_turns_evicted_after,
             kept_indices=kept_indices,
             kept_token_ids=kept_token_ids,
+            writer_len_at_compaction=writer_len_at_compaction,
             new_user_fragment_len=new_user_fragment_len,
             archived_span_ids=archived_span_ids,
         )
@@ -4129,18 +5719,39 @@ class Scheduler(SchedulerInterface):
         #   positions[2] = end of (live) turn 1
         #   positions[2*k] = end of (live) turn k
         live_turns = self._num_live_completed_turns(request)
-        if live_turns < self._compaction_max_turns:
+        if live_turns < self._effective_compaction_max_turns(request):
             return None
-        stride = min(self._compaction_eviction_turn_stride, live_turns)
+        # Unified turn budget: each attached recalled span occupies one of the
+        # stride's eviction slots (the client drops/replaces its recalls at
+        # compaction, so stride counts EFFECTIVE turns: recalled + visible).
+        # E.g. max_turns=10 stride=7 recall=2: fire1 evicts 7 visible -> 3+2
+        # recalled = 5 effective; fire2 at 8 visible evicts 5 -> 3+2 = 5. Stable.
+        _recalled = self._compaction_recalled_turns(request)
+        # PROTECT-OLDEST mode (KVE_COMPACTION_PROTECT_OLDEST_TURNS=P>0): the P
+        # oldest live turns are never evicted — they stay in the VISIBLE kept
+        # stream, so the next call's prompt (rebuilt from kept_token_ids) and
+        # the phase4 pin match them natively: the "recall set" rides the
+        # ordinary prefix-cache path with zero recompute and no hidden-restore
+        # machinery. (max_turns=10, stride=5, protect=2) == the unified budget
+        # (10, evict-7, recall-2): fire at 10 effective, land at 5.
+        protect = self._compaction_protect_oldest_turns()
+        if protect > 0:
+            protect = min(protect, max(0, live_turns - 1))
+        stride = min(
+            max(1, self._compaction_eviction_turn_stride - _recalled),
+            live_turns - protect,
+        )
         if stride <= 0:
             return None
+        if protect > 0 and len(positions) <= 2 * (protect + stride):
+            return None
 
-        # First live turn starts immediately after the system prompt,
-        # i.e. at positions[0]. (Even after prior evictions, positions[0]
-        # always marks the end of the system prompt — invariant.)
-        turn_first_start_pos = positions[0]
-        # The stride-th live turn ends at positions[2*stride].
-        turn_last_end_pos = positions[2 * stride]
+        # First EVICTABLE turn starts after the protected prefix: after the
+        # system prompt (positions[0]) when protect=0, else after the
+        # protect-th live turn (positions[2*protect]).
+        turn_first_start_pos = positions[2 * protect]
+        # The last evicted turn ends stride turns later.
+        turn_last_end_pos = positions[2 * (protect + stride)]
 
         evict_start = (
             (turn_first_start_pos + block_size - 1) // block_size
@@ -4190,7 +5801,11 @@ class Scheduler(SchedulerInterface):
         if evict_end <= evict_start:
             return None
 
-        last_turn_evicted = request.num_turns_evicted + stride - 1
+        # Absolute index of the last evicted turn. With protect=0 the evicted
+        # range is the oldest live turns [num_evicted .. num_evicted+stride-1];
+        # with protection the range shifts past the P everlasting oldest turns
+        # (their absolute indices stay below num_turns_evicted forever).
+        last_turn_evicted = request.num_turns_evicted + protect + stride - 1
         return (evict_start, evict_end, last_turn_evicted, stride)
 
     def _compute_new_user_fragment_len(
@@ -4293,6 +5908,7 @@ class Scheduler(SchedulerInterface):
                 num_external_computed_tokens=request.num_external_computed_tokens,
                 num_nans_in_logits=request.num_nans_in_logits,
                 compaction_events=compaction_events,
+                managed_context_restore_kind=request.managed_context_restore_kind,
             )
         )
 
@@ -4357,8 +5973,80 @@ class Scheduler(SchedulerInterface):
     def _phase4_proactive_cpu_offload_enabled(self) -> bool:
         if not self._managed_context_cpu_archive_enabled:
             return False
-        raw = os.environ.get("KVE_PHASE4_PROACTIVE_CPU_OFFLOAD", "0")
+        raw = os.environ.get("KVE_PHASE4_PROACTIVE_CPU_OFFLOAD")
+        if raw is None:
+            return False
         return raw.strip().lower() in ("1", "true", "yes", "on")
+
+    def _phase4_pressure_replay_enabled(self) -> bool:
+        raw = os.environ.get("KVE_PHASE4_PRESSURE_REPLAY")
+        if raw is None or raw.strip().lower() in ("0", "false", "no", "off"):
+            return False
+        return self._compact_replay_refill_enabled()
+
+    def _phase4_proactive_replay_drop_enabled(self) -> bool:
+        raw = os.environ.get("KVE_PHASE4_PROACTIVE_REPLAY_DROP")
+        if raw is not None and raw.strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            return False
+        if raw is not None:
+            return self._phase4_pressure_replay_enabled()
+        return self._phase4_pressure_replay_enabled()
+
+    def _phase4_replay_drop_evict_prefix_enabled(self) -> bool:
+        raw = os.environ.get("KVE_PHASE4_REPLAY_DROP_EVICT_PREFIX", "0")
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+
+    def _phase4_replay_cold_publish_enabled(self) -> bool:
+        raw = os.environ.get("KVE_PHASE4_REPLAY_COLD_PUBLISH")
+        if raw is None or raw.strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            return False
+        return self._compact_replay_refill_enabled()
+
+    def _phase4_replay_hot_pin_limit(self) -> int | None:
+        raw = os.environ.get("KVE_PHASE4_REPLAY_HOT_PIN_LIMIT")
+        if raw is None:
+            if (
+                self._phase4_replay_cold_publish_enabled()
+                and os.environ.get("KVE_PHASE4_REPLAY_HOT_PIN_BLOCK_LIMIT")
+                is None
+            ):
+                return 0
+            return None
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            if (
+                self._phase4_replay_cold_publish_enabled()
+                and os.environ.get("KVE_PHASE4_REPLAY_HOT_PIN_BLOCK_LIMIT")
+                is None
+            ):
+                return 0
+            return None
+
+    def _phase4_replay_hot_pin_block_limit(self) -> int | None:
+        value = self._env_optional_int("KVE_PHASE4_REPLAY_HOT_PIN_BLOCK_LIMIT")
+        if value is None:
+            return None
+        return max(0, value)
+
+    def _phase4_proactive_max_replay_drops_per_step(self) -> int:
+        return max(
+            1,
+            self._env_int(
+                "KVE_PHASE4_PROACTIVE_MAX_REPLAY_DROPS_PER_STEP",
+                self._env_int("KVE_PHASE4_PRESSURE_RELEASE_MAX", 16),
+            ),
+        )
 
     def _phase4_proactive_max_pin_offloads_per_step(self) -> int:
         return max(
@@ -4438,7 +6126,6 @@ class Scheduler(SchedulerInterface):
             self._managed_context_active_restores,
             self._managed_context_deferred_restores,
             self._managed_context_pending_loads,
-            self._managed_context_restore_reservations,
         ):
             add_request(self.requests.get(request_id))
 
@@ -4480,7 +6167,9 @@ class Scheduler(SchedulerInterface):
         if not self._phase4_proactive_cpu_offload_enabled():
             return 0
         productive_trace_ids = self._phase4_productive_gpu_trace_ids()
-        protected_keys = self._managed_context_cpu_archive_protected_keys()
+        protected_keys = self._managed_context_cpu_archive_protected_keys(
+            include_restore_reservations=False
+        )
         released_blocks = 0
         for key in list(self._managed_context_hot_gpu_order):
             if (
@@ -4537,6 +6226,18 @@ class Scheduler(SchedulerInterface):
                 trace_id, pin, now=now
             ):
                 continue
+            # Activity-aware: if this trace already has a next-turn request
+            # QUEUED (waiting/skipped), keep its prefix pin GPU-resident. The
+            # trace just left self.running between turns, but its successor is
+            # imminent -- offloading now forces an offload->reload round trip
+            # that gets parked by the load watermark (the 68k-defer trap).
+            if (
+                os.environ.get(
+                    "KVE_PHASE4_PIN_PROTECT_QUEUED_SUCCESSORS", "1"
+                ).strip().lower() not in ("0", "false", "no", "off")
+                and self._phase4_has_queued_successor(trace_id, pin)
+            ):
+                continue
             candidates.append((trace_id, pin))
 
         if self._request_kv_swap_pressure_largest_first_enabled():
@@ -4577,8 +6278,74 @@ class Scheduler(SchedulerInterface):
                 )
         return started
 
+    def _proactively_drop_replayable_phase4_pins(
+        self, reason: str, *, max_release_blocks: int | None = None
+    ) -> tuple[int, int]:
+        if not self._phase4_proactive_replay_drop_enabled():
+            return (0, 0)
+        if max_release_blocks is not None and max_release_blocks <= 0:
+            return (0, 0)
+        self._compact_phase4_pin_order()
+        productive_trace_ids = self._phase4_productive_gpu_trace_ids()
+        candidates: list[tuple[int, float, str, int]] = []
+        for trace_id in self._phase4_pin_order:
+            if trace_id in productive_trace_ids:
+                continue
+            pin = self._phase4_pinned_blocks.get(trace_id)
+            if (
+                pin is None
+                or pin.status != "gpu_pinned"
+                or not pin.entries
+                or pin.block_count <= 0
+            ):
+                continue
+            candidates.append(
+                (
+                    pin.block_count,
+                    pin.created_at,
+                    trace_id,
+                    pin.token_count,
+                )
+            )
+
+        candidates.sort(reverse=True)
+        dropped = 0
+        released_blocks = 0
+        max_drops = self._phase4_proactive_max_replay_drops_per_step()
+        for block_count, _created_at, trace_id, token_count in candidates:
+            if dropped >= max_drops:
+                break
+            if (
+                max_release_blocks is not None
+                and released_blocks >= max_release_blocks
+            ):
+                break
+            pin = self._phase4_pinned_blocks.get(trace_id)
+            if pin is None or pin.status != "gpu_pinned" or not pin.entries:
+                continue
+            block_count = pin.block_count
+            token_count = pin.token_count
+            self._release_phase4_pins(
+                trace_id,
+                f"{reason}-proactive-replay",
+                evict_prefix=self._phase4_replay_drop_evict_prefix_enabled(),
+            )
+            released_blocks += block_count
+            dropped += 1
+            logger.warning(
+                "[PHASE4-PROACTIVE-REPLAY-DROP] trace=%s reason=%s "
+                "blocks=%d tokens=%d productive=False",
+                trace_id,
+                reason,
+                block_count,
+                token_count,
+            )
+        return dropped, released_blocks
+
     def _proactively_offload_nonproductive_kv(self, reason: str) -> None:
-        if not self._phase4_proactive_cpu_offload_enabled():
+        cpu_offload_enabled = self._phase4_proactive_cpu_offload_enabled()
+        replay_drop_enabled = self._phase4_proactive_replay_drop_enabled()
+        if not cpu_offload_enabled and not replay_drop_enabled:
             return
         usage = self._phase4_gpu_block_usage()
         start_usage = self._phase4_proactive_offload_start_usage()
@@ -4601,28 +6368,56 @@ class Scheduler(SchedulerInterface):
         if trace_enabled:
             before_pools = self._kve_gpu_block_pool_diag_summary()
             before_managed = self._kve_managed_context_diag_summary()
-        hot_released_blocks = self._proactively_release_nonproductive_hot_gpu_spans(
-            reason,
-            max_release_blocks=release_target_blocks,
-        )
+        hot_released_blocks = 0
+        if cpu_offload_enabled:
+            hot_released_blocks = (
+                self._proactively_release_nonproductive_hot_gpu_spans(
+                    reason,
+                    max_release_blocks=release_target_blocks,
+                )
+            )
         remaining_release_blocks = release_target_blocks
         if remaining_release_blocks is not None:
             remaining_release_blocks = max(
                 0,
                 remaining_release_blocks - hot_released_blocks,
             )
-        pin_offloads = self._proactively_offload_nonproductive_phase4_pins(
-            reason,
-            max_release_blocks=remaining_release_blocks,
-        )
-        if trace_enabled and (hot_released_blocks or pin_offloads):
+        replay_drops = 0
+        replay_drop_blocks = 0
+        if replay_drop_enabled:
+            replay_drops, replay_drop_blocks = (
+                self._proactively_drop_replayable_phase4_pins(
+                    reason,
+                    max_release_blocks=remaining_release_blocks,
+                )
+            )
+            if remaining_release_blocks is not None:
+                remaining_release_blocks = max(
+                    0,
+                    remaining_release_blocks - replay_drop_blocks,
+                )
+        pin_offloads = 0
+        if cpu_offload_enabled and not replay_drop_enabled:
+            pin_offloads = self._proactively_offload_nonproductive_phase4_pins(
+                reason,
+                max_release_blocks=remaining_release_blocks,
+            )
+        if trace_enabled and (
+            hot_released_blocks
+            or replay_drops
+            or replay_drop_blocks
+            or pin_offloads
+        ):
             logger.warning(
-                "[PHASE4-PROACTIVE-CPU-OFFLOAD] reason=%s "
-                "hot_released_blocks=%d pin_offloads=%d start_usage=%.3f "
-                "release_target_blocks=%s pools_before=%s managed_before=%s "
-                "pools_after=%s managed_after=%s",
+                "[PHASE4-PROACTIVE-KV-RELEASE] reason=%s "
+                "hot_released_blocks=%d replay_drops=%d "
+                "replay_drop_blocks=%d pin_offloads=%d start_usage=%.3f "
+                "release_target_blocks=%s pools_before=%s "
+                "managed_before=%s pools_after=%s managed_after=%s",
                 reason,
                 hot_released_blocks,
+                replay_drops,
+                replay_drop_blocks,
                 pin_offloads,
                 start_usage,
                 release_target_blocks,
@@ -4967,7 +6762,12 @@ class Scheduler(SchedulerInterface):
 
     def _phase4_prefix_miss_reprefill_enabled(self) -> bool:
         raw = os.environ.get("KVE_PHASE4_PREFIX_MISS_REPREFILL", "0")
-        return raw.strip().lower() in ("1", "true", "yes", "on")
+        return raw.strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ) or self._compact_replay_refill_enabled()
 
     @staticmethod
     def _phase4_pin_recovery_defers(reason: str) -> bool:
@@ -5060,6 +6860,92 @@ class Scheduler(SchedulerInterface):
         if error is None:
             return "Phase4 pin load submitted"
         return error
+
+    def _phase4_pin_prefetch_queued_requests(self) -> None:
+        """Start CPU->GPU pin reloads for queued Phase4 successors.
+
+        Without prefetch, an offloaded pin's reload starts only when its
+        successor request is matched at admission (the PHASE4-PREFIX-DEFER
+        path). The successor can sit in the waiting queue for many steps
+        first, so starting the reload at queue-entry overlaps the H2D copy
+        with the queue wait. Flag-gated by KVE_PHASE4_PIN_PREFETCH=1
+        (default off). Respects the same load-capacity gates as the
+        admission-time path via _start_phase4_pin_cpu_load.
+        """
+        if not self._phase4_pin_prefetch_enabled:
+            return
+        if not self._phase4_pinned_blocks:
+            return
+        attempted = self._phase4_pin_prefetch_attempted
+        if len(attempted) > 8192:
+            attempted.intersection_update(self.requests.keys())
+        for request_queue in (
+            getattr(self, "waiting", ()),
+            getattr(self, "skipped_waiting", ()),
+        ):
+            for request in request_queue:
+                req_id = request.request_id
+                if req_id in attempted:
+                    continue
+                if self._phase4_pin_release_reprefill_active(request):
+                    attempted.add(req_id)
+                    continue
+                trace_id = self._phase4_request_trace_id_if_available(request)
+                if not trace_id:
+                    attempted.add(req_id)
+                    continue
+                pin = self._phase4_pinned_blocks.get(trace_id)
+                if pin is None:
+                    attempted.add(req_id)
+                    continue
+                if pin.status != "cpu_offloaded":
+                    # gpu_pinned needs no load; load_pending is already on
+                    # its way back. store_pending/expired are left unmarked
+                    # so a later step can prefetch once the store completes
+                    # (status becomes cpu_offloaded).
+                    if pin.status in ("gpu_pinned", "load_pending"):
+                        attempted.add(req_id)
+                    continue
+                expected_cached_tokens = self._phase4_expected_cached_tokens(
+                    request
+                )
+                if (
+                    expected_cached_tokens is not None
+                    and pin.token_count < expected_cached_tokens
+                ):
+                    # Pin cannot satisfy this successor; leave the
+                    # admission-time path to handle the miss.
+                    attempted.add(req_id)
+                    continue
+                error = self._start_phase4_pin_cpu_load(
+                    trace_id,
+                    pin,
+                    reason="pin-prefetch",
+                    request_id=req_id,
+                )
+                if error is None:
+                    attempted.add(req_id)
+                    self._phase4_pin_prefetch_started += 1
+                    logger.warning(
+                        "[PIN-PREFETCH] req=%s trace=%s blocks=%d tokens=%d "
+                        "started_total=%d",
+                        req_id[:8],
+                        trace_id,
+                        pin.block_count,
+                        pin.token_count,
+                        self._phase4_pin_prefetch_started,
+                    )
+                elif not self._phase4_pin_recovery_defers(error):
+                    attempted.add(req_id)
+                    logger.warning(
+                        "[PIN-PREFETCH-SKIP] req=%s trace=%s reason=%s",
+                        req_id[:8],
+                        trace_id,
+                        error,
+                    )
+                # Deferable errors (GPU headroom / watermark / transfer
+                # limit) are left unmarked so the prefetch retries on a
+                # later step while the request is still queued.
 
     def _mark_phase4_pin_consumed(
         self, trace_id: str, request_id: str
@@ -5268,6 +7154,27 @@ class Scheduler(SchedulerInterface):
                 continue
             if pin.status != "gpu_pinned":
                 continue
+            if self._phase4_pressure_replay_enabled():
+                if not pin.entries or pin.block_count <= 0:
+                    continue
+                queued_count = len(queued_successors)
+                block_count = pin.block_count
+                self._release_phase4_pins(
+                    trace_id,
+                    f"{reason}-replay",
+                    evict_prefix=self._phase4_replay_drop_evict_prefix_enabled(),
+                )
+                logger.warning(
+                    "[PHASE4-PRESSURE-REPLAY-DROP] trace=%s reason=%s "
+                    "blocks=%d tokens=%d queued_successors=%d live_demand=%s",
+                    trace_id,
+                    reason,
+                    block_count,
+                    pin.token_count,
+                    queued_count,
+                    live_demand,
+                )
+                return True
             offload_error = self._start_phase4_pin_cpu_offload(
                 trace_id,
                 pin,
@@ -5290,8 +7197,124 @@ class Scheduler(SchedulerInterface):
             # The D2H copy will free GPU blocks only after the transfer
             # completion is observed, so allocation-pressure callers must
             # not immediately retry slot allocation.
-            return False
+                return False
         return False
+
+    def _release_phase4_pressure_pins_for_blocks(
+        self,
+        needed_blocks: int,
+        *,
+        reason: str,
+    ) -> int:
+        if not self._phase4_pressure_replay_enabled():
+            if self._release_phase4_pressure_pin(reason):
+                return 1
+            return 0
+        if not self._phase4_pinned_blocks:
+            return 0
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        if not managers:
+            return 0
+        target_free_blocks = max(
+            0,
+            needed_blocks,
+            self._env_int(
+                "KVE_PHASE4_PRESSURE_RELEASE_TARGET_FREE_BLOCKS",
+                1024,
+            ),
+        )
+        release_limit = max(
+            1,
+            self._env_int(
+                "KVE_PHASE4_PRESSURE_RELEASE_MAX",
+                self._env_int("KVE_PHASE4_STALL_PRESSURE_RELEASE_MAX", 8),
+            ),
+        )
+        free_before = min(
+            manager.block_pool.get_num_free_blocks() for manager in managers
+        )
+        released_pins = 0
+        candidates: list[tuple[int, str, int, int, bool]] = []
+        self._compact_phase4_pin_order()
+        now = time.monotonic()
+        grace_seconds = self._phase4_consumed_pin_grace_seconds()
+        for trace_id in list(self._phase4_pin_order):
+            pin = self._phase4_pinned_blocks.get(trace_id)
+            if pin is None or pin.status != "gpu_pinned":
+                continue
+            if not pin.entries or pin.block_count <= 0:
+                continue
+            queued_successors = self._phase4_queued_successors(trace_id, pin)
+            live_demand = self._phase4_pin_has_live_demand(
+                trace_id,
+                pin,
+                now=now,
+                grace_seconds=grace_seconds,
+                queued_successors=queued_successors,
+            )
+            if not live_demand and reason != "scheduler-stall-pressure":
+                continue
+            candidates.append(
+                (
+                    pin.block_count,
+                    trace_id,
+                    pin.token_count,
+                    len(queued_successors),
+                    live_demand,
+                )
+            )
+        candidates.sort(reverse=True)
+        while released_pins < release_limit:
+            free_blocks = min(
+                manager.block_pool.get_num_free_blocks()
+                for manager in managers
+            )
+            if free_blocks >= target_free_blocks:
+                break
+            if not candidates:
+                break
+            block_count, trace_id, token_count, queued_count, live_demand = (
+                candidates.pop(0)
+            )
+            pin = self._phase4_pinned_blocks.get(trace_id)
+            if pin is None or pin.status != "gpu_pinned":
+                continue
+            block_count = pin.block_count
+            token_count = pin.token_count
+            self._release_phase4_pins(
+                trace_id,
+                f"{reason}-replay",
+                evict_prefix=self._phase4_replay_drop_evict_prefix_enabled(),
+            )
+            logger.warning(
+                "[PHASE4-PRESSURE-REPLAY-DROP] trace=%s reason=%s "
+                "blocks=%d tokens=%d queued_successors=%d live_demand=%s",
+                trace_id,
+                reason,
+                block_count,
+                token_count,
+                queued_count,
+                live_demand,
+            )
+            released_pins += 1
+        if released_pins:
+            free_after = min(
+                manager.block_pool.get_num_free_blocks()
+                for manager in managers
+            )
+            logger.warning(
+                "[PHASE4-PRESSURE-REPLAY-DRAIN] reason=%s pins=%d "
+                "needed=%d target_free=%d free_before=%d free_after=%d "
+                "limit=%d",
+                reason,
+                released_pins,
+                needed_blocks,
+                target_free_blocks,
+                free_before,
+                free_after,
+                release_limit,
+            )
+        return released_pins
 
     def _maybe_release_phase4_stall_pressure_pin(
         self, *, total_num_scheduled_tokens: int
@@ -5309,8 +7332,12 @@ class Scheduler(SchedulerInterface):
             self._env_int("KVE_PHASE4_STALL_PRESSURE_RELEASE_MAX", 8),
         )
         released_hot_gpu_blocks = 0
-        released_phase4_pins = 0
-        for _ in range(release_limit):
+        released_phase4_pins = self._release_phase4_pressure_pins_for_blocks(
+            0,
+            reason="scheduler-stall-pressure",
+        )
+        remaining_release_limit = max(0, release_limit - released_phase4_pins)
+        for _ in range(remaining_release_limit):
             released_hot = self._managed_context_release_hot_gpu_pressure(
                 "scheduler-stall-pressure"
             )
@@ -5340,14 +7367,14 @@ class Scheduler(SchedulerInterface):
         )
         return True
 
-    def _pin_phase4_request_blocks(self, request: Request) -> None:
+    def _pin_phase4_request_blocks(self, request: Request) -> str | None:
         trace_id = self._phase4_trace_id(request)
         if not trace_id or request.status in (
             RequestStatus.FINISHED_ABORTED,
             RequestStatus.FINISHED_ERROR,
             RequestStatus.FINISHED_IGNORED,
         ):
-            return
+            return None
 
         entries: list[tuple[Any, list[Any]]] = []
         total_blocks = 0
@@ -5371,7 +7398,7 @@ class Scheduler(SchedulerInterface):
             total_blocks += len(blocks)
 
         if not entries:
-            return
+            return None
 
         # The successor has finished successfully; replace the previous
         # retained-state pin only now. This keeps call N's pin available for
@@ -5395,6 +7422,100 @@ class Scheduler(SchedulerInterface):
                 request.num_tokens,
                 total_blocks,
             )
+        return trace_id
+
+    def _maybe_cold_release_phase4_published_pin(
+        self, trace_id: str | None
+    ) -> bool:
+        if not trace_id or not self._phase4_replay_cold_publish_enabled():
+            return False
+        return self._enforce_phase4_replay_hot_pin_budget(
+            reason="cold-publish-replay"
+        ) > 0
+
+    def _phase4_replay_hot_gpu_pins(
+        self,
+    ) -> list[tuple[str, Phase4Pin]]:
+        self._compact_phase4_pin_order()
+        hot_pins: list[tuple[str, Phase4Pin]] = []
+        for trace_id in self._phase4_pin_order:
+            pin = self._phase4_pinned_blocks.get(trace_id)
+            if (
+                pin is not None
+                and pin.status == "gpu_pinned"
+                and bool(pin.entries)
+                and pin.block_count > 0
+            ):
+                hot_pins.append((trace_id, pin))
+        return hot_pins
+
+    @staticmethod
+    def _phase4_replay_hot_pin_budget_exceeded(
+        count: int,
+        blocks: int,
+        *,
+        count_limit: int | None,
+        block_limit: int | None,
+    ) -> bool:
+        if count_limit is not None and count > count_limit:
+            return True
+        if block_limit is not None and blocks > block_limit:
+            return True
+        return False
+
+    def _enforce_phase4_replay_hot_pin_budget(self, reason: str) -> int:
+        if not self._phase4_replay_cold_publish_enabled():
+            return 0
+        count_limit = self._phase4_replay_hot_pin_limit()
+        block_limit = self._phase4_replay_hot_pin_block_limit()
+        if count_limit is None and block_limit is None:
+            return 0
+        hot_pins = self._phase4_replay_hot_gpu_pins()
+        hot_count = len(hot_pins)
+        hot_blocks = sum(pin.block_count for _trace_id, pin in hot_pins)
+        released = 0
+        while hot_pins and self._phase4_replay_hot_pin_budget_exceeded(
+            hot_count,
+            hot_blocks,
+            count_limit=count_limit,
+            block_limit=block_limit,
+        ):
+            trace_id, pin = hot_pins.pop(0)
+            pin = self._phase4_pinned_blocks.get(trace_id)
+            if (
+                pin is None
+                or pin.status != "gpu_pinned"
+                or not pin.entries
+                or pin.block_count <= 0
+            ):
+                continue
+            block_count = pin.block_count
+            token_count = pin.token_count
+            self._release_phase4_pins(
+                trace_id,
+                reason,
+                evict_prefix=self._phase4_replay_drop_evict_prefix_enabled(),
+            )
+            hot_count -= 1
+            hot_blocks = max(0, hot_blocks - block_count)
+            released += 1
+            logger.warning(
+                "[PHASE4-REPLAY-COLD-PUBLISH] trace=%s reason=%s "
+                "blocks=%d tokens=%d hot_pins=%d hot_blocks=%d "
+                "pin_limit=%s block_limit=%s evict_prefix=%s",
+                trace_id,
+                reason,
+                block_count,
+                token_count,
+                hot_count,
+                hot_blocks,
+                count_limit,
+                block_limit,
+                self._phase4_replay_drop_evict_prefix_enabled(),
+            )
+        if released:
+            self._compact_phase4_pin_order()
+        return released
 
     def _managed_context_trace_id(self, request: Request) -> str:
         if not self._managed_context_enabled:
@@ -5460,6 +7581,21 @@ class Scheduler(SchedulerInterface):
 
     def _request_kv_swap_resident_first_enabled(self) -> bool:
         raw = os.environ.get("KVE_REQUEST_KV_SWAP_RESIDENT_FIRST", "1")
+        return self._request_kv_swap_enabled() and raw.strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+
+    def _request_kv_swap_eager_fill_enabled(self) -> bool:
+        # #9 handshake collapse (default OFF): when ON, swap-in admission fills
+        # free GPU capacity eagerly instead of parking every swapped rollout
+        # behind GPU-resident work until the 30s starvation timer. Measured
+        # motivation: running-set ~5 with ~33% of the pool free, ~0.2
+        # resumes/step. See plans/request_kv_swap_preemption.md (collapse the
+        # per-turn recall/swap handshake).
+        raw = os.environ.get("KVE_REQUEST_KV_SWAP_EAGER_FILL", "0")
         return self._request_kv_swap_enabled() and raw.strip().lower() not in (
             "0",
             "false",
@@ -5536,6 +7672,207 @@ class Scheduler(SchedulerInterface):
         return self._request_kv_swap_usage_watermark(
             "KVE_REQUEST_KV_SWAP_ACTIVE_TRACE_TARGET_USAGE"
         )
+
+    def _managed_context_restore_admission_enabled(self) -> bool:
+        raw = os.environ.get("KVE_MANAGED_CONTEXT_RESTORE_ADMISSION")
+        if raw is not None:
+            return raw.strip().lower() not in ("0", "false", "no", "off")
+        return self._phase4_pressure_replay_enabled()
+
+    def _managed_context_restore_admission_max_requests(self) -> int | None:
+        value = self._env_optional_int(
+            "KVE_MANAGED_CONTEXT_ACTIVE_RESTORE_MAX_REQUESTS"
+        )
+        if value is not None:
+            return value if value > 0 else None
+        return None
+
+    def _managed_context_restore_admission_max_blocks(self) -> int | None:
+        value = self._env_optional_int(
+            "KVE_MANAGED_CONTEXT_ACTIVE_RESTORE_MAX_BLOCKS"
+        )
+        if value is not None:
+            return value if value > 0 else None
+        target_usage = self._request_kv_swap_usage_watermark(
+            "KVE_MANAGED_CONTEXT_ACTIVE_RESTORE_TARGET_USAGE"
+        )
+        if target_usage is None:
+            if not self._phase4_pressure_replay_enabled():
+                return None
+            target_usage = 0.50
+        total_blocks, _free_blocks = self._request_kv_swap_gpu_block_pool_stats()
+        if total_blocks <= 0:
+            return None
+        return max(1, int(total_blocks * target_usage))
+
+    @staticmethod
+    def _managed_context_restore_admission_is_deferred(
+        request: Request,
+    ) -> bool:
+        return bool(
+            getattr(
+                request,
+                "_kve_managed_context_restore_admission_deferred",
+                False,
+            )
+        )
+
+    @staticmethod
+    def _set_managed_context_restore_admission_deferred(
+        request: Request,
+        error: str | None,
+    ) -> None:
+        setattr(
+            request,
+            "_kve_managed_context_restore_admission_deferred",
+            error is not None,
+        )
+        setattr(
+            request,
+            "_kve_managed_context_restore_admission_error",
+            error,
+        )
+
+    def _managed_context_restore_entries_block_count(
+        self,
+        entries_by_span: dict[str, list[tuple[Any, list[Any]]]],
+    ) -> int:
+        return sum(
+            self._kve_blocks_from_entries(entries)
+            for entries in entries_by_span.values()
+        )
+
+    def _managed_context_restore_span_block_count(
+        self,
+        spans: list[ManagedContextSpan],
+        restored_entries_by_span: dict[
+            str, list[tuple[Any, list[Any]]]
+        ] | None = None,
+    ) -> int:
+        restored_entries_by_span = restored_entries_by_span or {}
+        total_blocks = 0
+        for span in spans:
+            entries = restored_entries_by_span.get(span.span_id)
+            if entries is not None:
+                total_blocks += self._kve_blocks_from_entries(entries)
+            else:
+                total_blocks += max(0, int(span.kv_block_count))
+        return total_blocks
+
+    def _managed_context_restore_working_set_blocks(
+        self,
+        *,
+        exclude_request_id: str | None = None,
+    ) -> int:
+        active_blocks = sum(
+            self._kve_blocks_from_entries(restore.entries)
+            for request_id, restore in self._managed_context_active_restores.items()
+            if request_id != exclude_request_id
+        )
+        deferred_blocks = sum(
+            self._managed_context_restore_entries_block_count(
+                deferred.restored_entries_by_span
+            )
+            for request_id, deferred in self._managed_context_deferred_restores.items()
+            if request_id != exclude_request_id
+        )
+        pending_blocks = sum(
+            self._managed_context_restore_entries_block_count(
+                pending.restored_entries_by_span
+            )
+            for request_id, pending in self._managed_context_pending_loads.items()
+            if request_id != exclude_request_id
+        )
+        return active_blocks + deferred_blocks + pending_blocks
+
+    def _managed_context_restore_inflight_request_count(
+        self,
+        *,
+        exclude_request_id: str | None = None,
+    ) -> int:
+        request_ids = set(self._managed_context_active_restores)
+        request_ids.update(self._managed_context_pending_loads)
+        request_ids.update(
+            request_id
+            for request_id, deferred in self._managed_context_deferred_restores.items()
+            if deferred.restored_entries_by_span
+        )
+        if exclude_request_id is not None:
+            request_ids.discard(exclude_request_id)
+        return len(request_ids)
+
+    def _managed_context_restore_admission_error(
+        self,
+        request: Request,
+        restore_spans: list[ManagedContextSpan],
+        *,
+        restored_entries_by_span: dict[
+            str, list[tuple[Any, list[Any]]]
+        ] | None = None,
+    ) -> str | None:
+        if not restore_spans or not self._managed_context_restore_admission_enabled():
+            return None
+        request_id = request.request_id
+        if request_id in self._managed_context_active_restores:
+            return None
+
+        inflight_requests = self._managed_context_restore_inflight_request_count(
+            exclude_request_id=request_id
+        )
+        max_requests = self._managed_context_restore_admission_max_requests()
+        if (
+            max_requests is not None
+            and inflight_requests >= max_requests
+            and inflight_requests > 0
+        ):
+            return (
+                "managed-context restore admission is waiting for inflight "
+                f"restore request budget: req={request_id[:8]} "
+                f"inflight={inflight_requests} max={max_requests}"
+            )
+
+        incoming_blocks = self._managed_context_restore_span_block_count(
+            restore_spans,
+            restored_entries_by_span,
+        )
+        current_blocks = self._managed_context_restore_working_set_blocks(
+            exclude_request_id=request_id
+        )
+        max_blocks = self._managed_context_restore_admission_max_blocks()
+        if (
+            max_blocks is not None
+            and current_blocks + incoming_blocks > max_blocks
+            and current_blocks > 0
+        ):
+            return (
+                "managed-context restore admission is waiting for hidden KV "
+                f"block budget: req={request_id[:8]} "
+                f"current_blocks={current_blocks} "
+                f"incoming_blocks={incoming_blocks} max_blocks={max_blocks}"
+            )
+
+        return None
+
+    def _managed_context_deferred_restore_blocked_by_admission(
+        self,
+        request: Request,
+        *,
+        computed_tokens: int | None = None,
+    ) -> bool:
+        if not self._managed_context_restore_admission_is_deferred(request):
+            return False
+        request_id = request.request_id
+        if request_id not in self._managed_context_deferred_restores:
+            return False
+        current_computed_tokens = (
+            request.num_computed_tokens
+            if computed_tokens is None
+            else int(computed_tokens)
+        )
+        ready_tokens = self._managed_context_deferred_restore_ready_tokens(
+            request
+        )
+        return current_computed_tokens >= ready_tokens
 
     @staticmethod
     def _request_kv_swap_trace_admission_is_deferred(
@@ -5970,6 +8307,22 @@ class Scheduler(SchedulerInterface):
         if swap.status != "swapped":
             return False
 
+        # #9 handshake collapse (KVE_REQUEST_KV_SWAP_EAGER_FILL, default OFF):
+        # resident-first parking defers every swap-in behind GPU-resident work
+        # until the 30s starvation timer, stranding free GPU capacity (measured:
+        # running ~5 with ~33% of the pool free, ~0.2 resumes/step). When eager
+        # fill is on, do NOT park a swapped rollout whose load is admissible right
+        # now -- bring it back to fill free capacity. Bounded by the existing
+        # load-admissibility/capacity check (free blocks, pending<max), so it
+        # cannot over-subscribe the pool. Flag-guarded + default OFF so the
+        # validated path is unchanged.
+        if self._request_kv_swap_eager_fill_enabled() and (
+            self._request_kv_swap_load_is_admissible(
+                request, swap, token_budget=token_budget
+            )
+        ):
+            return False
+
         # If no GPU-resident or ordinary waiting work can make progress, this
         # parked request is the work. Let the normal load path try and report
         # the exact admission reason.
@@ -5995,6 +8348,15 @@ class Scheduler(SchedulerInterface):
         return True
 
     def _request_kv_swap_should_prefer_waiting_queue(self) -> bool:
+        if (
+            self._managed_context_restore_admission_enabled()
+            and self.waiting
+            and self.skipped_waiting
+            and self._managed_context_restore_admission_is_deferred(
+                self.skipped_waiting.peek_request()
+            )
+        ):
+            return True
         if (
             self._request_kv_swap_active_trace_admission_enabled()
             and self.waiting
@@ -6080,7 +8442,31 @@ class Scheduler(SchedulerInterface):
             return "request has managed-context load in flight"
         if self._request_kv_swap_gpu_block_count(request_id) <= 0:
             return "request has no GPU KV blocks"
+        # MIN-PROGRESS protection (KVE_REQUEST_KV_SWAP_MIN_PROGRESS_TOKENS=K):
+        # measured pathology — single requests swap-preempted up to 26-31x,
+        # resuming and being re-evicted after a token or two; 20 trips x ~4s
+        # = the 90s p99 call tail. A (re)admitted request may not be preempted
+        # again until it has computed K tokens since admission. Calls here are
+        # ~10 decode tokens, so K~32 effectively means "let resumed calls
+        # finish" at bounded cost.
+        min_progress = self._request_kv_swap_min_progress_tokens()
+        if min_progress > 0:
+            admit_computed = getattr(request, "_kve_admit_computed", None)
+            if (
+                admit_computed is not None
+                and request.num_computed_tokens - admit_computed < min_progress
+            ):
+                return "request below min progress since (re)admission"
         return None
+
+    def _request_kv_swap_min_progress_tokens(self) -> int:
+        raw = os.environ.get("KVE_REQUEST_KV_SWAP_MIN_PROGRESS_TOKENS")
+        if not raw:
+            return 0
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return 0
 
     def _request_kv_swap_pressure_candidates(
         self,
@@ -6102,6 +8488,18 @@ class Scheduler(SchedulerInterface):
             )
         else:
             candidates = list(reversed(candidates))
+        if os.environ.get("KVE_REQUEST_KV_SWAP_FAIR_PREEMPT", "0") == "1":
+            # FAIRNESS: newest-first preemption re-parks the just-resumed
+            # request forever (a resumed request re-enters self.running at the
+            # tail = top candidate again) -> ping-pong starvation, measured as
+            # p99 call latency ~90s while median is ~1s. Prefer parking
+            # requests that have been preempted the FEWEST times (stable sort
+            # keeps newest-first within equal counts) -> round-robin sharing.
+            candidates.sort(
+                key=lambda request: int(
+                    getattr(request, "num_preemptions", 0) or 0
+                )
+            )
         if self._request_kv_swap_pressure_largest_first_enabled():
             candidates.sort(
                 key=lambda request: self._request_kv_swap_gpu_block_count(
@@ -6263,6 +8661,25 @@ class Scheduler(SchedulerInterface):
                 released_blocks += len(blocks)
         return released_blocks
 
+    def _free_request_kv_swap_kept_blocks(self, swap: RequestKVSwap) -> int:
+        """Free the shared (ref_cnt>1 at swap-out) blocks kept resident across
+        the swap. Called only on teardown paths that do NOT hand the kept blocks
+        back to the request's block table (abort / store-expired). After a
+        successful load the kept blocks live in req_to_blocks (spliced in
+        _start_request_kv_swap_load) and are freed by normal request finish, so
+        this must NOT run there. kept and `entries` are disjoint sets, so this
+        never double-frees the spilled/reloaded blocks."""
+        if not swap.kept_blocks_by_group:
+            return 0
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        freed = 0
+        for mgr, kept in zip(managers, swap.kept_blocks_by_group):
+            blocks = [blk for _, blk in kept]
+            if blocks:
+                mgr.block_pool.free_blocks(reversed(blocks))
+                freed += len(blocks)
+        return freed
+
     def _start_request_kv_swap_out(
         self, request: Request, reason: str
     ) -> str | None:
@@ -6293,16 +8710,35 @@ class Scheduler(SchedulerInterface):
 
         entries: list[tuple[Any, list[Any]]] = []
         logical_start_by_group: list[list[int]] = []
+        kept_by_group: list[list[tuple[int, Any]]] = []
+        total_by_group: list[int] = []
         total_blocks = 0
         for manager in managers:
             blocks = list(manager.req_to_blocks.get(request_id, []))
             if not blocks:
                 return "request has no GPU KV blocks"
-            entries.append((manager, blocks))
+            # #2 shared-prefix-resident DISABLED (2026-06-07): keeping every
+            # ref_cnt>1 block resident DEADLOCKED the GPU under heavy swap.
+            # Blocks shared by a SUBSET of rollouts that all swap out then never
+            # free (this request holds its ref while swapped, so ref_cnt never
+            # reaches 0), so the held-resident set accumulates and swapping
+            # STOPS relieving pressure (measured: spilled/swap fell 96->7, the
+            # running set drained to 0, EngineCore hung in D-state). The
+            # "keeping shared blocks costs no relief" assumption is false for
+            # subset-shared blocks. Reverted to whole-rollout spill (kept stays
+            # empty, spill all); the kept/splice/teardown scaffolding below is
+            # inert while kept_by_group holds only empty lists. A correct
+            # version would keep resident ONLY blocks guaranteed resident
+            # regardless (prefix held by the running set) — deferred.
+            kept: list[tuple[int, Any]] = []
+            spilled: list[Any] = list(blocks)
+            entries.append((manager, spilled))
             logical_start_by_group.append(
-                [int(block.logical_start) for block in blocks]
+                [int(block.logical_start) for block in spilled]
             )
-            total_blocks += len(blocks)
+            kept_by_group.append(kept)
+            total_by_group.append(len(blocks))
+            total_blocks += len(spilled)
 
         cpu_block_ids = self._alloc_managed_context_cpu_blocks(total_blocks)
         if cpu_block_ids is None:
@@ -6334,6 +8770,8 @@ class Scheduler(SchedulerInterface):
             created_at=time.monotonic(),
             entries=entries,
             store_event_id=event_id,
+            kept_blocks_by_group=tuple(kept_by_group),
+            total_blocks_by_group=tuple(total_by_group),
         )
         self._request_kv_swaps[request_id] = swap
         self._request_kv_swap_store_event_to_request_id[event_id] = request_id
@@ -6356,6 +8794,28 @@ class Scheduler(SchedulerInterface):
                 request.position_offset,
                 cpu_by_group,
             )
+        # Whole-trace swap (design B): the window is now swapping out; ALSO
+        # offload this rollout's gpu_pinned ARCHIVE spans so the ENTIRE trace
+        # leaves the GPU together, instead of stranding the archive resident
+        # (which is what forced the per-span ARCHIVE_GPU_FRACTION cap and the
+        # 618 GiB of per-span streaming). The spans become cpu_offloaded and
+        # are recalled on demand. Only in deferred mode (immediate already
+        # offloads at eviction). Best-effort: a CPU-full span just stays pinned.
+        if not self._managed_context_cpu_offload_immediate:
+            swap_trace_id = self._managed_context_trace_id(request)
+            if swap_trace_id:
+                for arch_key in list(self._managed_context_archive_order):
+                    if arch_key[0] != swap_trace_id:
+                        continue
+                    arch_span = self._managed_context_archive.get(arch_key)
+                    if (
+                        arch_span is not None
+                        and arch_span.status == "gpu_pinned"
+                        and arch_span.entries
+                    ):
+                        self._start_managed_context_cpu_offload(
+                            arch_span, "swap-out-whole-trace"
+                        )
         return None
 
     def _complete_request_kv_swap_store(self, event_id: int) -> None:
@@ -6374,11 +8834,13 @@ class Scheduler(SchedulerInterface):
         swap.store_event_id = None
         if swap.status == "expired":
             self._managed_context_free_cpu_block_ids(swap.cpu_block_ids_by_group)
+            self._free_request_kv_swap_kept_blocks(swap)
             self._request_kv_swaps.pop(request_id, None)
             self._request_kv_swap_remove_ready(request_id)
             self.requests.pop(request_id, None)
             return
         swap.status = "swapped"
+        swap._t_swapped = time.monotonic()  # SWAP-AGE room1 end (store flight)
         self._request_kv_swap_remove_ready(request_id)
         self._request_kv_swap_ready_queue.append(request_id)
         if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
@@ -6390,6 +8852,87 @@ class Scheduler(SchedulerInterface):
                 released_blocks,
                 swap.cpu_block_ids_by_group,
             )
+
+    def _swap_reload_cache_hit_blocks(
+        self, request, swap, idx, manager, logical_starts, cpu_ids
+    ):
+        """Re-attach the still-resident offset-0 shared prefix on swap reload
+        via the normal cache-aware admission, returning (new_suffix_blocks,
+        n_cached) for the caller to H2D — or None to fall back to the whole-
+        rollout reload. All go/no-go checks happen BEFORE allocate_slots (so a
+        fallback claims nothing → no leak); once allocate_slots commits we
+        trust it and fail LOUD on a count surprise rather than silently leak.
+        Constrained to inherited_offset==0 (the always-resident system prompt).
+        Gated by KVE_SWAP_RELOAD_CACHE_HIT; NOT bit-exact-validated yet."""
+        total = len(cpu_ids)
+        saved_computed = request.num_computed_tokens
+        try:
+            # Re-admit as if fresh: comp=0; the cached prefix is the prefix-cache
+            # hit (num_new_computed); the H2D'd suffix is external-computed KV
+            # (num_new_tokens=0, num_external_computed_tokens=suffix).
+            request.num_computed_tokens = 0
+            computed, num_cached_tokens, inherited_offset = (
+                self.kv_cache_manager.get_computed_blocks(request)
+            )
+            cached_list = computed.blocks[idx] if computed.blocks else []
+            n_cached = len(cached_list)
+            suffix_tokens = int(swap.num_computed_tokens) - int(num_cached_tokens)
+            if (
+                inherited_offset != 0     # only the offset-0 prefix is frame-safe
+                or n_cached <= 0          # no hit → nothing to gain
+                or n_cached >= total      # need a real miss-suffix to H2D
+                or suffix_tokens <= 0
+            ):
+                request.num_computed_tokens = saved_computed
+                return None
+            # Allocate the cache-MISS suffix as normal new tokens (we fill them
+            # via H2D instead of prefill). num_external_computed_tokens is for a
+            # KV connector that SUPPLIES blocks — without one it allocates none.
+            new_kv = self.kv_cache_manager.allocate_slots(
+                request,
+                num_new_tokens=int(suffix_tokens),
+                num_new_computed_tokens=int(num_cached_tokens),
+                new_computed_blocks=computed,
+            )
+            if new_kv is None:
+                request.num_computed_tokens = saved_computed
+                return None
+            # COMMITTED: allocate_slots set req_to_blocks = cached + new and
+            # claimed the cached. From here NEVER raise/return-None (that would
+            # leak the claim / double-allocate) — a count surprise DEGRADES to
+            # H2D-all (re-attach the full req_to_blocks, re-H2D the cached too:
+            # wasteful but bit-exact), so a surprise can't crash the engine.
+            manager.num_cached_block.pop(request.request_id, None)
+            new_list = new_kv.blocks[idx] if new_kv.blocks else []
+            if len(new_list) == total - n_cached:
+                for blk, ls in zip(new_list, logical_starts[n_cached:]):
+                    blk.logical_start = int(ls)
+                if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
+                    logger.warning(
+                        "[REQUEST-KV-SWAP-CACHE-HIT] req=%s cached_blocks=%d "
+                        "suffix_blocks=%d total=%d",
+                        request.request_id[:8], n_cached, len(new_list), total,
+                    )
+                return (new_list, n_cached)
+            # Degraded: H2D the FULL block set (cached re-H2D'd from archive).
+            full_list = list(manager.req_to_blocks.get(request.request_id, []))
+            for blk, ls in zip(full_list, logical_starts):
+                blk.logical_start = int(ls)
+            logger.warning(
+                "[REQUEST-KV-SWAP-CACHE-HIT-DEGRADED] req=%s new=%d cached=%d "
+                "total=%d full=%d -> H2D-all",
+                request.request_id[:8], len(new_list), n_cached, total,
+                len(full_list),
+            )
+            return (full_list, 0)
+        except Exception as exc:
+            # Pre-allocate_slots failure only → restore + fall back (claim none).
+            request.num_computed_tokens = saved_computed
+            logger.warning(
+                "[REQUEST-KV-SWAP-CACHE-HIT-FALLBACK] req=%s err=%r",
+                request.request_id[:8], exc,
+            )
+            return None
 
     def _start_request_kv_swap_load(
         self,
@@ -6415,6 +8958,22 @@ class Scheduler(SchedulerInterface):
         if len(managers) != len(swap.logical_start_by_group):
             return "request KV swap has incomplete manager metadata"
 
+        # Partial reload (user's loop): restore only sys-prefix + recent window,
+        # park the middle on CPU (recallable). Restores FEWER GPU blocks than the
+        # full rollout, so it succeeds under pressure where the full reload can't.
+        # Single group only; falls through to full reload if nothing to park.
+        if (
+            os.environ.get("KVE_REQUEST_KV_SWAP_PARTIAL_RELOAD") == "1"
+            and len(managers) == 1
+            and not any(swap.kept_blocks_by_group)
+        ):
+            partial = self._start_request_kv_swap_load_partial(
+                request, swap,
+                extra_required_gpu_blocks=extra_required_gpu_blocks,
+            )
+            if partial != "FALLBACK":
+                return partial  # None on success, or an error string
+
         capacity_error = self._request_kv_swap_load_capacity_error(
             swap,
             extra_required_gpu_blocks=extra_required_gpu_blocks,
@@ -6426,20 +8985,43 @@ class Scheduler(SchedulerInterface):
         entries: list[tuple[Any, list[Any]]] = []
         gpu_block_ids: list[int] = []
         cpu_block_ids: list[int] = []
+        # #2 reload prefix-cache-hit (KVE_SWAP_RELOAD_CACHE_HIT, default OFF):
+        # re-attach the still-resident shared prefix via get_computed_blocks +
+        # allocate_slots instead of re-allocating + H2D'ing a private copy, so
+        # the reload only allocates+loads the cache-MISS suffix. Flag-guarded
+        # and falls back to the whole-rollout reload on ANY inconsistency, so
+        # the default path is unchanged. NOT validated bit-exact yet → keep OFF
+        # in production until the low-concurrency temp=0 token-match passes.
+        reload_cache_hit = (
+            os.environ.get("KVE_SWAP_RELOAD_CACHE_HIT") == "1"
+            and len(managers) == 1
+        )
         try:
             for idx, manager in enumerate(managers):
                 logical_starts = swap.logical_start_by_group[idx]
                 cpu_ids = swap.cpu_block_ids_by_group[idx]
                 if len(logical_starts) != len(cpu_ids):
                     return "request KV swap block metadata mismatch"
-                blocks = manager.block_pool.get_new_blocks(len(cpu_ids))
-                for block, logical_start in zip(blocks, logical_starts):
-                    block.logical_start = int(logical_start)
-                manager.req_to_blocks[request_id] = blocks
-                manager.num_cached_block.pop(request_id, None)
-                entries.append((manager, blocks))
-                gpu_block_ids.extend(int(block.block_id) for block in blocks)
-                cpu_block_ids.extend(int(block_id) for block_id in cpu_ids)
+                hit = None
+                if reload_cache_hit:
+                    hit = self._swap_reload_cache_hit_blocks(
+                        request, swap, idx, manager, logical_starts, cpu_ids
+                    )
+                if hit is not None:
+                    new_blocks, n_cached = hit
+                    # req_to_blocks already set by allocate_slots (cached+new).
+                    entries.append((manager, new_blocks))
+                    gpu_block_ids.extend(int(b.block_id) for b in new_blocks)
+                    cpu_block_ids.extend(int(c) for c in cpu_ids[n_cached:])
+                else:
+                    reloaded = manager.block_pool.get_new_blocks(len(cpu_ids))
+                    for block, logical_start in zip(reloaded, logical_starts):
+                        block.logical_start = int(logical_start)
+                    manager.req_to_blocks[request_id] = reloaded
+                    manager.num_cached_block.pop(request_id, None)
+                    entries.append((manager, reloaded))
+                    gpu_block_ids.extend(int(b.block_id) for b in reloaded)
+                    cpu_block_ids.extend(int(c) for c in cpu_ids)
         except ValueError as exc:
             for manager, blocks in entries:
                 manager.req_to_blocks.pop(request_id, None)
@@ -6456,6 +9038,8 @@ class Scheduler(SchedulerInterface):
         )
         self._request_kv_swap_load_event_to_request_id[event_id] = request_id
         swap.status = "load_pending"
+        if not hasattr(swap, "_t_load_start"):
+            swap._t_load_start = time.monotonic()  # SWAP-AGE room2 end (picked)
         swap.entries = entries
         swap.load_event_id = event_id
         self._request_kv_swap_remove_ready(request_id)
@@ -6473,20 +9057,172 @@ class Scheduler(SchedulerInterface):
             )
         return None
 
+    def _start_request_kv_swap_load_partial(
+        self,
+        request: Request,
+        swap: "RequestKVSwap",
+        *,
+        extra_required_gpu_blocks: int = 0,
+    ) -> str | None:
+        """Partial reload: restore sys-prefix + recent window blocks only; park
+        the middle on CPU (recallable / droppable). Returns None on success, an
+        error string on failure, or the sentinel "FALLBACK" when there is no
+        middle to park (caller then does the normal full reload). Single group.
+
+        The post-reload state is made identical to a compaction eviction of the
+        parked middle [evict_start, evict_end): _apply_trim + smart bump are run
+        at load COMPLETION (after _complete resets to the full base state), so we
+        only stash the eviction scalars here.
+        """
+        request_id = request.request_id
+        manager = self.kv_cache_manager.coordinator.single_type_managers[0]
+        block_size = int(self.cache_config.block_size)
+        logical_starts = list(swap.logical_start_by_group[0])
+        cpu_ids = list(swap.cpu_block_ids_by_group[0])
+        total = len(cpu_ids)
+        if total != len(logical_starts):
+            return "request KV swap block metadata mismatch"
+        ppl = max(0, int(self._worker_protected_prefix_len(request)))
+        prefix_n = min(ppl // block_size, total)
+        window_n = max(
+            1,
+            int(os.environ.get(
+                "KVE_REQUEST_KV_SWAP_RELOAD_WINDOW_BLOCKS", "96"
+            ) or "96"),
+        )
+        window_n = min(window_n, total - prefix_n)
+        parked_idx = list(range(prefix_n, total - window_n))
+        if not parked_idx:
+            return "FALLBACK"  # nothing to park -> full reload
+        restore_idx = list(range(0, prefix_n)) + list(range(total - window_n, total))
+
+        # Restore only the prefix+window blocks; check capacity for THAT count.
+        n_restore = len(restore_idx)
+        _total_blocks, free_blocks = self._request_kv_swap_gpu_block_pool_stats()
+        headroom = self._request_kv_swap_gpu_headroom_blocks()
+        if free_blocks - n_restore < headroom + max(0, extra_required_gpu_blocks):
+            return (
+                f"partial reload needs {n_restore} blocks; free {free_blocks} "
+                f"under headroom {headroom}"
+            )
+        restore_cpu = [cpu_ids[i] for i in restore_idx]
+        restore_logical = [logical_starts[i] for i in restore_idx]
+        parked_cpu = [cpu_ids[i] for i in parked_idx]
+        parked_logical = [logical_starts[i] for i in parked_idx]
+        try:
+            reloaded = manager.block_pool.get_new_blocks(n_restore)
+        except ValueError as exc:
+            return f"insufficient GPU blocks for partial reload: {exc}"
+        for block, ls in zip(reloaded, restore_logical):
+            block.logical_start = int(ls)
+        manager.req_to_blocks[request_id] = reloaded
+        manager.num_cached_block.pop(request_id, None)
+
+        # Eviction range (token coords) = the parked middle. Blocks are ordered
+        # by position and contiguous (full-context swap), so block i covers
+        # tokens [i*bs, (i+1)*bs).
+        evict_start = prefix_n * block_size
+        evict_end = (total - window_n) * block_size
+        total_evicted = evict_end - evict_start
+
+        event_id = self._next_managed_context_transfer_event_id()
+        self._managed_context_load_events_to_submit[event_id] = (
+            ManagedContextCopyEvent(
+                event_id=event_id,
+                gpu_block_ids=[int(b.block_id) for b in reloaded],
+                cpu_block_ids=[int(c) for c in restore_cpu],
+            )
+        )
+        self._request_kv_swap_load_event_to_request_id[event_id] = request_id
+        swap.status = "load_pending"
+        if not hasattr(swap, "_t_load_start"):
+            swap._t_load_start = time.monotonic()  # SWAP-AGE room2 end (picked)
+        swap.entries = [(manager, reloaded)]
+        swap.load_event_id = event_id
+        # Completion frees cpu_block_ids_by_group -> set it to the RESTORED part
+        # so the parked middle is NOT freed; stash parked separately.
+        swap.cpu_block_ids_by_group = (restore_cpu,)
+        swap.parked_cpu_block_ids_by_group = (parked_cpu,)
+        swap.parked_logical_start_by_group = (parked_logical,)
+        swap.partial_reload = True
+        swap.partial_evict_start = evict_start
+        swap.partial_evict_end = evict_end
+        swap.partial_total_evicted = total_evicted
+        self._request_kv_swap_remove_ready(request_id)
+        if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
+            logger.warning(
+                "[REQUEST-KV-SWAP-IN-PARTIAL] req=%s event=%d restore=%d "
+                "parked=%d evict=[%d,%d) total_evicted=%d",
+                request_id[:8], event_id, n_restore, len(parked_idx),
+                evict_start, evict_end, total_evicted,
+            )
+        return None
+
     def _complete_request_kv_swap_load(self, request: Request) -> None:
         request_id = request.request_id
         swap = self._request_kv_swaps.pop(request_id, None)
         if swap is None:
             return
+        # SWAP-AGE readout: where did a slow round-trip wait? room1 = store
+        # flight, room2 = on CPU waiting to be PICKED, room3 = load flight +
+        # scheduler admission. Logged only for the tail (>15s total).
+        _now = time.monotonic()
+        _total = _now - swap.created_at
+        if _total > 15.0:
+            _t_sw = getattr(swap, "_t_swapped", swap.created_at)
+            _t_ld = getattr(swap, "_t_load_start", _now)
+            logger.warning(
+                "[SWAP-AGE] req=%s total=%.1fs room1_store=%.1fs "
+                "room2_pick_wait=%.1fs room3_load_admit=%.1fs",
+                request_id[:8],
+                _total,
+                _t_sw - swap.created_at,
+                max(0.0, _t_ld - _t_sw),
+                max(0.0, _now - _t_ld),
+            )
         self._request_kv_swap_finished_load_req_ids.discard(request_id)
         if swap.load_event_id is not None:
             self._request_kv_swap_load_event_to_request_id.pop(
                 swap.load_event_id, None
             )
+        # cpu_block_ids_by_group = the RESTORED part for a partial reload, so
+        # this frees only restored CPU blocks; the parked middle survives.
         self._managed_context_free_cpu_block_ids(swap.cpu_block_ids_by_group)
         request.num_computed_tokens = swap.num_computed_tokens
         request.position_offset = swap.position_offset
         request.num_external_computed_tokens = 0
+        if swap.partial_reload:
+            # We restored only sys-prefix + window; reproduce the compaction
+            # post-eviction state for the parked middle on the now-full base
+            # state (resets above), reusing the proven _apply_trim + smart bump.
+            if any(swap.parked_cpu_block_ids_by_group):
+                self._request_kv_swap_parked[request_id] = (
+                    swap.parked_cpu_block_ids_by_group,
+                    swap.parked_logical_start_by_group,
+                )
+            manager0 = self.kv_cache_manager.coordinator.single_type_managers[0]
+            block_size = int(self.cache_config.block_size)
+            prompt_tokens_evicted, _ = self._apply_trim(
+                request,
+                evict_start=swap.partial_evict_start,
+                evict_end=swap.partial_evict_end,
+                total_evicted=swap.partial_total_evicted,
+                stride_used=swap.partial_stride,
+                num_turns_evicted_after=swap.partial_num_turns_after,
+                trim_prompt_token_ids=False,
+            )
+            self._apply_smart_position_offset_bump(
+                request, manager0, block_size, prompt_tokens_evicted
+            )
+            if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
+                logger.warning(
+                    "[REQUEST-KV-SWAP-IN-PARTIAL-DONE] req=%s evict=[%d,%d) "
+                    "parked_groups=%d num_computed=%d position_offset=%d",
+                    request_id[:8], swap.partial_evict_start,
+                    swap.partial_evict_end,
+                    len(swap.parked_cpu_block_ids_by_group),
+                    request.num_computed_tokens, request.position_offset,
+                )
         request.num_cached_tokens = request.num_computed_tokens
         request.needs_rebuild = True
         if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
@@ -6556,6 +9292,7 @@ class Scheduler(SchedulerInterface):
             self._request_kv_swap_finished_load_req_ids.discard(request_id)
         if release_gpu_entries:
             self._release_request_kv_swap_entries(request_id, swap.entries)
+        self._free_request_kv_swap_kept_blocks(swap)
         self._managed_context_free_cpu_block_ids(swap.cpu_block_ids_by_group)
         if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
             logger.warning(
@@ -6804,10 +9541,13 @@ class Scheduler(SchedulerInterface):
     def _managed_context_cpu_archive_protected_keys(
         self,
         extra: set[tuple[str, str]] | None = None,
+        *,
+        include_restore_reservations: bool = True,
     ) -> set[tuple[str, str]]:
         protected = set(extra or ())
-        for keys in self._managed_context_restore_reservations.values():
-            protected.update(keys)
+        if include_restore_reservations:
+            for keys in self._managed_context_restore_reservations.values():
+                protected.update(keys)
         for key, span in self._managed_context_archive.items():
             if span.pending_load_count > 0:
                 protected.add(key)
@@ -6932,15 +9672,72 @@ class Scheduler(SchedulerInterface):
     def _retry_managed_context_gpu_pinned_offloads(self, reason: str) -> int:
         if not (
             self._managed_context_enabled
-            and self._managed_context_cpu_offload_immediate
+            and self._managed_context_cpu_archive_enabled
         ):
             return 0
+        # Two modes share this gpu_pinned -> CPU offload loop:
+        #  - IMMEDIATE: spans are offloaded at eviction; this is the retry for
+        #    offloads that failed then (e.g. CPU briefly full). Spill ALL
+        #    gpu_pinned spans every step (needed_blocks = None = unlimited).
+        #  - DEFERRED/LAZY: evicted spans stay GPU-resident on purpose; only
+        #    spill the OLDEST to CPU when the GPU is actually under pressure
+        #    (free < swap pressure watermark). This is the deferred-offload
+        #    pressure valve: keep KV on GPU until the GPU needs the blocks,
+        #    then free just enough (oldest-first) to relieve pressure. Without
+        #    it the gpu_pinned archive can never spill and deadlocks the GPU
+        #    (swap-ins find no free blocks). Set KVE_MANAGED_CONTEXT_PRESSURE_SPILL=0
+        #    to disable the deferred spill.
+        needed_blocks: int | None = None
+        # Traces whose archive we keep GPU-resident (their mid-turn recalls stay
+        # free, no H2D). Populated only in deferred mode below; empty otherwise.
+        protect_running: set[str] = set()
+        if not self._managed_context_cpu_offload_immediate:
+            if os.environ.get(
+                "KVE_MANAGED_CONTEXT_PRESSURE_SPILL", "1"
+            ).strip().lower() in ("0", "false", "no", "off"):
+                return 0
+            # NO per-span archive cap (design B). Archive spans stay GPU-resident
+            # WITH their rollout and leave the GPU via WHOLE-ROLLOUT swap (see
+            # _start_request_kv_swap_out, which now offloads the trace's archive
+            # spans when the rollout swaps). The earlier ARCHIVE_GPU_FRACTION cap
+            # streamed ~618 GiB of individual spans to CPU; removed. Here we keep
+            # ONLY a last-resort acute-pressure backstop: if GPU free drops below
+            # the swap pressure watermark, spill the oldest cold spans to avoid a
+            # hard deadlock when whole-rollout swap can't keep up.
+            _total_blocks, free_blocks = (
+                self._request_kv_swap_gpu_block_pool_stats()
+            )
+            pressure = self._request_kv_swap_gpu_pressure_blocks()
+            pressure_deficit = (
+                max(0, pressure - free_blocks) if pressure > 0 else 0
+            )
+            needed_blocks = pressure_deficit
+            if needed_blocks <= 0:
+                # GPU has room -> stay lazy; archive leaves via whole-rollout swap.
+                return 0
+            # Keep RUNNING traces' archives GPU-resident so their mid-turn
+            # recalls stay free (no H2D) -- spill only IDLE traces' archives
+            # (the hoarders: ~50 idle traces squatting on the GPU). Acute swap
+            # pressure (free < watermark) overrides this and may spill anyone,
+            # last-resort, to avoid deadlock.
+            if pressure_deficit <= 0:
+                for r in self.running:
+                    tid = self._managed_context_trace_id(r)
+                    if tid:
+                        protect_running.add(tid)
         started = 0
+        started_blocks = 0
         for key in list(self._managed_context_archive_order):
+            if needed_blocks is not None and started_blocks >= needed_blocks:
+                # Spilled enough to clear pressure; keep the rest GPU-resident.
+                break
             if self._managed_context_cpu_store_transfer_limit_error() is not None:
                 break
             span = self._managed_context_archive.get(key)
             if span is None or span.status != "gpu_pinned":
+                continue
+            if span.trace_id in protect_running:
+                # Running trace -> keep its archive on GPU for free recall.
                 continue
             if (
                 not self._managed_context_cpu_evict_on_capacity
@@ -6951,6 +9748,7 @@ class Scheduler(SchedulerInterface):
             error = self._start_managed_context_cpu_offload(span, reason)
             if error is None:
                 started += 1
+                started_blocks += span.kv_block_count
                 continue
             if "store transfer limit" in error:
                 break
@@ -6961,6 +9759,19 @@ class Scheduler(SchedulerInterface):
                     span.span_id,
                     error,
                 )
+        if (
+            started
+            and needed_blocks is not None
+            and os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1"
+        ):
+            logger.warning(
+                "[MANAGED-CONTEXT-PRESSURE-SPILL] reason=%s spans=%d "
+                "blocks=%d needed=%d",
+                reason,
+                started,
+                started_blocks,
+                needed_blocks,
+            )
         return started
 
     def _promote_managed_context_hot_gpu_span(
@@ -7037,19 +9848,68 @@ class Scheduler(SchedulerInterface):
         ):
             return None
         while len(self._managed_context_cpu_free_block_ids) < num_blocks:
-            if not self._managed_context_archive_order:
+            order = self._managed_context_archive_order
+            if not order:
                 return None
-            key = self._managed_context_archive_order.popleft()
-            if key in protected:
-                self._managed_context_archive_order.append(key)
-                if all(
-                    item in protected
-                    for item in self._managed_context_archive_order
-                ):
-                    return None
-                continue
-            if key in self._managed_context_archive:
-                self._release_managed_context_span(key, "cpu-block-limit")
+            # Only a COLD, fully-offloaded span is safe to drop for capacity.
+            # A cpu_hot span is GPU-resident and may still be attended by a
+            # running request (its recall reservation can already be released);
+            # freeing it corrupts that request's KV -> "internal error during
+            # generation" 500s + EngineCore crash (observed at 50 turns once
+            # eviction is enabled). An offload_pending span has an in-flight
+            # store. Skip both; reclaim only a safe cpu_offloaded span. If none
+            # is safe to drop, fail this allocation (caller retries next step)
+            # rather than evict in-use memory.
+            #
+            # Victim selection. Default = pure LRU (drop the oldest safe cold
+            # span by archive_order). Opt-in recall-frequency-aware selection
+            # (KVE_MANAGED_CONTEXT_EVICT_BY_RECALL=1) drops the LEAST-recalled
+            # safe cold span instead (ties -> LRU).
+            #
+            # REFUTED 2026-06-08: recall-frequency-aware eviction was ~28x WORSE
+            # on dropped-restore misses at 50t/128c/0.20 (1228 misses @ ep25 vs
+            # 44 @ ep21 for pure LRU). Recalls in this workload are RECENCY-
+            # biased (the model retrieves recent spans, e.g. T0014-T0017), not
+            # frequency-biased: protecting old high-count spans and dropping
+            # low-count RECENT spans drops exactly what is about to be recalled.
+            # Pure LRU (oldest-done-first) is the better predictor here. Kept as
+            # an opt-in for the record; default OFF.
+            evict_by_recall = os.environ.get(
+                "KVE_MANAGED_CONTEXT_EVICT_BY_RECALL", "0"
+            ).strip().lower() not in ("0", "false", "no", "off")
+            victim = None
+            if evict_by_recall:
+                best_rank: tuple[int, int] | None = None
+                for pos, k in enumerate(order):
+                    if k in protected:
+                        continue
+                    s = self._managed_context_archive.get(k)
+                    if (
+                        s is not None
+                        and s.status == "cpu_offloaded"
+                        and s.pending_load_count == 0
+                    ):
+                        # (recall_count, position) -> min recall first, then LRU.
+                        rank = (s.recall_count, pos)
+                        if best_rank is None or rank < best_rank:
+                            best_rank = rank
+                            victim = k
+            else:
+                for k in order:
+                    if k in protected:
+                        continue
+                    s = self._managed_context_archive.get(k)
+                    if (
+                        s is not None
+                        and s.status == "cpu_offloaded"
+                        and s.pending_load_count == 0
+                    ):
+                        victim = k
+                        break
+            if victim is None:
+                return None
+            self._managed_context_archive_order.remove(victim)
+            self._release_managed_context_span(victim, "cpu-block-limit")
 
         if len(self._managed_context_cpu_free_block_ids) < num_blocks:
             return None
@@ -7410,7 +10270,7 @@ class Scheduler(SchedulerInterface):
         if current_computed_tokens < ready_tokens:
             return False
 
-        deferred = self._managed_context_deferred_restores.pop(request_id, None)
+        deferred = self._managed_context_deferred_restores.get(request_id)
         if deferred is None:
             spans, error = self._validate_managed_context_restore_request(request)
             if error is not None:
@@ -7433,6 +10293,41 @@ class Scheduler(SchedulerInterface):
                 created_at=time.monotonic(),
             )
 
+        admission_error = self._managed_context_restore_admission_error(
+            request,
+            deferred.spans,
+            restored_entries_by_span=deferred.restored_entries_by_span,
+        )
+        if admission_error is not None:
+            if request_id not in self._managed_context_deferred_restores:
+                self._set_managed_context_deferred_restore(
+                    request,
+                    deferred.spans,
+                    restored_entries_by_span=deferred.restored_entries_by_span,
+                    skip_hot_hit_span_ids=deferred.skip_hot_hit_span_ids,
+                )
+            self._set_managed_context_restore_admission_deferred(
+                request,
+                admission_error,
+            )
+            if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+                logger.warning(
+                    "[MANAGED-CONTEXT-RESTORE-DEFER-ADMISSION-WAIT] "
+                    "req=%s spans=%s computed=%d prompt=%d ready=%d %s",
+                    request_id[:8],
+                    deferred.span_ids,
+                    current_computed_tokens,
+                    request.num_prompt_tokens,
+                    ready_tokens,
+                    admission_error,
+                )
+            return False
+
+        deferred = self._managed_context_deferred_restores.pop(
+            request_id,
+            deferred,
+        )
+        self._set_managed_context_restore_admission_deferred(request, None)
         self._release_managed_context_restore_reservation(request_id, "activate")
         self._activate_managed_context_restore(
             request,
@@ -7561,6 +10456,27 @@ class Scheduler(SchedulerInterface):
         """
         if not spans or not self._managed_context_align_positions:
             return False
+        # FULL-FRAME opt-out (kve_restore_align_positions=False): persistent
+        # upfront recalls present the complete kept stream — the request's
+        # frame is owned by the eviction/inherit bookkeeping, and the restored
+        # spans sit at their own original positions BELOW the window. Mutating
+        # position_offset here (designed for short retrieve-RETRY prompts that
+        # continue after the spans) clobbers the not-yet-seeded frame of a
+        # fresh request -> every block written after carries a shifted
+        # logical_start -> the next call's pin/prefix match dies (measured:
+        # PIN-HIT 60 -> 0, calls doubled). Full-frame callers skip alignment.
+        ea = (
+            request.sampling_params.extra_args
+            if request.sampling_params is not None
+            else None
+        ) or {}
+        raw_align = ea.get("kve_restore_align_positions")
+        if raw_align is not None:
+            if isinstance(raw_align, str):
+                if raw_align.lower() in ("0", "false", "no", "off"):
+                    return False
+            elif not raw_align:
+                return False
 
         max_hidden_logical_end = -1
         for span in spans:
@@ -7672,6 +10588,51 @@ class Scheduler(SchedulerInterface):
         if start_block == end_block:
             return []
 
+        if self._managed_context_replay_only_archive_enabled():
+            next_id = self._managed_context_next_span_by_trace[trace_id] + 1
+            self._managed_context_next_span_by_trace[trace_id] = next_id
+            span_id = f"T{next_id:04d}"
+            key = (trace_id, span_id)
+            if last_turn_evicted >= 0 and stride_used > 0:
+                absolute_turn_start = max(0, last_turn_evicted - stride_used + 1)
+                absolute_turn_end = last_turn_evicted
+            else:
+                absolute_turn_start = -1
+                absolute_turn_end = -1
+            span = ManagedContextSpan(
+                span_id=span_id,
+                trace_id=trace_id,
+                request_id=request.request_id[:8],
+                absolute_turn_start=absolute_turn_start,
+                absolute_turn_end=absolute_turn_end,
+                token_ids=list(request._all_token_ids[evict_start:evict_end]),
+                entries=[],
+                kv_block_count=0,
+                logical_start_by_group=[],
+                position_offset_frame=int(request.position_offset),
+                evict_start=evict_start,
+                evict_end=evict_end,
+                created_at=time.monotonic(),
+                status="replay_only",
+            )
+            self._managed_context_archive[key] = span
+            self._managed_context_archive_order.append(key)
+            self._prune_managed_context_archive()
+            if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+                logger.warning(
+                    "[MANAGED-CONTEXT-REPLAY-ARCHIVE] trace=%s span=%s "
+                    "req=%s evict=[%d,%d) turns=%d..%d tokens=%d",
+                    trace_id,
+                    span_id,
+                    request.request_id[:8],
+                    evict_start,
+                    evict_end,
+                    absolute_turn_start,
+                    absolute_turn_end,
+                    len(span.token_ids),
+                )
+            return [span_id] if key in self._managed_context_archive else []
+
         collected: list[tuple[Any, list[Any], list[int]]] = []
         total_blocks = 0
         for manager in (compaction_mgr,):
@@ -7741,6 +10702,101 @@ class Scheduler(SchedulerInterface):
                     self._kve_managed_context_diag_summary(),
                 )
             return None
+
+        # PER-TURN SPANS (KVE_MANAGED_CONTEXT_PER_TURN_SPANS=1): split the
+        # evicted chunk into one span per exchange instead of one stride-sized
+        # blob. "recall 2" then attaches ~2 turns (~25 blocks) instead of
+        # 2x stride turns (~140 blocks), and the model picks the exact turn it
+        # needs. Turn ends are block-aligned (BLOCK_ALIGNED_FINISH pads each
+        # <|im_end|> to a block boundary), so the split is clean. Falls back to
+        # the single-span path when boundaries are unavailable.
+        if (
+            os.environ.get("KVE_MANAGED_CONTEXT_PER_TURN_SPANS", "0") == "1"
+            and len(collected) == 1
+        ):
+            bs = self.block_size
+            positions = request.turn_end_positions
+            seg_bounds: list[int] = [evict_start]
+            for k in range(1, len(positions) // 2 + 1):
+                if 2 * k >= len(positions):
+                    break
+                aligned = ((positions[2 * k] + bs - 1) // bs) * bs
+                if evict_start < aligned < evict_end:
+                    seg_bounds.append(aligned)
+            seg_bounds.append(evict_end)
+            if len(seg_bounds) > 2:
+                manager = collected[0][0]
+                req_blocks_full = manager.req_to_blocks.get(
+                    request.request_id, []
+                )
+                seg_span_ids: list[str] = []
+                for si in range(len(seg_bounds) - 1):
+                    s, e = seg_bounds[si], seg_bounds[si + 1]
+                    seg_blocks = [
+                        b
+                        for b in req_blocks_full[s // bs : e // bs]
+                        if not b.is_null
+                    ]
+                    if not seg_blocks:
+                        continue
+                    manager.block_pool.touch(seg_blocks)
+                    seg_next = (
+                        self._managed_context_next_span_by_trace[trace_id] + 1
+                    )
+                    self._managed_context_next_span_by_trace[trace_id] = seg_next
+                    seg_sid = f"T{seg_next:04d}"
+                    seg_key = (trace_id, seg_sid)
+                    seg_turn = (
+                        max(0, last_turn_evicted - stride_used + 1) + si
+                        if last_turn_evicted >= 0 and stride_used > 0
+                        else -1
+                    )
+                    seg_span = ManagedContextSpan(
+                        span_id=seg_sid,
+                        trace_id=trace_id,
+                        request_id=request.request_id[:8],
+                        absolute_turn_start=seg_turn,
+                        absolute_turn_end=seg_turn,
+                        token_ids=list(request._all_token_ids[s:e]),
+                        entries=[(manager, seg_blocks)],
+                        kv_block_count=len(seg_blocks),
+                        logical_start_by_group=[
+                            [int(b.logical_start) for b in seg_blocks]
+                        ],
+                        position_offset_frame=int(request.position_offset),
+                        evict_start=s,
+                        evict_end=e,
+                        created_at=time.monotonic(),
+                    )
+                    self._managed_context_archive[seg_key] = seg_span
+                    self._managed_context_archive_order.append(seg_key)
+                    if self._managed_context_cpu_offload_immediate:
+                        seg_err = self._start_managed_context_cpu_offload(
+                            seg_span, "archive-immediate"
+                        )
+                        if seg_err is not None:
+                            logger.warning(
+                                "[MANAGED-CONTEXT-CPU-SKIP] req=%s span=%s %s",
+                                request.request_id[:8], seg_sid, seg_err,
+                            )
+                    seg_span_ids.append(seg_sid)
+                if seg_span_ids:
+                    self._prune_managed_context_archive()
+                    if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+                        logger.warning(
+                            "[MANAGED-CONTEXT-ARCHIVE-SPLIT] trace=%s req=%s "
+                            "evict=[%d,%d) spans=%s",
+                            trace_id,
+                            request.request_id[:8],
+                            evict_start,
+                            evict_end,
+                            seg_span_ids,
+                        )
+                    return [
+                        sid
+                        for sid in seg_span_ids
+                        if (trace_id, sid) in self._managed_context_archive
+                    ]
 
         entries: list[tuple[Any, list[Any]]] = []
         logical_start_by_group: list[list[int]] = []
@@ -7819,7 +10875,10 @@ class Scheduler(SchedulerInterface):
     def _managed_context_restore_needs_cpu_load(
         self, spans: list[ManagedContextSpan]
     ) -> bool:
-        return any(span.status == "cpu_offloaded" for span in spans)
+        return any(
+            span.status in ("cpu_offloaded", "replay_only")
+            for span in spans
+        )
 
     def _start_managed_context_cpu_load(
         self,
@@ -7830,6 +10889,14 @@ class Scheduler(SchedulerInterface):
     ) -> ManagedContextCPULoadStart:
         if not self._managed_context_restore_needs_cpu_load(spans):
             return ManagedContextCPULoadStart()
+        replay_only_span_ids = [
+            span.span_id for span in spans if span.status == "replay_only"
+        ]
+        if replay_only_span_ids:
+            return ManagedContextCPULoadStart(
+                "managed-context replay-only restore requires compact "
+                f"replay prefill: spans={replay_only_span_ids}"
+            )
         if request.request_id in self._managed_context_pending_loads:
             return ManagedContextCPULoadStart()
 
@@ -7946,6 +11013,8 @@ class Scheduler(SchedulerInterface):
         for span in spans:
             if span.span_id in restored_entries_by_span:
                 span.pending_load_count += 1
+                # Record the recall so capacity eviction keeps hot-but-old spans.
+                span.recall_count += 1
         if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
             logger.warning(
                 "[MANAGED-CONTEXT-LOAD-SUBMIT] req=%s spans=%s event=%d "
@@ -8080,6 +11149,30 @@ class Scheduler(SchedulerInterface):
                 num_tokens=num_tokens,
                 created_at=time.monotonic(),
             )
+        )
+        # Movement tag: a span in restored_entries_by_span was H2D-loaded from
+        # CPU (a CPU->GPU MOVE); a span not in it was re-spliced from GPU-resident
+        # KV (NO movement). Tells us how much of recall is real transfer vs free.
+        _n_h2d = sum(1 for s in spans if s.span_id in restored_entries_by_span)
+        _n_resident = len(spans) - _n_h2d
+        if _n_h2d and _n_resident:
+            _kind = "MIXED"
+        elif _n_h2d:
+            _kind = "CPU->GPU(H2D-MOVED)"
+        else:
+            _kind = "GPU-RESIDENT(NO-MOVE)"
+        # Echo the verdict back to the client on the response (pure metadata).
+        request.managed_context_restore_kind = {
+            "kind": _kind,
+            "spans": len(spans),
+            "resident": _n_resident,
+            "h2d": _n_h2d,
+        }
+        logger.warning(
+            "[MANAGED-CONTEXT-RESTORE-KIND] %s req=%s spans=%d "
+            "gpu_resident_NO_MOVE=%d cpu_to_gpu_H2D=%d",
+            _kind,
+            request.request_id[:8], len(spans), _n_resident, _n_h2d,
         )
         if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
             span_block_ids: dict[str, list[list[int]]] = {}
@@ -8218,6 +11311,8 @@ class Scheduler(SchedulerInterface):
         spans: list[ManagedContextSpan] = []
         total_blocks = 0
         total_tokens = 0
+        replay_span_ids: set[str] | None = None
+        replay_snapshot: CompactReplaySnapshot | None = None
         for span_id in span_ids:
             span = self._managed_context_archive.get((trace_id, span_id))
             if span is None or span.status not in (
@@ -8225,8 +11320,28 @@ class Scheduler(SchedulerInterface):
                 "offload_pending",
                 "cpu_offloaded",
                 "cpu_hot",
+                "replay_only",
             ):
                 return [], f"span {span_id!r} is not available for this trace"
+            if span.status == "replay_only":
+                if replay_span_ids is None:
+                    replay_span_ids = self._compact_replay_span_ids_from_xargs(
+                        request
+                    )
+                if str(span_id) not in replay_span_ids:
+                    return [], (
+                        f"span {span_id!r} is replay-only but compact replay "
+                        "metadata is missing"
+                    )
+                if replay_snapshot is None:
+                    replay_snapshot = self._compact_replay_snapshot_from_xargs(
+                        request
+                    )
+                if replay_snapshot is None or replay_snapshot.evictions <= 0:
+                    return [], (
+                        f"span {span_id!r} is replay-only but compact replay "
+                        "snapshot is invalid"
+                    )
             if span.status == "offload_pending" and not span.entries:
                 return [], f"span {span_id!r} is still offloading"
             if span.status == "cpu_offloaded" and not span.cpu_block_ids_by_group:
@@ -8326,7 +11441,20 @@ class Scheduler(SchedulerInterface):
             return None
         if expected <= 0:
             return None
-        return min(expected, request.num_prompt_tokens)
+        expected = min(expected, request.num_prompt_tokens)
+        # The phase4 pin caches whole PagedAttention blocks, so it can only cover a
+        # block-aligned prefix, but the client's expected length is token-exact.
+        # Floor to the block boundary so the block-aligned pin satisfies the
+        # expectation; the sub-block remainder (<block_size tokens) is prefilled
+        # normally (bit-exact). Without this the pin is judged "too short" by 1-15
+        # tokens once the prefix exceeds one block, and the request ABORTS -> 500
+        # (the 50-turn phase4-prefix-abort storm). Default on; env to disable.
+        if os.environ.get(
+            "KVE_PHASE4_EXPECTED_CACHED_BLOCK_FLOOR", "1"
+        ).strip().lower() not in ("0", "false", "no", "off"):
+            block_size = max(1, int(self.cache_config.block_size))
+            expected = (expected // block_size) * block_size
+        return expected
 
     def _apply_trim(
         self,
@@ -8646,6 +11774,7 @@ class Scheduler(SchedulerInterface):
         prompt_lengths: dict[str, int] = {}
         protected_prefix_lens: dict[str, int] = {}
         hidden_kv_num_tokens: dict[str, int] = {}
+        compact_replay_data: dict[str, CompactReplayData] = {}
 
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
@@ -8698,6 +11827,17 @@ class Scheduler(SchedulerInterface):
                 )
                 if hidden_tokens:
                     hidden_kv_num_tokens[req_id] = hidden_tokens
+                replay_snapshot = getattr(
+                    req, "_kve_compact_replay_refill_snapshot", None
+                )
+                if replay_snapshot is not None and getattr(
+                    req, "_kve_compact_replay_refill_active", False
+                ) and not getattr(
+                    req, "_kve_compact_replay_segmented_refill_active", False
+                ):
+                    compact_replay_data[req_id] = CompactReplayData.from_snapshot(
+                        replay_snapshot
+                    )
                 if hidden_block_ids:
                     managers = (
                         self.kv_cache_manager.coordinator.single_type_managers
@@ -8765,6 +11905,7 @@ class Scheduler(SchedulerInterface):
             prompt_lengths=prompt_lengths,
             protected_prefix_lens=protected_prefix_lens,
             hidden_kv_num_tokens=hidden_kv_num_tokens,
+            compact_replay_data=compact_replay_data,
         )
 
     def _try_schedule_encoder_inputs(
@@ -9065,6 +12206,30 @@ class Scheduler(SchedulerInterface):
             kv_transfer_params = None
             status_before_stop = request.status
 
+            if (
+                getattr(request, "_kve_compact_replay_full_refill_active", False)
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                compact_replay_had_sample = bool(new_token_ids)
+                if new_token_ids and os.environ.get(
+                    "KVE_TRACE_COMPACT_REPREFILL"
+                ) == "1":
+                    logger.warning(
+                        "[COMPACT-REPLAY-FULL-APPLY-SAMPLE] req=%s tokens=%s",
+                        request.request_id[:8],
+                        new_token_ids,
+                    )
+                completed = self._complete_compact_replay_full_refill(
+                    request,
+                    reason="update-from-output",
+                )
+                if not completed:
+                    continue
+                if not compact_replay_had_sample:
+                    self._force_compact_replay_decode_if_fully_computed(
+                        request
+                    )
+
             # Check for stop and update request status.
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
@@ -9266,6 +12431,7 @@ class Scheduler(SchedulerInterface):
                         routed_experts=final_routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                         compaction_events=compaction_events,
+                        managed_context_restore_kind=request.managed_context_restore_kind,
                         padding_token_ids=final_padding_token_ids,
                     )
                 )
@@ -9320,7 +12486,15 @@ class Scheduler(SchedulerInterface):
             # never get a plan emitted (e.g. live_turns < max_turns).
             # Call directly so the scan happens regardless of which
             # compaction branch (or neither) fires.
-            if self._compaction_enabled and self._compaction_max_turns > 0:
+            if (
+                self._compaction_enabled
+                and self._compaction_max_turns > 0
+                and not getattr(
+                    request,
+                    "_kve_compact_replay_full_refill_active",
+                    False,
+                )
+            ):
                 self._scan_new_turn_boundaries(request)
 
             # KV cache compaction: admission eviction has already fired
@@ -9351,6 +12525,11 @@ class Scheduler(SchedulerInterface):
                 and self._compaction_enabled
                 and request.num_output_placeholders == 0
                 and request.request_id not in self._pending_admission_compaction_ids
+                and not getattr(
+                    request,
+                    "_kve_compact_replay_full_refill_active",
+                    False,
+                )
             ):
                 while self._should_compact(request):
                     tokens_evicted = self._compact_request(request)
@@ -9403,6 +12582,7 @@ class Scheduler(SchedulerInterface):
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                         compaction_events=compaction_events,
+                        managed_context_restore_kind=request.managed_context_restore_kind,
                         padding_token_ids=padding_token_ids_for_output,
                     )
                 )
@@ -9830,6 +13010,11 @@ class Scheduler(SchedulerInterface):
         self._release_managed_context_deferred_restore(
             request_id, "free-request"
         )
+        # Free partial-reload parked-prefix CPU blocks (the parked middle that
+        # stayed on CPU after a partial swap-in). No leak on finish/abort.
+        parked = self._request_kv_swap_parked.pop(request_id, None)
+        if parked is not None and any(parked[0]):
+            self._managed_context_free_cpu_block_ids(parked[0])
         if request_id in self._managed_context_pending_loads:
             pending_load_released = self._release_managed_context_pending_load(
                 request_id,
@@ -9881,6 +13066,7 @@ class Scheduler(SchedulerInterface):
         # block-aligned writers; block-aligned writers (auto-pad no-op)
         # exposed the bug. Safe: cache_blocks is idempotent when blocks
         # are already cached and only fires when prefix caching is on.
+        phase4_published_trace_id: str | None = None
         if self.cache_config.enable_prefix_caching and request.num_tokens > 0:
             if os.environ.get("KVE_TRACE_CACHE_COMMIT") == "1":
                 logger.warning(
@@ -9897,8 +13083,13 @@ class Scheduler(SchedulerInterface):
             self.kv_cache_manager.cache_blocks(
                 request, request.num_tokens
             )
-            self._pin_phase4_request_blocks(request)
+            phase4_published_trace_id = self._pin_phase4_request_blocks(
+                request
+            )
         self.kv_cache_manager.free(request)
+        self._maybe_cold_release_phase4_published_pin(
+            phase4_published_trace_id
+        )
         del self.requests[request.request_id]
 
     @property

@@ -55,6 +55,43 @@ class StreamingUpdate:
         )
 
 
+@dataclass(frozen=True)
+class CompactReplaySnapshot:
+    """Replay metadata for reconstructing a compacted request.
+
+    token_ids is the full writer timeline. death_indices follows the Flex
+    replay contract: key row k is visible to query q iff
+    k <= q < death_indices[k].
+    """
+
+    token_ids: tuple[int, ...]
+    death_indices: tuple[int, ...]
+    live_writer_indices: tuple[int, ...]
+    evictions: int
+
+    @property
+    def final_writer_len(self) -> int:
+        return len(self.token_ids)
+
+    def is_valid(self) -> bool:
+        if len(self.death_indices) != len(self.token_ids):
+            return False
+        if any(death_idx <= idx for idx, death_idx in enumerate(self.death_indices)):
+            return False
+        live_writer_indices = set(self.live_writer_indices)
+        if len(live_writer_indices) != len(self.live_writer_indices):
+            return False
+        if not all(
+            0 <= writer_idx < len(self.token_ids)
+            for writer_idx in self.live_writer_indices
+        ):
+            return False
+        final_len = len(self.token_ids)
+        if any(self.death_indices[idx] != final_len for idx in live_writer_indices):
+            return False
+        return True
+
+
 class Request:
     def __init__(
         self,
@@ -135,6 +172,11 @@ class Request:
             if self.prompt_token_ids is not None
             else [0] * self.num_prompt_tokens
         )
+        self._kve_compact_replay_token_ids: list[int] | None = None
+        self._kve_compact_replay_death_indices: list[int | None] | None = None
+        self._kve_compact_replay_live_writer_indices: list[int] | None = None
+        self._kve_compact_replay_evictions: int = 0
+        self._kve_compact_replay_last_error: str | None = None
 
         # Used in async scheduling.
         self.num_output_placeholders = 0
@@ -159,6 +201,12 @@ class Request:
         # Managed context: model-selected retries must prefill their visible
         # retry suffix before restored hidden KV is attached for answer decode.
         self.managed_context_defer_restore_until_prefill: bool = False
+        # Managed context: per-request recall movement verdict, set by
+        # _activate_managed_context_restore and echoed back to the client on the
+        # response so the client's [MANAGED-CONTEXT-CLIENT-RESTORE] log can show
+        # whether the recall was a CPU->GPU H2D move or GPU-resident (no move).
+        # Pure metadata: never touches KV/logits/tokens. dict or None.
+        self.managed_context_restore_kind: dict | None = None
 
         # Turn tracking (only populated when compaction_max_turns > 0).
         # Absolute positions (in the CURRENT post-eviction _all_token_ids)
@@ -257,10 +305,12 @@ class Request:
             self._output_token_ids.append(token_ids)
             self._all_token_ids.append(token_ids)
             self.num_total_generated += 1
+            self._append_compact_replay_token_ids([token_ids])
         else:
             self._output_token_ids.extend(token_ids)
             self._all_token_ids.extend(token_ids)
             self.num_total_generated += len(token_ids)
+            self._append_compact_replay_token_ids(token_ids)
 
         self.update_block_hashes()
 
@@ -282,8 +332,108 @@ class Request:
             return
         for _ in range(count):
             self._all_token_ids.append(padding_token_id)
+        self._append_compact_replay_token_ids([padding_token_id] * count)
         self.num_padding_tokens += count
         self.update_block_hashes()
+
+    def _append_compact_replay_token_ids(self, token_ids: list[int]) -> None:
+        replay_token_ids = self._kve_compact_replay_token_ids
+        death_indices = self._kve_compact_replay_death_indices
+        live_writer_indices = self._kve_compact_replay_live_writer_indices
+        if (
+            replay_token_ids is None
+            or death_indices is None
+            or live_writer_indices is None
+            or not token_ids
+        ):
+            return
+        writer_start = len(replay_token_ids)
+        replay_token_ids.extend(token_ids)
+        death_indices.extend([None] * len(token_ids))
+        live_writer_indices.extend(
+            range(writer_start, writer_start + len(token_ids))
+        )
+
+    def _ensure_compact_replay_timeline(self) -> bool:
+        if self._kve_compact_replay_token_ids is not None:
+            return True
+        if self.prompt_token_ids is None:
+            self._kve_compact_replay_last_error = "prompt token ids unavailable"
+            return False
+        self._kve_compact_replay_token_ids = self._all_token_ids.copy()
+        self._kve_compact_replay_death_indices = [None] * len(
+            self._all_token_ids
+        )
+        self._kve_compact_replay_live_writer_indices = list(
+            range(len(self._all_token_ids))
+        )
+        self._kve_compact_replay_last_error = None
+        return True
+
+    def mark_compact_replay_eviction(
+        self,
+        evict_start: int,
+        tokens_evicted: int,
+    ) -> bool:
+        """Record a KV compaction splice in replay coordinates.
+
+        This deliberately does not delete from the replay token timeline.
+        Deleted rows are marked dead at the current writer length and removed
+        from the live mapping so future evictions address the post-compaction
+        cache coordinates.
+        """
+        if tokens_evicted <= 0:
+            return True
+        live_len = (
+            len(self._kve_compact_replay_live_writer_indices)
+            if self._kve_compact_replay_live_writer_indices is not None
+            else len(self._all_token_ids)
+        )
+        evict_end = evict_start + tokens_evicted
+        if evict_start < 0 or evict_end > live_len:
+            self._kve_compact_replay_last_error = (
+                f"evict range [{evict_start}, {evict_end}) outside live "
+                f"writer len {live_len}"
+            )
+            return False
+        if not self._ensure_compact_replay_timeline():
+            return False
+        replay_token_ids = self._kve_compact_replay_token_ids
+        death_indices = self._kve_compact_replay_death_indices
+        live_writer_indices = self._kve_compact_replay_live_writer_indices
+        assert replay_token_ids is not None
+        assert death_indices is not None
+        assert live_writer_indices is not None
+        death_idx = len(replay_token_ids)
+        for writer_idx in live_writer_indices[evict_start:evict_end]:
+            death_indices[writer_idx] = death_idx
+        del live_writer_indices[evict_start:evict_end]
+        self._kve_compact_replay_evictions += 1
+        self._kve_compact_replay_last_error = None
+        return True
+
+    def compact_replay_snapshot(self) -> CompactReplaySnapshot | None:
+        replay_token_ids = self._kve_compact_replay_token_ids
+        death_indices = self._kve_compact_replay_death_indices
+        live_writer_indices = self._kve_compact_replay_live_writer_indices
+        if (
+            replay_token_ids is None
+            or death_indices is None
+            or live_writer_indices is None
+            or len(replay_token_ids) != len(death_indices)
+        ):
+            return None
+        final_len = len(replay_token_ids)
+        snapshot = CompactReplaySnapshot(
+            token_ids=tuple(replay_token_ids),
+            death_indices=tuple(
+                final_len if death_idx is None else int(death_idx)
+                for death_idx in death_indices
+            ),
+            live_writer_indices=tuple(live_writer_indices),
+            evictions=self._kve_compact_replay_evictions,
+        )
+        return snapshot if snapshot.is_valid() else None
 
     def update_block_hashes(self) -> None:
         """Compute block hashes for any new full blocks and append them."""

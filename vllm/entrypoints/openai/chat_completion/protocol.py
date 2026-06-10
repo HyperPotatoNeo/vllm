@@ -125,6 +125,9 @@ class CompactionEventPayload(OpenAIBaseModel):
     # Managed-context extension: scheduler-local IDs for archived KV spans
     # captured during this eviction. Empty unless managed context is enabled.
     archived_span_ids: list[str] = Field(default_factory=list)
+    # Length of the untrimmed writer timeline when this eviction fired.
+    # Used by full replay to reproduce the original compact attention mask.
+    writer_len_at_compaction: int = 0
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -150,6 +153,16 @@ class ChatCompletionResponse(OpenAIBaseModel):
     compaction_events: list[CompactionEventPayload] | None = Field(
         default=None,
         description="KV cache compaction events (vLLM compaction extension).",
+    )
+    # Managed-context recall movement verdict (vLLM extension). Populated only
+    # when this request triggered a managed-context recall. Tells the client
+    # whether the recall pulled KV from CPU (H2D move) or found it GPU-resident.
+    managed_context_restore_kind: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Managed-context recall movement verdict: "
+            "{kind, spans, resident, h2d} (vLLM compaction extension)."
+        ),
     )
     # KV cache compaction auto-pad filler token ids appended by vLLM at
     # finish-time. Empty/None when auto-pad did not fire. Consumed by the

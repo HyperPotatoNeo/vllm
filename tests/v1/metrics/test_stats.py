@@ -126,6 +126,22 @@ def test_prompt_token_stats_all_computed():
     assert stats.total == 1000
 
 
+def test_prompt_token_stats_clamps_negative_cached_tokens():
+    """Negative cached-token snapshots should not underflow counters."""
+    stats = PromptTokenStats()
+
+    stats.update_from_output(
+        num_cached_tokens=-1,
+        num_external_computed_tokens=0,
+        prompt_len=1000,
+    )
+
+    assert stats.computed == 1000
+    assert stats.local_cache_hit == 0
+    assert stats.cached_tokens == 0
+    assert stats.total == 1000
+
+
 def test_prompt_token_stats_partial_local_cache():
     """Test partial local prefix cache hit."""
     stats = PromptTokenStats()
