@@ -10266,11 +10266,14 @@ class Scheduler(SchedulerInterface):
             if blocks:
                 manager.block_pool.free_blocks(blocks)
                 released_blocks += len(blocks)
-        # Record the visibility change for the trainer mirror. If the
-        # request is already gone (finish-time release) there are no
-        # further queries, so the re-death is irrelevant to the mask.
+        # Record the visibility change for the trainer mirror — but only
+        # for a request that will still run queries. Finish-time releases
+        # (the request is still in self.requests during finish_requests)
+        # are redundant: nothing decodes afterwards, the trainer closes
+        # open intervals at call end anyway, and the finish-frame
+        # boundary is polluted by pads/hidden blocks (v2-v4 smoke trail).
         released_request = self.requests.get(request_id)
-        if released_request is not None:
+        if released_request is not None and not released_request.is_finished():
             self._append_managed_context_restore_event(
                 released_request,
                 kind=2,
