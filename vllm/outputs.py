@@ -178,6 +178,12 @@ class RequestOutput:
             self.managed_context_restore_kind = (
                 next_output.managed_context_restore_kind
             )
+        # Same overwrite-on-non-None rule for auto-pad filler: the finalize
+        # output carries it, and losing it in a coalesced merge breaks the
+        # session client's stream-offset math (coalescing only happens under
+        # consumer lag — invisible at low concurrency, routine at 64c).
+        if next_output.padding_token_ids is not None:
+            self.padding_token_ids = next_output.padding_token_ids
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):

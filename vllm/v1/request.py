@@ -194,6 +194,10 @@ class Request:
         # decremented). Used by check_stop for max_tokens because
         # len(_output_token_ids) shrinks after compaction.
         self.num_total_generated: int = 0
+        # Streaming sessions: num_total_generated at the start of the
+        # current segment. check_stop budgets each segment independently
+        # via num_segment_generated; stays 0 for ordinary requests.
+        self.segment_generated_base: int = 0
         # History of compaction events (included in API response metadata).
         self.compaction_events: list = []
         # Flag: request was compacted and needs model runner rebuild.
@@ -455,6 +459,12 @@ class Request:
     @property
     def num_output_tokens(self) -> int:
         return len(self._output_token_ids)
+
+    @property
+    def num_segment_generated(self) -> int:
+        # Tokens generated in the current streaming-session segment.
+        # Equals num_total_generated for ordinary requests (base 0).
+        return self.num_total_generated - self.segment_generated_base
 
     @property
     def num_encoder_inputs(self) -> int:

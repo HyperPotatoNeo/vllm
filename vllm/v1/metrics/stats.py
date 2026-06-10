@@ -280,7 +280,13 @@ class PromptTokenStats:
         # needs at least one input token to run a forward pass.
         recomputed = 1 if (num_cached_tokens + 1 == prompt_len) else 0
 
-        self.computed += prompt_len - num_cached_tokens
+        # Clamp: for streaming sessions resumed from a KV swap the cached
+        # snapshot can exceed the output-processor's prompt_len (which never
+        # gains folded outputs), making this delta negative and crashing the
+        # Prometheus counter ("incremented by non-negative amounts"). Session
+        # prompt metrics are inaccurate either way (re-counted per segment);
+        # they must never kill the output loop.
+        self.computed += max(0, prompt_len - num_cached_tokens)
         self.external_kv_transfer += num_external_computed_tokens
         # FIXME(yifan): local_cache_hit can go negative after preemption.
         # num_cached_tokens is a one-time snapshot from first scheduling and

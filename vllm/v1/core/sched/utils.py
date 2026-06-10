@@ -97,7 +97,7 @@ def check_stop(request: Request, max_model_len: int) -> bool:
     sampling_params = request.sampling_params
     assert sampling_params is not None
 
-    if request.num_total_generated < sampling_params.min_tokens:
+    if request.num_segment_generated < sampling_params.min_tokens:
         return False
 
     last_token_id = request.output_token_ids[-1]
@@ -110,8 +110,11 @@ def check_stop(request: Request, max_model_len: int) -> bool:
         request.stop_reason = last_token_id
         return True
     if (
-        request.num_prompt_tokens + request.num_total_generated >= max_model_len
-        or request.num_total_generated >= request.max_tokens
+        # num_prompt_tokens already includes prior segments' folded outputs
+        # for streaming sessions, so the model-len term must count only the
+        # current segment's generation (base 0 for ordinary requests).
+        request.num_prompt_tokens + request.num_segment_generated >= max_model_len
+        or request.num_segment_generated >= request.max_tokens
     ):
         request.status = RequestStatus.FINISHED_LENGTH_CAPPED
         return True

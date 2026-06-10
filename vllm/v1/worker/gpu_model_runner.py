@@ -1630,40 +1630,9 @@ class GPUModelRunner(
         reqs_to_add: list[CachedRequestState] = []
         deferred_spec_decode_corrections = []
 
-        def splice_hidden_after_protected_prefix(
-            visible_block_ids: tuple[list[int], ...],
-            hidden_block_ids: tuple[list[int], ...],
-            protected_prefix_len: int,
-        ) -> tuple[list[int], ...]:
-            spliced: list[list[int]] = []
-            for group_idx, visible_ids in enumerate(visible_block_ids):
-                block_table = self.input_batch.block_table[group_idx]
-                manager_block_size = (
-                    block_table.block_size * block_table.blocks_per_kv_block
-                )
-                if (
-                    protected_prefix_len % manager_block_size != 0
-                    and os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1"
-                ):
-                    logger.warning(
-                        "[MANAGED-CONTEXT-SPLICE-WARN] req protected prefix "
-                        "is not block aligned: protected_prefix_len=%d "
-                        "block_size=%d group=%d",
-                        protected_prefix_len,
-                        manager_block_size,
-                        group_idx,
-                    )
-                prefix_blocks = min(
-                    len(visible_ids),
-                    (protected_prefix_len + manager_block_size - 1)
-                    // manager_block_size,
-                )
-                spliced.append(
-                    list(visible_ids[:prefix_blocks])
-                    + list(hidden_block_ids[group_idx])
-                    + list(visible_ids[prefix_blocks:])
-                )
-            return tuple(spliced)
+        splice_hidden_after_protected_prefix = (
+            self._splice_hidden_after_protected_prefix
+        )
 
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
@@ -2072,6 +2041,42 @@ class GPUModelRunner(
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
 
+    def _splice_hidden_after_protected_prefix(
+        self,
+        visible_block_ids: tuple[list[int], ...],
+        hidden_block_ids: tuple[list[int], ...],
+        protected_prefix_len: int,
+    ) -> tuple[list[int], ...]:
+        spliced: list[list[int]] = []
+        for group_idx, visible_ids in enumerate(visible_block_ids):
+            block_table = self.input_batch.block_table[group_idx]
+            manager_block_size = (
+                block_table.block_size * block_table.blocks_per_kv_block
+            )
+            if (
+                protected_prefix_len % manager_block_size != 0
+                and os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1"
+            ):
+                logger.warning(
+                    "[MANAGED-CONTEXT-SPLICE-WARN] req protected prefix "
+                    "is not block aligned: protected_prefix_len=%d "
+                    "block_size=%d group=%d",
+                    protected_prefix_len,
+                    manager_block_size,
+                    group_idx,
+                )
+            prefix_blocks = min(
+                len(visible_ids),
+                (protected_prefix_len + manager_block_size - 1)
+                // manager_block_size,
+            )
+            spliced.append(
+                list(visible_ids[:prefix_blocks])
+                + list(hidden_block_ids[group_idx])
+                + list(visible_ids[prefix_blocks:])
+            )
+        return tuple(spliced)
+
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
     ) -> CachedRequestState:
@@ -2092,8 +2097,22 @@ class GPUModelRunner(
         req_state.sampling_params = new_req_data.sampling_params
         req_state.pooling_params = new_req_data.pooling_params
         self.late_interaction_runner.register_request(req_id, req_state.pooling_params)
-        req_state.block_ids = new_req_data.block_ids
+        if new_req_data.hidden_kv_block_ids:
+            req_state.block_ids = self._splice_hidden_after_protected_prefix(
+                new_req_data.block_ids,
+                new_req_data.hidden_kv_block_ids,
+                new_req_data.protected_prefix_len,
+            )
+        else:
+            req_state.block_ids = new_req_data.block_ids
         req_state.num_computed_tokens = new_req_data.num_computed_tokens
+        # Streaming-session resume must adopt the scheduler's current RoPE
+        # frame: UPDATE-time admission eviction may have bumped
+        # position_offset, and the resume-step prefill rows read these from
+        # the cached state (gpu_input_batch), not from NewRequestData.
+        req_state.position_offset = new_req_data.position_offset
+        req_state.protected_prefix_len = new_req_data.protected_prefix_len
+        req_state.hidden_kv_num_tokens = new_req_data.hidden_kv_num_tokens
         req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             req_state.prompt_token_ids, req_state.prompt_embeds
         )

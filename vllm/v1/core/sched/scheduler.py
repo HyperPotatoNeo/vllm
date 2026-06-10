@@ -275,6 +275,12 @@ class RequestKVSwap:
     # those blocks back. Empty = no parked prefix (whole-rollout reload).
     parked_cpu_block_ids_by_group: tuple[list[int], ...] = ()
     parked_logical_start_by_group: tuple[list[int], ...] = ()
+    # Streaming sessions: swap-out of an IDLE parked session
+    # (WAITING_FOR_STREAMING_REQ, no pending update). While True the swap is
+    # excluded from the ready queue / eager fill (nothing to resume — the
+    # session must NOT auto-resume decode); the next turn's UPDATE clears the
+    # flag and routes the session through the normal swapped->load promotion.
+    parked_idle: bool = False
     # Partial-reload eviction scalars (the middle range parked on this reload),
     # applied via _apply_trim + smart bump at load completion to reproduce the
     # compaction post-eviction state. partial_reload gates the whole path.
@@ -2169,7 +2175,10 @@ class Scheduler(SchedulerInterface):
                                             or repeat & (repeat - 1) == 0
                                             or repeat % 1000 == 0
                                         )
-                                    if should_log_pin_hit:
+                                    if should_log_pin_hit and (
+                                        os.environ.get("KVE_QUIET_PHASE4_LOGS")
+                                        != "1"
+                                    ):
                                         logger.warning(
                                             "[PHASE4-PIN-HIT] req=%s trace=%s "
                                             "call=%s cached=%d->%d expected=%d "
@@ -2255,7 +2264,9 @@ class Scheduler(SchedulerInterface):
                                     "KVE_TRACE_PHASE4_PREFIX_HIT", ""
                                 ) == "1"
                                 or delta > 0
-                            ):
+                            ) and os.environ.get(
+                                "KVE_QUIET_PHASE4_LOGS"
+                            ) != "1":
                                 logger.warning(
                                     "[PHASE4-PREFIX] req=%s trace=%s "
                                     "call=%s prompt=%d cached=%d "
@@ -2316,16 +2327,17 @@ class Scheduler(SchedulerInterface):
                                     if self._phase4_pin_recovery_defers(
                                         pin_load_reason
                                     ):
-                                        logger.warning(
-                                            "[PHASE4-PREFIX-DEFER] req=%s "
-                                            "trace=%s call=%s reason=%s "
-                                            "miss=%s",
-                                            request.request_id[:8],
-                                            phase4_trace_id,
-                                            phase4_call_idx,
-                                            pin_load_reason,
-                                            phase4_prefix_miss_msg,
-                                        )
+                                        if os.environ.get("KVE_QUIET_PHASE4_LOGS") != "1":
+                                            logger.warning(
+                                                "[PHASE4-PREFIX-DEFER] req=%s "
+                                                "trace=%s call=%s reason=%s "
+                                                "miss=%s",
+                                                request.request_id[:8],
+                                                phase4_trace_id,
+                                                phase4_call_idx,
+                                                pin_load_reason,
+                                                phase4_prefix_miss_msg,
+                                            )
                                         request_queue.pop_request()
                                         clear_pending_phase4_pin_consumed()
                                         step_skipped_waiting.prepend_request(
@@ -3266,6 +3278,19 @@ class Scheduler(SchedulerInterface):
                     len(req.compaction_events or []),
                     token_ids[:8],
                     token_ids[-8:],
+                )
+
+        # Streaming-session contract accounting: every token forwarded for a
+        # resumable request is counted exactly once here. At park time
+        # [SESSION-PARK] reports the cumulative total — if KV continuity
+        # holds it tracks the stream length; a re-prefill bug shows up as a
+        # multiple of it. Engine truth (the prompt-token Prometheus metrics
+        # over-count sessions: they re-count the full prompt every segment).
+        for _sched_req_id, _sched_n in num_scheduled_tokens.items():
+            _sched_req = self.requests.get(_sched_req_id)
+            if _sched_req is not None and _sched_req.resumable:
+                _sched_req._kve_session_forwarded = (
+                    getattr(_sched_req, "_kve_session_forwarded", 0) + _sched_n
                 )
 
         scheduler_output = SchedulerOutput(
@@ -6607,15 +6632,16 @@ class Scheduler(SchedulerInterface):
             )
         )
         self._phase4_pin_store_event_to_trace_id[event_id] = trace_id
-        logger.warning(
-            "[PHASE4-PIN-OFFLOAD-SUBMIT] trace=%s reason=%s event=%d "
-            "blocks=%d cpu_blocks=%s",
-            trace_id,
-            reason,
-            event_id,
-            total_blocks,
-            cpu_by_group,
-        )
+        if os.environ.get("KVE_QUIET_PHASE4_LOGS") != "1":
+            logger.warning(
+                "[PHASE4-PIN-OFFLOAD-SUBMIT] trace=%s reason=%s event=%d "
+                "blocks=%d cpu_blocks=%s",
+                trace_id,
+                reason,
+                event_id,
+                total_blocks,
+                cpu_by_group,
+            )
         return None
 
     def _complete_phase4_pin_cpu_store(self, event_id: int) -> bool:
@@ -6638,15 +6664,16 @@ class Scheduler(SchedulerInterface):
         else:
             pin.status = "cpu_offloaded"
             status = pin.status
-        logger.warning(
-            "[PHASE4-PIN-STORE-DONE] trace=%s event=%d "
-            "released_gpu_blocks=%d status=%s cpu_blocks=%s",
-            trace_id,
-            event_id,
-            released_blocks,
-            status,
-            pin.cpu_block_ids_by_group,
-        )
+        if os.environ.get("KVE_QUIET_PHASE4_LOGS") != "1":
+            logger.warning(
+                "[PHASE4-PIN-STORE-DONE] trace=%s event=%d "
+                "released_gpu_blocks=%d status=%s cpu_blocks=%s",
+                trace_id,
+                event_id,
+                released_blocks,
+                status,
+                pin.cpu_block_ids_by_group,
+            )
         return True
 
     def _start_phase4_pin_cpu_load(
@@ -6711,16 +6738,17 @@ class Scheduler(SchedulerInterface):
         pin.load_event_id = event_id
         pin.load_requested_by_request_id = request_id
         pin.load_requested_at = time.monotonic()
-        logger.warning(
-            "[PHASE4-PIN-LOAD-SUBMIT] trace=%s reason=%s event=%d "
-            "blocks=%d gpu_blocks=%s cpu_blocks=%s",
-            trace_id,
-            reason,
-            event_id,
-            pin.block_count,
-            gpu_block_ids,
-            cpu_block_ids,
-        )
+        if os.environ.get("KVE_QUIET_PHASE4_LOGS") != "1":
+            logger.warning(
+                "[PHASE4-PIN-LOAD-SUBMIT] trace=%s reason=%s event=%d "
+                "blocks=%d gpu_blocks=%s cpu_blocks=%s",
+                trace_id,
+                reason,
+                event_id,
+                pin.block_count,
+                gpu_block_ids,
+                cpu_block_ids,
+            )
         return None
 
     def _complete_phase4_pin_cpu_load(self, event_id: int) -> bool:
@@ -6739,25 +6767,27 @@ class Scheduler(SchedulerInterface):
             released_blocks = self._release_phase4_pin_gpu_entries(pin)
             self._managed_context_free_cpu_block_ids(pin.cpu_block_ids_by_group)
             self._phase4_pinned_blocks.pop(trace_id, None)
-            logger.warning(
-                "[PHASE4-PIN-LOAD-DONE] trace=%s event=%d "
-                "status=expired released_gpu_blocks=%d",
-                trace_id,
-                event_id,
-                released_blocks,
-            )
+            if os.environ.get("KVE_QUIET_PHASE4_LOGS") != "1":
+                logger.warning(
+                    "[PHASE4-PIN-LOAD-DONE] trace=%s event=%d "
+                    "status=expired released_gpu_blocks=%d",
+                    trace_id,
+                    event_id,
+                    released_blocks,
+                )
             return True
         pin.status = "gpu_pinned"
         self._managed_context_free_cpu_block_ids(pin.cpu_block_ids_by_group)
         pin.cpu_block_ids_by_group = ()
         pin.logical_start_by_group = ()
         pin.last_loaded_at = time.monotonic()
-        logger.warning(
-            "[PHASE4-PIN-LOAD-DONE] trace=%s event=%d blocks=%d",
-            trace_id,
-            event_id,
-            pin.block_count,
-        )
+        if os.environ.get("KVE_QUIET_PHASE4_LOGS") != "1":
+            logger.warning(
+                "[PHASE4-PIN-LOAD-DONE] trace=%s event=%d blocks=%d",
+                trace_id,
+                event_id,
+                pin.block_count,
+            )
         return True
 
     def _phase4_prefix_miss_reprefill_enabled(self) -> bool:
@@ -8424,11 +8454,18 @@ class Scheduler(SchedulerInterface):
         self,
         request: Request,
         protected_request_ids: set[str],
+        *,
+        parked_idle: bool = False,
     ) -> str | None:
         request_id = request.request_id
         if request_id in protected_request_ids:
             return "request is protected in this scheduler step"
-        if request.status != RequestStatus.RUNNING:
+        if parked_idle:
+            if request.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
+                return f"request is not parked: {request.status}"
+            if request.streaming_queue:
+                return "parked session has a pending streaming update"
+        elif request.status != RequestStatus.RUNNING:
             return f"request is not running: {request.status}"
         if request.padding_pending or request.num_output_placeholders:
             return "request has pending padding/output placeholders"
@@ -8449,7 +8486,12 @@ class Scheduler(SchedulerInterface):
         # again until it has computed K tokens since admission. Calls here are
         # ~10 decode tokens, so K~32 effectively means "let resumed calls
         # finish" at bounded cost.
-        min_progress = self._request_kv_swap_min_progress_tokens()
+        # Parked-idle sessions are exempt: min-progress protects RUNNING
+        # decode progress; an idle session has nothing to protect and would
+        # otherwise be immune to parking right after a short turn.
+        min_progress = (
+            0 if parked_idle else self._request_kv_swap_min_progress_tokens()
+        )
         if min_progress > 0:
             admit_computed = getattr(request, "_kve_admit_computed", None)
             if (
@@ -8467,6 +8509,27 @@ class Scheduler(SchedulerInterface):
             return max(0, int(raw))
         except ValueError:
             return 0
+
+    def _parked_session_swap_candidates(
+        self,
+        protected_request_ids: set[str],
+    ) -> list[Request]:
+        """Idle parked sessions (WAITING_FOR_STREAMING_REQ, no pending
+        update) whose KV can be spilled to CPU under pressure. Queue order =
+        oldest parked first. Sessions with active managed-context restores
+        are filtered by the shared candidate-error checks (B.1: measure
+        first; release-at-park is the B.2 follow-up if binding)."""
+        return [
+            request
+            for request in self.skipped_waiting
+            if request.resumable
+            and self._request_kv_swap_pressure_candidate_error(
+                request,
+                protected_request_ids,
+                parked_idle=True,
+            )
+            is None
+        ]
 
     def _request_kv_swap_pressure_candidates(
         self,
@@ -8548,6 +8611,34 @@ class Scheduler(SchedulerInterface):
                 return None
 
         last_error: str | None = None
+        # Streaming sessions: spill IDLE parked sessions before touching the
+        # running set — idle KV is the cheapest relief (no decode to stop,
+        # nothing to auto-resume). The session stays parked
+        # (WAITING_FOR_STREAMING_REQ, in skipped_waiting); only its blocks
+        # move. parked_idle keeps the swap out of ready-queue/eager-fill.
+        for candidate in self._parked_session_swap_candidates(
+            protected_request_ids
+        ):
+            error = self._start_request_kv_swap_out(candidate, reason)
+            if error is None:
+                swap = self._request_kv_swaps[candidate.request_id]
+                swap.parked_idle = True
+                logger.info(
+                    "[SESSION-PARK-SWAP-OUT] req=%s reason=%s blocks=%d "
+                    "free=%d pressure=%d",
+                    candidate.request_id[:16],
+                    reason,
+                    swap.kv_block_count,
+                    free_blocks,
+                    pressure_blocks,
+                )
+                return candidate
+            last_error = error
+            if self._request_kv_swap_pressure_global_error(error):
+                # Store queue / CPU pool exhausted — running candidates
+                # would hit the same wall this step.
+                break
+
         for candidate in self._request_kv_swap_pressure_candidates(
             protected_request_ids
         ):
@@ -8842,7 +8933,12 @@ class Scheduler(SchedulerInterface):
         swap.status = "swapped"
         swap._t_swapped = time.monotonic()  # SWAP-AGE room1 end (store flight)
         self._request_kv_swap_remove_ready(request_id)
-        self._request_kv_swap_ready_queue.append(request_id)
+        if not swap.parked_idle:
+            # Idle parked sessions must not enter the ready queue: the head
+            # slot would block real reloads and eager-fill would auto-resume
+            # a session that has no next turn yet. The UPDATE path enqueues
+            # them when their turn actually arrives.
+            self._request_kv_swap_ready_queue.append(request_id)
         if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
             logger.warning(
                 "[REQUEST-KV-SWAP-STORE-DONE] req=%s event=%d "
@@ -8864,6 +8960,14 @@ class Scheduler(SchedulerInterface):
         trust it and fail LOUD on a count surprise rather than silently leak.
         Constrained to inherited_offset==0 (the always-resident system prompt).
         Gated by KVE_SWAP_RELOAD_CACHE_HIT; NOT bit-exact-validated yet."""
+        if getattr(request, "resumable", False):
+            # Streaming sessions: the re-admit-as-fresh trick below asserted
+            # mid-commit on a session resume (block hashes span folded
+            # outputs + a pending turn extension) and the partial mutation
+            # corrupted the pool free list (ref_cnt!=0 on free) -> engine
+            # death (64c diag 2026-06-10). Whole-rollout reload is correct
+            # and session-safe; skip the fast path entirely.
+            return None
         total = len(cpu_ids)
         saved_computed = request.num_computed_tokens
         try:
@@ -9386,6 +9490,15 @@ class Scheduler(SchedulerInterface):
                 return False
             self._complete_request_kv_swap_load(request)
             request.status = RequestStatus.PREEMPTED
+            # Streaming sessions: the UPDATE that resumed this swapped
+            # session deferred its admission eviction until the blocks were
+            # back on GPU. Run it now, BEFORE the new turn is scheduled for
+            # prefill, so the new content's K is computed under the
+            # post-eviction state (same ordering as the resident path).
+            if getattr(request, "_kve_session_evict_after_load", False):
+                request._kve_session_evict_after_load = False
+                if self._compaction_max_turns > 0:
+                    self._run_admission_eviction_loop(request)
             return True
         if swap.status == "expired":
             return False
@@ -10091,6 +10204,39 @@ class Scheduler(SchedulerInterface):
         for key in list(self._managed_context_archive):
             self._release_managed_context_span(key, reason)
         self._managed_context_archive_order.clear()
+
+    def _release_session_park_restores(self, request: Request) -> None:
+        """Session park: drop the active-restore entry (so the parked
+        session is swappable) and free ONLY restore blocks not owned by the
+        request's own block table. Upfront-mode restores are spliced into
+        the visible stream — req_to_blocks owns those blocks and the normal
+        swap/free machinery handles them; freeing them here double-frees.
+        Archived spans + reservations are untouched (re-attach next turn)."""
+        request_id = request.request_id
+        restore = self._managed_context_active_restores.pop(request_id, None)
+        if restore is None:
+            return
+        owned: set[int] = set()
+        for manager in self.kv_cache_manager.coordinator.single_type_managers:
+            owned.update(
+                id(block)
+                for block in manager.req_to_blocks.get(request_id, [])
+            )
+        freed = kept_visible = 0
+        for manager, blocks in restore.entries:
+            to_free = [b for b in blocks if id(b) not in owned]
+            kept_visible += len(blocks) - len(to_free)
+            if to_free:
+                manager.block_pool.free_blocks(to_free)
+                freed += len(to_free)
+        logger.info(
+            "[SESSION-PARK-RESTORE-RELEASE] req=%s freed_hidden=%d "
+            "kept_visible=%d spans=%s",
+            request_id[:16],
+            freed,
+            kept_visible,
+            restore.span_ids,
+        )
 
     def _release_managed_context_active_restore(
         self, request_id: str, reason: str
@@ -11168,12 +11314,13 @@ class Scheduler(SchedulerInterface):
             "resident": _n_resident,
             "h2d": _n_h2d,
         }
-        logger.warning(
-            "[MANAGED-CONTEXT-RESTORE-KIND] %s req=%s spans=%d "
-            "gpu_resident_NO_MOVE=%d cpu_to_gpu_H2D=%d",
-            _kind,
-            request.request_id[:8], len(spans), _n_resident, _n_h2d,
-        )
+        if os.environ.get("KVE_QUIET_PHASE4_LOGS") != "1":
+            logger.warning(
+                "[MANAGED-CONTEXT-RESTORE-KIND] %s req=%s spans=%d "
+                "gpu_resident_NO_MOVE=%d cpu_to_gpu_H2D=%d",
+                _kind,
+                request.request_id[:8], len(spans), _n_resident, _n_h2d,
+            )
         if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
             span_block_ids: dict[str, list[list[int]]] = {}
             span_logical_starts: dict[str, list[list[int]]] = {}
@@ -11700,12 +11847,21 @@ class Scheduler(SchedulerInterface):
         self.finished_req_ids = set()
 
     def _update_request_as_session(
-        self, session: Request, update: StreamingUpdate
+        self,
+        session: Request,
+        update: StreamingUpdate,
+        *,
+        defer_admission_eviction: bool = False,
     ) -> None:
         """
         Updates the waiting session with the next streaming update.
 
         Discards the last sampled output token from the prior input chunk.
+
+        defer_admission_eviction: the session's KV is swapped out (no GPU
+        blocks) — token/bookkeeping updates apply now, but the admission
+        eviction loop must wait until the swap load restores the blocks
+        (see _try_progress_request_kv_swap).
         """
 
         # Current streaming input behaviour: Keep only computed output tokens
@@ -11735,6 +11891,16 @@ class Scheduler(SchedulerInterface):
         session.num_prompt_tokens = len(session.prompt_token_ids)
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
+        # Per-segment generation budget: apply this turn's max_tokens and
+        # rebase the segment counter, else check_stop keeps comparing the
+        # episode-cumulative count against turn-1's budget and the
+        # max_model_len term double-counts the outputs just folded into
+        # the prompt above.
+        session.max_tokens = update.max_tokens
+        session.segment_generated_base = session.num_total_generated
+        # stop_reason is only overwritten on a stop_token_ids hit; clear it
+        # so an EOS stop this segment doesn't re-emit last segment's reason.
+        session.stop_reason = None
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
         session.status = RequestStatus.WAITING
@@ -11748,7 +11914,14 @@ class Scheduler(SchedulerInterface):
         # content's K vectors are written under the post-eviction state.
         # See plans/connect_admission_events_to_trainer.md "Operative intent".
         session.session_prefill_boundary = session.num_computed_tokens
-        if self._compaction_max_turns > 0:
+        # Per-turn recall directives ride update.sampling_params.extra_args;
+        # reserve their archive spans exactly as the fresh-request path does
+        # (add_request), else a parallel CPU-capacity eviction can drop a
+        # span this turn is about to restore.
+        self._reserve_managed_context_restore_request(session)
+        if defer_admission_eviction:
+            session._kve_session_evict_after_load = True
+        elif self._compaction_max_turns > 0:
             self._run_admission_eviction_loop(session)
 
         if self.log_stats:
@@ -12730,6 +12903,26 @@ class Scheduler(SchedulerInterface):
         else:
             request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
             self.num_waiting_for_streaming_input += 1
+            # Detach recall restores while parked: per-call requests release
+            # them at finish (every turn); a session never finishes, so
+            # without this every post-recall session stays unswappable (the
+            # active-restore guard) — measured 64c deadlock: pool 3345/3345
+            # used, zero relief candidates. CRITICAL ownership rule: in
+            # upfront mode the restore blocks are spliced into the VISIBLE
+            # stream (req_to_blocks owns them) — freeing those here
+            # double-frees and poisons the pool free list (measured: engine
+            # death via ref_cnt!=0 in get_new_blocks). Pop the entry always;
+            # free only blocks the request does not own.
+            self._release_session_park_restores(request)
+            logger.info(
+                "[SESSION-PARK] req=%s forwarded_total=%d num_computed=%d "
+                "num_tokens=%d position_offset=%d",
+                request.request_id[:16],
+                getattr(request, "_kve_session_forwarded", 0),
+                request.num_computed_tokens,
+                request.num_tokens,
+                request.position_offset,
+            )
 
         self._enqueue_waiting_request(request)
         return False
@@ -12870,12 +13063,49 @@ class Scheduler(SchedulerInterface):
         if existing is not None:
             update = StreamingUpdate.from_request(request)
             if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
-                assert existing.streaming_queue is not None, "duplicate request id"
+                if existing.streaming_queue is None:
+                    # Duplicate ADD against a non-resumable request (client
+                    # retry or id collision). An assert here kills the engine
+                    # busy loop; drop the chunk and let the client time out.
+                    logger.error(
+                        "Dropping duplicate ADD for non-streaming request %s "
+                        "(status=%s)",
+                        request.request_id,
+                        existing.status,
+                    )
+                    return
                 # Queue next input chunk (or finished sentinel).
                 existing.streaming_queue.append(update)
             elif update is not None:
-                # Commence next input chunk.
-                self._update_request_as_session(existing, update)
+                swap = self._request_kv_swaps.get(request.request_id)
+                if swap is not None and swap.status in (
+                    "store_pending",
+                    "swapped",
+                ):
+                    # The parked session's KV is on CPU (or in flight there).
+                    # Apply the turn's tokens/params now, but route the
+                    # session through the swapped->load promotion before any
+                    # decode: admission eviction is deferred to load-done.
+                    self._update_request_as_session(
+                        existing, update, defer_admission_eviction=True
+                    )
+                    existing.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    swap.parked_idle = False
+                    if swap.status == "swapped":
+                        self._request_kv_swap_remove_ready(request.request_id)
+                        self._request_kv_swap_ready_queue.append(
+                            request.request_id
+                        )
+                    logger.info(
+                        "[SESSION-RESUME-SWAPPED] req=%s swap_status=%s "
+                        "blocks=%d",
+                        request.request_id[:16],
+                        swap.status,
+                        swap.kv_block_count,
+                    )
+                else:
+                    # Commence next input chunk.
+                    self._update_request_as_session(existing, update)
             else:
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
@@ -12952,16 +13182,27 @@ class Scheduler(SchedulerInterface):
         for request in valid_requests:
             delay_free_blocks = False
             drop_request_after_free = False
-            if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
-                if request.request_id in self._request_kv_swaps:
-                    (
-                        delay_free_blocks,
-                        drop_request_after_free,
-                    ) = self._release_request_kv_swap_for_finish(
-                        request.request_id,
-                        "finish-waiting-request",
-                    )
-                elif request.request_id in self._managed_context_pending_loads:
+            # Swap teardown must run for ANY status: a parked streaming
+            # session (WAITING_FOR_STREAMING_REQ) can have a parked-idle
+            # swap-out store in flight when the client DELETEs it. Gating
+            # this on WAITING_FOR_REMOTE_KVS let _free_request free the
+            # blocks while store-done later freed the SAME objects again —
+            # ref_cnt -1 poisoned the free queue and the next reload's
+            # get_new_blocks asserted (64c session crash, 2026-06-10).
+            # Expiring the swap here routes the second free to the
+            # store-done "expired" branch, which frees exactly once. Also
+            # reclaims the orphaned CPU blocks of deleted already-swapped
+            # sessions (previously leaked).
+            if request.request_id in self._request_kv_swaps:
+                (
+                    delay_free_blocks,
+                    drop_request_after_free,
+                ) = self._release_request_kv_swap_for_finish(
+                    request.request_id,
+                    "finish-waiting-request",
+                )
+            elif request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                if request.request_id in self._managed_context_pending_loads:
                     pending = self._managed_context_pending_loads[
                         request.request_id
                     ]
