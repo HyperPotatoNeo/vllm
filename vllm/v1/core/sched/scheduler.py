@@ -5443,6 +5443,7 @@ class Scheduler(SchedulerInterface):
         last_turn_evicted = -1
         stride_used = 0
         archived_span_ids: list[str] | None = []
+        archived_span_bounds: list[int] = []
         if self._compaction_max_turns > 0:
             plan = self._plan_turn_evict_range(
                 request, block_size,
@@ -5494,6 +5495,21 @@ class Scheduler(SchedulerInterface):
             )
             if archived_span_ids is None:
                 return 0
+            # Per-span [start, end) bounds in the same pre-event frame as
+            # evict_start, read back from the archive registry before any
+            # prune can drop the spans. Restore events reference spans by
+            # id; these bounds are how a consumer maps the id to rows.
+            _bounds_trace_id = self._managed_context_trace_id(request)
+            for _sid in archived_span_ids:
+                _span = self._managed_context_archive.get(
+                    (_bounds_trace_id, _sid)
+                )
+                if _span is None:
+                    archived_span_bounds.extend((-1, -1))
+                else:
+                    archived_span_bounds.extend(
+                        (int(_span.evict_start), int(_span.evict_end))
+                    )
             tokens_evicted = compaction_mgr.compact_request(
                 request.request_id,
                 effective_prompt,
@@ -5695,6 +5711,7 @@ class Scheduler(SchedulerInterface):
             writer_len_at_compaction=writer_len_at_compaction,
             new_user_fragment_len=new_user_fragment_len,
             archived_span_ids=archived_span_ids,
+            archived_span_bounds=archived_span_bounds,
         )
         request.compaction_events.append(event)
         if os.environ.get("KV_EVICTION_BUG_TRACE") == "1":
@@ -10249,6 +10266,14 @@ class Scheduler(SchedulerInterface):
             if blocks:
                 manager.block_pool.free_blocks(blocks)
                 released_blocks += len(blocks)
+        # Record the visibility change for the trainer mirror. If the
+        # request is already gone (finish-time release) there are no
+        # further queries, so the re-death is irrelevant to the mask.
+        released_request = self.requests.get(request_id)
+        if released_request is not None:
+            self._append_managed_context_restore_event(
+                released_request, kind=2, span_ids=list(restore.span_ids)
+            )
         if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
             logger.warning(
                 "[MANAGED-CONTEXT-RESTORE-RELEASE] req=%s reason=%s "
@@ -10258,6 +10283,51 @@ class Scheduler(SchedulerInterface):
                 restore.span_ids,
                 released_blocks,
                 restore.num_tokens,
+            )
+
+    def _append_managed_context_restore_event(
+        self, request: Request, *, kind: int, span_ids: list[str]
+    ) -> None:
+        """Record a hidden-restore visibility change as a CompactionEvent.
+
+        kind 1 = attach (the spans are visible to queries from here on),
+        kind 2 = release (they left visibility). The timing frame mirrors
+        eviction events — current token-list length (replay-mirror length
+        when active) plus cumulative generated count — and
+        visibility_boundary_computed pins the exact query boundary for
+        mid-prefill (deferred) attaches.
+        """
+        if not span_ids:
+            return
+        replay_token_ids = getattr(
+            request, "_kve_compact_replay_token_ids", None
+        )
+        writer_len = (
+            len(replay_token_ids)
+            if replay_token_ids is not None
+            else len(request._all_token_ids)
+        )
+        event = CompactionEvent(
+            num_output_tokens_at_compaction=request.num_total_generated,
+            tokens_evicted=0,
+            position_offset_after=request.position_offset,
+            num_prompt_tokens=request.num_prompt_tokens,
+            writer_len_at_compaction=writer_len,
+            event_kind=kind,
+            restored_span_ids=list(span_ids),
+            visibility_boundary_computed=int(request.num_computed_tokens),
+        )
+        request.compaction_events.append(event)
+        if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+            logger.warning(
+                "[MANAGED-CONTEXT-VISIBILITY-EVENT] req=%s kind=%d spans=%s "
+                "writer_len=%d computed=%d generated=%d",
+                request.request_id[:8],
+                kind,
+                span_ids,
+                writer_len,
+                request.num_computed_tokens,
+                request.num_total_generated,
             )
 
     def _managed_context_defer_restore_until_prefill(
@@ -11314,6 +11384,11 @@ class Scheduler(SchedulerInterface):
             "resident": _n_resident,
             "h2d": _n_h2d,
         }
+        # Record the attach for the trainer mirror: these spans are visible
+        # to every query computed from this point on.
+        self._append_managed_context_restore_event(
+            request, kind=1, span_ids=span_ids
+        )
         if os.environ.get("KVE_QUIET_PHASE4_LOGS") != "1":
             logger.warning(
                 "[MANAGED-CONTEXT-RESTORE-KIND] %s req=%s spans=%d "

@@ -109,3 +109,35 @@ class CompactionEvent(
     # KV rows under the compact replay mask. Appended for array_like wire
     # compatibility with older CompactionEvent readers.
     writer_len_at_compaction: int = 0
+
+    # Managed-context extension: per-span [start, end) bounds for each
+    # entry in archived_span_ids, flattened pairs in the SAME pre-event
+    # coordinate frame as evict_start/kept_indices. Length is always
+    # 2 * len(archived_span_ids). Lets a consumer map every archived span
+    # to the exact rows that died at this event (per-turn span splitting
+    # archives several sub-ranges of [evict_start, evict_end) under one
+    # event), which is what later restore events reference by span_id.
+    archived_span_bounds: list[int] = msgspec.field(default_factory=list)
+
+    # Managed-context restore lifecycle. 0 = eviction (default).
+    # 1 = hidden-restore ATTACH: restored_span_ids became visible to
+    # subsequent queries. 2 = restore RELEASE: they left visibility.
+    # For kind 1/2 events the eviction fields are zeros/defaults;
+    # num_output_tokens_at_compaction, num_prompt_tokens and
+    # writer_len_at_compaction carry the timing frame, and
+    # visibility_boundary_computed pins the exact query boundary.
+    event_kind: int = 0
+
+    # kind 1/2 only: span ids attached/released by this event, in span
+    # order. Resolve each id to its token rows via the archiving eviction
+    # event's archived_span_ids + archived_span_bounds.
+    restored_span_ids: list[str] = msgspec.field(default_factory=list)
+
+    # kind 1/2 only: the request's num_computed_tokens (current-frame) at
+    # the moment of the visibility change. Queries at current positions
+    # >= this value see (kind 1) / no longer see (kind 2) the restored
+    # spans. Distinct from writer_len_at_compaction when the change lands
+    # mid-prefill (deferred restore): prompt tokens past this boundary
+    # attend to the spans even though they were already in the token list
+    # when the restore attached. -1 on eviction events.
+    visibility_boundary_computed: int = -1
