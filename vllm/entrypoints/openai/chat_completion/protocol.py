@@ -128,6 +128,19 @@ class CompactionEventPayload(OpenAIBaseModel):
     # Length of the untrimmed writer timeline when this eviction fired.
     # Used by full replay to reproduce the original compact attention mask.
     writer_len_at_compaction: int = 0
+    # Per-span [start, end) bounds for archived_span_ids, flattened pairs in
+    # the same pre-event frame as evict_start/kept_indices. Length is
+    # 2 * len(archived_span_ids).
+    archived_span_bounds: list[int] = Field(default_factory=list)
+    # Managed-context restore lifecycle: 0 = eviction, 1 = restore attach,
+    # 2 = restore release. Kind 1/2 events carry restored_span_ids and
+    # visibility_boundary_computed; eviction fields are zeros/defaults.
+    event_kind: int = 0
+    restored_span_ids: list[str] = Field(default_factory=list)
+    # num_computed_tokens (current frame) at the visibility change; queries
+    # at positions >= this boundary see / stop seeing the restored spans.
+    # -1 on eviction events.
+    visibility_boundary_computed: int = -1
 
 
 class ChatCompletionResponse(OpenAIBaseModel):

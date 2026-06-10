@@ -75,6 +75,16 @@ def _compaction_event_to_dict(e: Any) -> dict[str, Any]:
         "writer_len_at_compaction": int(
             getattr(e, "writer_len_at_compaction", 0) or 0
         ),
+        "archived_span_bounds": [
+            int(x) for x in getattr(e, "archived_span_bounds", []) or []
+        ],
+        "event_kind": int(getattr(e, "event_kind", 0) or 0),
+        "restored_span_ids": [
+            str(x) for x in getattr(e, "restored_span_ids", []) or []
+        ],
+        "visibility_boundary_computed": int(
+            getattr(e, "visibility_boundary_computed", -1)
+        ),
     }
 
 
