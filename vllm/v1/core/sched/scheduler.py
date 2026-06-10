@@ -10272,7 +10272,10 @@ class Scheduler(SchedulerInterface):
         released_request = self.requests.get(request_id)
         if released_request is not None:
             self._append_managed_context_restore_event(
-                released_request, kind=2, span_ids=list(restore.span_ids)
+                released_request,
+                kind=2,
+                span_ids=list(restore.span_ids),
+                hidden_tokens=int(restore.num_tokens),
             )
         if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
             logger.warning(
@@ -10286,7 +10289,12 @@ class Scheduler(SchedulerInterface):
             )
 
     def _append_managed_context_restore_event(
-        self, request: Request, *, kind: int, span_ids: list[str]
+        self,
+        request: Request,
+        *,
+        kind: int,
+        span_ids: list[str],
+        hidden_tokens: int = 0,
     ) -> None:
         """Record a hidden-restore visibility change as a CompactionEvent.
 
@@ -10315,7 +10323,14 @@ class Scheduler(SchedulerInterface):
             writer_len_at_compaction=writer_len,
             event_kind=kind,
             restored_span_ids=list(span_ids),
-            visibility_boundary_computed=int(request.num_computed_tokens),
+            # num_computed_tokens counts PHYSICAL KV; while a restore is
+            # active the attached hidden blocks are part of it. Subtract
+            # them so the boundary indexes the VISIBLE stream frame the
+            # consumer reconstructs (kind-2 releases fire with the spans
+            # still attached; attaches fire before the blocks count).
+            visibility_boundary_computed=max(
+                0, int(request.num_computed_tokens) - int(hidden_tokens)
+            ),
         )
         request.compaction_events.append(event)
         if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
