@@ -10324,12 +10324,18 @@ class Scheduler(SchedulerInterface):
             event_kind=kind,
             restored_span_ids=list(span_ids),
             # num_computed_tokens counts PHYSICAL KV; while a restore is
-            # active the attached hidden blocks are part of it. Subtract
-            # them so the boundary indexes the VISIBLE stream frame the
-            # consumer reconstructs (kind-2 releases fire with the spans
-            # still attached; attaches fire before the blocks count).
-            visibility_boundary_computed=max(
-                0, int(request.num_computed_tokens) - int(hidden_tokens)
+            # active the attached hidden blocks (block-granular, so larger
+            # than restore.num_tokens) are part of it. Subtract the exact
+            # hidden tokens AND clamp to the visible token list — a
+            # visible-frame boundary can never exceed it, and a release at
+            # the visible end means "the spans were visible through this
+            # whole turn", which is the truthful block-aligned semantics.
+            visibility_boundary_computed=min(
+                max(
+                    0,
+                    int(request.num_computed_tokens) - int(hidden_tokens),
+                ),
+                len(request._all_token_ids),
             ),
         )
         request.compaction_events.append(event)
