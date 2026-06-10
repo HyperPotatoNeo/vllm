@@ -5367,6 +5367,25 @@ class Scheduler(SchedulerInterface):
             required_offset = (
                 max_survivor_logical + 1 - request.num_computed_tokens
             )
+            # Align the bump to the block grid (default on). At admission
+            # eviction num_computed is one short of the boundary (last
+            # prompt token computes with the first decode step), so the
+            # raw requirement comes out off-grid (+1). An off-grid offset
+            # stamps off-grid logical_start on every subsequent block,
+            # which find_longest_cache_hit's inheritance skip-rule
+            # (logical_start != block_idx * block_size) rejects — the next
+            # call cannot inherit the frame, re-derives a different one,
+            # and the SAME K gets served at disagreeing RoPE frames across
+            # calls (M2 recall-arm trainer KL 0.14 vs 0.0009 floor).
+            # Rounding up keeps new writes above all survivors AND keeps
+            # every frame on the block grid.
+            if (
+                required_offset % block_size
+                and os.environ.get("KVE_SMART_BUMP_BLOCK_ALIGN", "1") == "1"
+            ):
+                required_offset += block_size - (
+                    required_offset % block_size
+                )
             if required_offset > request.position_offset:
                 logger.warning(
                     "[COMPACT-SMART] req=%s position_offset %d -> %d "
@@ -6387,6 +6406,25 @@ class Scheduler(SchedulerInterface):
     def _proactively_offload_nonproductive_kv(self, reason: str) -> None:
         cpu_offload_enabled = self._phase4_proactive_cpu_offload_enabled()
         replay_drop_enabled = self._phase4_proactive_replay_drop_enabled()
+        if os.environ.get("KVE_TRACE_PHASE4_PIN") == "1":
+            _usage = self._phase4_gpu_block_usage()
+            _now = time.monotonic()
+            if _now - getattr(self, "_kve_proactive_dbg_t", 0.0) > 5.0:
+                self._kve_proactive_dbg_t = _now
+                logger.warning(
+                    "[PIN-PROACTIVE-DBG] reason=%s cpu_offload=%s replay=%s "
+                    "archive=%s usage=%s start=%.2f pins=%d "
+                    "archdev_env=%r archdev_parsed=%r",
+                    reason,
+                    cpu_offload_enabled,
+                    replay_drop_enabled,
+                    self._managed_context_cpu_archive_enabled,
+                    f"{_usage[2]:.3f}" if _usage else None,
+                    self._phase4_proactive_offload_start_usage(),
+                    len(self._phase4_pinned_blocks),
+                    os.environ.get("KVE_MANAGED_CONTEXT_ARCHIVE_DEVICE"),
+                    getattr(self, "_managed_context_archive_device", None),
+                )
         if not cpu_offload_enabled and not replay_drop_enabled:
             return
         usage = self._phase4_gpu_block_usage()
@@ -7707,13 +7745,59 @@ class Scheduler(SchedulerInterface):
             or self._request_kv_swap_active_trace_target_usage() is not None
         )
 
+    def _kve_auto_trace_budget(self) -> int | None:
+        """AUTO-K admission (KVE_AUTO_TRACE_BUDGET=1): K = target_usage *
+        pool / measured per-trace owned footprint. Owned footprint = mean
+        pinned block_count over traces that have pinned state; it matures
+        after first calls complete and converges within an episode because
+        compaction caps the window. Returns None during warmup — the
+        existing per-candidate usage projection guards that window.
+        Rationale (measured 2026-06-10): when sum(owned) > ~0.9*pool the
+        relief machinery rotates working sets through PCIe and the decode
+        batch collapses (504 tok/s); at capacity-fit K the same workload
+        runs at full per-slot parity with full-context (2,445 tok/s)."""
+        if os.environ.get(
+            "KVE_AUTO_TRACE_BUDGET", "0"
+        ).strip().lower() not in ("1", "true", "yes", "on"):
+            return None
+        target = self._request_kv_swap_usage_watermark(
+            "KVE_AUTO_TRACE_BUDGET_TARGET_USAGE"
+        )
+        if target is None:
+            target = 0.75
+        total_blocks, _free = self._request_kv_swap_gpu_block_pool_stats()
+        if total_blocks <= 0:
+            return None
+        footprints = [
+            max(0, int(pin.block_count))
+            for pin in self._phase4_pinned_blocks.values()
+            if pin.block_count > 0
+        ]
+        if not footprints:
+            return None
+        mean_footprint = sum(footprints) / len(footprints)
+        if mean_footprint <= 0:
+            return None
+        budget = max(1, int(total_blocks * target / mean_footprint))
+        if os.environ.get("KVE_TRACE_AUTO_TRACE_BUDGET") == "1":
+            logger.warning(
+                "[AUTO-TRACE-BUDGET] K=%d (pool=%d target=%.2f "
+                "mean_owned_blocks=%.1f over %d traces)",
+                budget,
+                total_blocks,
+                target,
+                mean_footprint,
+                len(footprints),
+            )
+        return budget
+
     def _request_kv_swap_max_active_traces(self) -> int | None:
         value = self._env_optional_int(
             "KVE_REQUEST_KV_SWAP_MAX_ACTIVE_TRACES"
         )
-        if value is None or value <= 0:
-            return None
-        return value
+        if value is not None and value > 0:
+            return value
+        return self._kve_auto_trace_budget()
 
     def _request_kv_swap_active_trace_target_usage(self) -> float | None:
         return self._request_kv_swap_usage_watermark(
