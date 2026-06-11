@@ -6,7 +6,7 @@ import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -151,6 +151,30 @@ class Phase4Pin:
     load_requested_by_request_id: str | None = None
     load_requested_at: float | None = None
     last_error: str | None = None
+    # SOFT-PIN validation snapshot, captured at publish: per manager,
+    # (manager, blocks, block_hashes_at_publish, logical_starts_at_publish).
+    # After store-done drops the refs, the successor may re-attach these
+    # exact blocks trace-keyed IF each block still carries the recorded
+    # hash + logical_start (reclaim resets both at get_new_blocks). This
+    # serves multi-frame chains (smart-bump seams) that the hash walk's
+    # frame-uniformity rule legitimately truncates, and blocks mid-store.
+    soft_entries: list[tuple[Any, list[Any], list[Any], list[int]]] = field(
+        default_factory=list
+    )
+
+
+@dataclass
+class KVEStreamMirror:
+    """SOFT-PIN streaming mirror for ONE running request: KV of filled
+    visible blocks streams to CPU in the background as decode proceeds.
+    cpu_block_ids[i] mirrors the request's i-th visible block; submitted /
+    confirmed are high-water block counts (store events complete in FIFO
+    order on the transfer stream). At preemption the confirmed prefix is
+    freed INSTANTLY (no store phase) — only the unconfirmed tail ships."""
+
+    cpu_block_ids: list[int] = field(default_factory=list)
+    submitted_blocks: int = 0
+    confirmed_blocks: int = 0
 
 
 @dataclass
@@ -719,6 +743,18 @@ class Scheduler(SchedulerInterface):
             str, ManagedContextPendingLoad
         ] = {}
         self._managed_context_finished_load_req_ids: set[str] = set()
+        # SOFT-PIN revocable restores: span_ids revoked at swap-out, keyed by
+        # request_id; re-attached (and popped) before the swap reload may
+        # complete. Spans stay reservation-protected for the whole gap.
+        self._kve_swap_revoked_restore_span_ids: dict[str, list[str]] = {}
+        # SOFT-PIN streaming mirror: per-running-request background D2H of
+        # filled visible blocks (KVEStreamMirror), event_id -> (request_id,
+        # confirmed_upto, cpu_ids) routing, and orphaned-event CPU ids freed
+        # at completion when the owning record is already gone.
+        self._kve_stream_mirrors: dict[str, KVEStreamMirror] = {}
+        self._kve_stream_mirror_event_meta: dict[
+            int, tuple[str, int, list[int]]
+        ] = {}
         self._request_kv_swaps: dict[str, RequestKVSwap] = {}
         self._request_kv_swap_ready_queue: deque[str] = deque()
         self._request_kv_swap_store_event_to_request_id: dict[int, str] = {}
@@ -1268,6 +1304,8 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self._prune_phase4_pins()
+        self._kve_stream_mirror_tick()
+        self._kve_sched_decision_census()
         self.kv_cache_manager.new_step_starts()
         self._retry_managed_context_gpu_pinned_offloads("schedule-start")
         self._proactively_offload_nonproductive_kv("schedule-start")
@@ -2338,6 +2376,9 @@ class Scheduler(SchedulerInterface):
                                                 pin_load_reason,
                                                 phase4_prefix_miss_msg,
                                             )
+                                        request._kve_last_defer = (
+                                            f"prefix-defer:{pin_load_reason}"
+                                        )[:120]
                                         request_queue.pop_request()
                                         clear_pending_phase4_pin_consumed()
                                         step_skipped_waiting.prepend_request(
@@ -2428,6 +2469,9 @@ class Scheduler(SchedulerInterface):
                                 request.request_id[:8],
                                 restore_replay_prefill_reason,
                             )
+                            request._kve_last_defer = (
+                                f"restore-replay:{restore_replay_prefill_reason}"
+                            )[:120]
                             request_queue.pop_request()
                             clear_pending_phase4_pin_consumed()
                             step_skipped_waiting.prepend_request(request)
@@ -2448,6 +2492,7 @@ class Scheduler(SchedulerInterface):
                             clear_pending_phase4_pin_consumed()
                             if pending_inherit_event is not None:
                                 request.position_offset = 0
+                            request._kve_last_defer = "inherit-event-wait"
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
@@ -5148,10 +5193,22 @@ class Scheduler(SchedulerInterface):
         iterations = 0
         while True:
             self._scan_new_turn_boundaries(request)
-            if (
-                self._num_live_completed_turns(request)
-                < self._effective_compaction_max_turns(request)
-            ):
+            _live = self._num_live_completed_turns(request)
+            _eff = self._effective_compaction_max_turns(request)
+            if os.environ.get("KVE_TRACE_COMPACT_ADMISSION") == "1":
+                logger.warning(
+                    "[ADMIT-EVICT-CHECK] req=%s live=%d eff=%d synth=%d "
+                    "recalled=%d positions=%d prompt=%d iter=%d",
+                    request.request_id[:8],
+                    _live,
+                    _eff,
+                    self._compaction_synthetic_live_turns(request),
+                    self._compaction_recalled_turns(request),
+                    len(request.turn_end_positions),
+                    request.num_prompt_tokens,
+                    iterations,
+                )
+            if _live < _eff:
                 break
             evicted = self._compact_request(
                 request,
@@ -5798,8 +5855,20 @@ class Scheduler(SchedulerInterface):
         protect = self._compaction_protect_oldest_turns()
         if protect > 0:
             protect = min(protect, max(0, live_turns - 1))
+        # KVE_COMPACTION_STRIDE_IGNORE_RECALLED=1: recalled spans count
+        # toward the CEILING (unified budget) but never shrink the evict
+        # stride — eviction always does real work. Without this, recalled
+        # >= stride freezes eviction entirely (measured 2026-06-10: forced
+        # recall-per-call -> stride 0 -> unbounded streams -> pool deadlock
+        # at any concurrency). Default OFF: the textworld 10/7/recall-2
+        # landing arithmetic relies on the shrink.
+        _stride_base = self._compaction_eviction_turn_stride
+        if os.environ.get(
+            "KVE_COMPACTION_STRIDE_IGNORE_RECALLED", "0"
+        ).strip().lower() not in ("1", "true", "yes", "on"):
+            _stride_base = _stride_base - _recalled
         stride = min(
-            max(1, self._compaction_eviction_turn_stride - _recalled),
+            max(1, _stride_base),
             live_turns - protect,
         )
         if stride <= 0:
@@ -6636,7 +6705,12 @@ class Scheduler(SchedulerInterface):
         pin: Phase4Pin,
         *,
         reason: str,
+        stream_mirror_request_id: str | None = None,
+        inherited_cpu_by_block: dict[int, int] | None = None,
     ) -> str | None:
+        # Ownership note: inherited_cpu_by_block ids are owned by the CALLER
+        # until this function returns None (they were already detached from
+        # the previous pin) — on any error return the caller frees them.
         if not self._managed_context_cpu_archive_enabled:
             return "managed-context CPU archive is disabled"
         if pin.status in ("cpu_offloaded", "store_pending", "load_pending"):
@@ -6656,13 +6730,78 @@ class Scheduler(SchedulerInterface):
             logical_starts = [int(block.logical_start) for block in blocks]
             logical_start_by_group.append(logical_starts)
             total_blocks += len(blocks)
-        cpu_block_ids = self._alloc_managed_context_cpu_blocks(total_blocks)
-        if cpu_block_ids is None:
-            return (
-                f"Phase4 pin needs {total_blocks} CPU blocks, "
-                f"available={len(self._managed_context_cpu_free_block_ids)} "
-                f"max={self._managed_context_cpu_max_blocks}"
+
+        # DELTA PUBLISH (streaming mirror): the finishing request already
+        # holds CONFIRMED CPU copies of its visible prefix — adopt those ids
+        # and store only the tail. Collapses the wave-end pin-store burst
+        # (~130 blocks/pin re-stored) to ~the final turn's blocks, so the
+        # pin's GPU refs drop almost immediately (v8 diagnosis: 32
+        # simultaneous full-pin stores held ~4k blocks ref'd for seconds
+        # every turn, starving the next wave's admission).
+        # Per-position CPU coverage for the single-group case:
+        #   1. pin-chain inheritance (block already stored by the old pin),
+        #   2. stream-mirror confirmed prefix (this call's blocks),
+        #   3. fresh ids for the residue — the ONLY part that gets stored.
+        coverage: list[int | None] = [None] * total_blocks
+        single_group = len(pin.entries) == 1
+        group_blocks = pin.entries[0][1] if single_group else []
+        if single_group and inherited_cpu_by_block:
+            for idx, block in enumerate(group_blocks):
+                cpu_id = inherited_cpu_by_block.get(id(block))
+                if cpu_id is not None:
+                    coverage[idx] = cpu_id
+        mirror_adopted: list[int] = []
+        if (
+            stream_mirror_request_id is not None
+            and self._kve_soft_pin_stream_mirror_enabled()
+            and single_group
+        ):
+            stream_mirror = self._kve_stream_mirrors.get(
+                stream_mirror_request_id
             )
+            if stream_mirror is not None and stream_mirror.confirmed_blocks > 0:
+                confirmed = min(stream_mirror.confirmed_blocks, total_blocks)
+                for idx in range(confirmed):
+                    if coverage[idx] is None:
+                        coverage[idx] = int(stream_mirror.cpu_block_ids[idx])
+                        mirror_adopted.append(coverage[idx])
+                # Unadopted mirror ids (covered by inheritance or beyond the
+                # pin) are freed here for confirmed ones; in-flight ids go
+                # through the orphan branch.
+                leftover = [
+                    int(cpu_id)
+                    for idx, cpu_id in enumerate(
+                        stream_mirror.cpu_block_ids[
+                            : stream_mirror.confirmed_blocks
+                        ]
+                    )
+                    if not (idx < total_blocks and coverage[idx] == cpu_id)
+                ]
+                if leftover:
+                    self._managed_context_free_cpu_block_ids((leftover,))
+                self._kve_stream_mirrors.pop(stream_mirror_request_id, None)
+
+        tail_positions = [
+            idx for idx in range(total_blocks) if coverage[idx] is None
+        ]
+        tail_cpu_ids: list[int] = []
+        if tail_positions:
+            tail_cpu_ids = self._alloc_managed_context_cpu_blocks(
+                len(tail_positions)
+            )
+            if tail_cpu_ids is None:
+                if mirror_adopted:
+                    self._managed_context_free_cpu_block_ids(
+                        (mirror_adopted,)
+                    )
+                return (
+                    f"Phase4 pin needs {len(tail_positions)} CPU blocks, "
+                    f"available={len(self._managed_context_cpu_free_block_ids)} "
+                    f"max={self._managed_context_cpu_max_blocks}"
+                )
+            for pos, cpu_id in zip(tail_positions, tail_cpu_ids):
+                coverage[pos] = int(cpu_id)
+        cpu_block_ids = [int(cpu_id) for cpu_id in coverage]
 
         cpu_by_group: list[list[int]] = []
         offset = 0
@@ -6674,28 +6813,60 @@ class Scheduler(SchedulerInterface):
             self._managed_context_free_cpu_block_ids((cpu_block_ids,))
             return "Phase4 pin has inconsistent block metadata"
 
-        event_id = self._next_managed_context_transfer_event_id()
-        pin.status = "store_pending"
         pin.cpu_block_ids_by_group = tuple(cpu_by_group)
         pin.logical_start_by_group = tuple(logical_start_by_group)
+
+        if not tail_positions:
+            # Fully covered (pin-chain + mirror): no store phase. FIFO
+            # transfer ordering makes this safe even when inherited ids'
+            # writes are still in flight — their events precede anything
+            # that could reuse these CPU slots.
+            released_blocks = self._release_phase4_pin_gpu_entries(pin)
+            pin.status = "cpu_offloaded"
+            pin.store_event_id = None
+            if os.environ.get("KVE_QUIET_PHASE4_LOGS") != "1":
+                logger.warning(
+                    "[PHASE4-PIN-OFFLOAD-INSTANT] trace=%s reason=%s "
+                    "blocks=%d released_gpu_blocks=%d (delta: fully covered)",
+                    trace_id,
+                    reason,
+                    total_blocks,
+                    released_blocks,
+                )
+            return None
+
+        tail_gpu_ids: list[int] = []
+        if single_group:
+            tail_gpu_ids = [
+                int(group_blocks[pos].block_id) for pos in tail_positions
+            ]
+        else:
+            for _manager, blocks in pin.entries:
+                tail_gpu_ids.extend(
+                    int(block.block_id) for block in blocks
+                )
+        event_id = self._next_managed_context_transfer_event_id()
+        pin.status = "store_pending"
         pin.store_event_id = event_id
         self._managed_context_store_events_to_submit[event_id] = (
             ManagedContextCopyEvent(
                 event_id=event_id,
-                gpu_block_ids=self._managed_context_gpu_block_ids(pin.entries),
-                cpu_block_ids=cpu_block_ids,
+                gpu_block_ids=tail_gpu_ids,
+                cpu_block_ids=list(tail_cpu_ids),
             )
         )
         self._phase4_pin_store_event_to_trace_id[event_id] = trace_id
         if os.environ.get("KVE_QUIET_PHASE4_LOGS") != "1":
             logger.warning(
                 "[PHASE4-PIN-OFFLOAD-SUBMIT] trace=%s reason=%s event=%d "
-                "blocks=%d cpu_blocks=%s",
+                "blocks=%d inherited=%d mirror=%d store_tail=%d",
                 trace_id,
                 reason,
                 event_id,
                 total_blocks,
-                cpu_by_group,
+                total_blocks - len(tail_positions) - len(mirror_adopted),
+                len(mirror_adopted),
+                len(tail_positions),
             )
         return None
 
@@ -6884,6 +7055,10 @@ class Scheduler(SchedulerInterface):
         self,
         pin: Phase4Pin,
     ) -> str | None:
+        if self._kve_atomic_resume_enabled():
+            # The atomic bundle gate owns capacity; per-stage watermarks
+            # stand down (their staged holds were the v15 deadlock chain).
+            return None
         managers = self.kv_cache_manager.coordinator.single_type_managers
         if not managers:
             return None
@@ -6936,6 +7111,13 @@ class Scheduler(SchedulerInterface):
             )
         if pin.status == "gpu_pinned":
             return "Phase4 pin GPU blocks are unavailable"
+        bundle_error = self._kve_atomic_resume_bundle_error(
+            request, reload_blocks=int(pin.block_count)
+        )
+        if bundle_error is not None:
+            # Contains " is waiting for " -> the recovery ladder DEFERS
+            # (never aborts) and retries; the request holds nothing.
+            return f"Phase4 pin load {bundle_error}"
         error = self._start_phase4_pin_cpu_load(
             trace_id,
             pin,
@@ -7452,6 +7634,274 @@ class Scheduler(SchedulerInterface):
         )
         return True
 
+    def _kve_soft_pin_enabled(self) -> bool:
+        """SOFT-PIN (KVE_SOFT_PIN=1): publish-then-offload retained state.
+
+        Inverts the pin residency policy: instead of holding GPU refs
+        between calls (offloading only under pressure), every pin starts
+        its D2H mirror immediately at publish and its GPU refs drop at
+        store-done. The freed blocks keep their hashes (free_blocks
+        retains hash + logical_start), so the successor re-hits them for
+        free via the prefix walk while they stay resident, the native
+        allocator may reclaim them at will, and a reclaimed prefix
+        reloads from the pin's CPU copy (never recomputed) via
+        _phase4_try_load_pin_for_prefix_miss.
+        """
+        return os.environ.get(
+            "KVE_SOFT_PIN", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
+
+    def _kve_soft_pin_revocable_restores_enabled(self) -> bool:
+        """KVE_SOFT_PIN_REVOCABLE_RESTORES=1: a pressure victim holding an
+        ACTIVE hidden restore becomes swappable. At swap-out the restore is
+        released (its bytes live in the CPU archive; spans get reservation-
+        protected) and the visible KV swaps normally; at swap reload the
+        spans re-attach (resident touch or H2D) BEFORE the request may
+        schedule again. Deletes the no-preemption deadlock leg: over-commit
+        resolves by time-sharing instead of wedging. Zero recompute."""
+        return os.environ.get(
+            "KVE_SOFT_PIN_REVOCABLE_RESTORES", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
+
+    def _kve_soft_pin_stream_mirror_enabled(self) -> bool:
+        """KVE_SOFT_PIN_STREAM_MIRROR=1: stream every filled visible block
+        of running managed requests to CPU in the background. A preemption
+        then frees the confirmed-mirrored prefix INSTANTLY — the swap's
+        store phase shrinks to the unconfirmed tail (usually 1-2 blocks) —
+        making relief cheap enough for native over-commit time-sharing."""
+        return os.environ.get(
+            "KVE_SOFT_PIN_STREAM_MIRROR", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
+
+    def _kve_stream_mirror_tick(self) -> None:
+        """Submit background D2H for newly-filled visible blocks of running
+        per-call managed requests. Runs at schedule() start: num_computed
+        reflects fully-completed forwards, and events submitted this step
+        execute at the next step's preprocess — after the KV writes they
+        read (host-serialized, async_scheduling off)."""
+        if not self._kve_soft_pin_stream_mirror_enabled():
+            return
+        if not self._managed_context_cpu_archive_enabled:
+            return
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        if len(managers) != 1:
+            return
+        manager = managers[0]
+        block_size = manager.block_size
+        budget = 64  # blocks per step; stragglers catch up on later steps
+        for request in self.running:
+            if budget <= 0:
+                break
+            if getattr(request, "resumable", False):
+                continue  # sessions keep their own lifecycle
+            request_id = request.request_id
+            if request_id in self._request_kv_swaps:
+                continue
+            if not self._phase4_trace_id(request):
+                continue
+            req_blocks = manager.req_to_blocks.get(request_id)
+            if not req_blocks:
+                continue
+            hidden_blocks = 0
+            restore = self._managed_context_active_restores.get(request_id)
+            if restore is not None:
+                hidden_blocks = self._kve_blocks_from_entries(restore.entries)
+            visible_computed = max(
+                0, request.num_computed_tokens - hidden_blocks * block_size
+            )
+            full_blocks = min(
+                len(req_blocks),
+                visible_computed // block_size,
+                request.num_tokens // block_size,
+            )
+            mirror = self._kve_stream_mirrors.get(request_id)
+            if mirror is None:
+                mirror = KVEStreamMirror()
+                self._kve_stream_mirrors[request_id] = mirror
+            start = mirror.submitted_blocks
+            if full_blocks <= start:
+                continue
+            count = min(full_blocks - start, budget)
+            blocks = req_blocks[start : start + count]
+            if any(block.is_null for block in blocks):
+                continue
+            if self._managed_context_cpu_store_transfer_limit_error() is not None:
+                break
+            cpu_ids = self._alloc_managed_context_cpu_blocks(count)
+            if cpu_ids is None:
+                break  # CPU pool full; retry on a later step
+            event_id = self._next_managed_context_transfer_event_id()
+            self._managed_context_store_events_to_submit[event_id] = (
+                ManagedContextCopyEvent(
+                    event_id=event_id,
+                    gpu_block_ids=[int(block.block_id) for block in blocks],
+                    cpu_block_ids=list(cpu_ids),
+                )
+            )
+            self._kve_stream_mirror_event_meta[event_id] = (
+                request_id,
+                start + count,
+                list(cpu_ids),
+            )
+            mirror.cpu_block_ids.extend(cpu_ids)
+            mirror.submitted_blocks = start + count
+            budget -= count
+
+    def _kve_sched_decision_census(self) -> None:
+        """KVE_SCHED_DECISION_CENSUS=1: every ~5s, classify WHY each queued
+        request isn't running (pure state probes, no mutation) and show the
+        deepest (highest-SRPT-priority) waiters with queue age. Turns
+        'the scheduler isn't doing what we want' into a named reason."""
+        if os.environ.get("KVE_SCHED_DECISION_CENSUS") != "1":
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_kve_census_last_ts", 0.0) < 5.0:
+            return
+        self._kve_census_last_ts = now
+
+        def classify(req: Request) -> str:
+            rid = req.request_id
+            swap = self._request_kv_swaps.get(rid)
+            if swap is not None:
+                return (
+                    f"swap:{swap.status}:"
+                    f"{(swap.last_error or '-')[:48]}"
+                )
+            if rid in self._managed_context_pending_loads:
+                return "restore-load-in-flight"
+            if getattr(
+                req, "_kve_managed_context_restore_admission_deferred", False
+            ):
+                err = getattr(
+                    req,
+                    "_kve_managed_context_restore_admission_error",
+                    None,
+                )
+                return f"restore-admission:{(err or '-')[:48]}"
+            if getattr(
+                req, "_kve_request_kv_swap_trace_admission_deferred", False
+            ):
+                return "trace-admission-cap"
+            if rid in self._kve_swap_revoked_restore_span_ids:
+                return "revoked-restore-reattach-wait"
+            trace_id = self._phase4_trace_id(req)
+            if trace_id:
+                pin = self._phase4_pinned_blocks.get(trace_id)
+                if pin is not None and pin.status in (
+                    "load_pending",
+                    "store_pending",
+                ):
+                    return f"pin:{pin.status}"
+            last_defer = getattr(req, "_kve_last_defer", None)
+            if last_defer:
+                return f"defer:{last_defer[:64]}"
+            return f"queued:{getattr(req.status, 'name', req.status)}"
+
+        reasons: dict[str, int] = {}
+        rows: list[tuple[int, float, str, str]] = []
+        for queue in (
+            getattr(self, "waiting", None),
+            getattr(self, "skipped_waiting", None),
+        ):
+            if not queue:
+                continue
+            for req in queue:
+                reason = classify(req)
+                reasons[reason] = reasons.get(reason, 0) + 1
+                rows.append(
+                    (
+                        int(getattr(req, "priority", 0) or 0),
+                        now - float(getattr(req, "arrival_time", now) or now),
+                        req.request_id[:8],
+                        reason,
+                    )
+                )
+        rows.sort()
+        logger.warning(
+            "[SCHED-CENSUS] queued=%d reasons=%s deepest=%s",
+            len(rows),
+            sorted(reasons.items(), key=lambda kv: -kv[1])[:6],
+            [
+                (prio, f"{age:.1f}s", rid, reason[:44])
+                for prio, age, rid, reason in rows[:5]
+            ],
+        )
+
+    def _kve_atomic_resume_enabled(self) -> bool:
+        """KVE_SOFT_PIN_ATOMIC_RESUME=1: a returning call's GPU needs are
+        granted as ONE bundle (window reload + recalled spans + decode
+        headroom) or not at all. Replaces the per-stage watermarks whose
+        staged holds formed a hold-and-wait chain (v15 diagnosis: ~9 slots
+        parked inside half-resumed requests, equilibrium running≈5). A
+        denied request holds NOTHING; grants are evaluated in SRPT queue
+        order so leaders fill first."""
+        return os.environ.get(
+            "KVE_SOFT_PIN_ATOMIC_RESUME", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
+
+    def _kve_request_restore_span_blocks(self, request: Request) -> int:
+        """CPU-offloaded blocks the request's recalled spans would need on
+        GPU: the revoked-at-swap list when present, else the request's
+        restore xargs."""
+        trace_id = self._managed_context_trace_id(request)
+        if not trace_id:
+            return 0
+        span_ids = self._kve_swap_revoked_restore_span_ids.get(
+            request.request_id
+        )
+        if span_ids is None:
+            span_ids = self._managed_context_restore_span_ids(request) or []
+        total = 0
+        for span_id in span_ids:
+            span = self._managed_context_archive.get((trace_id, span_id))
+            if span is not None and span.status == "cpu_offloaded":
+                total += max(0, int(span.kv_block_count))
+        return total
+
+    def _kve_atomic_resume_bundle_error(
+        self,
+        request: Request,
+        *,
+        reload_blocks: int,
+    ) -> str | None:
+        """All-or-nothing bundle gate. None = granted (flag set; the
+        per-stage watermarks stand down for this request); a string =
+        keep waiting while holding NOTHING. The flag reserves no blocks —
+        stage starts still require absolute room, so racing grants degrade
+        to short retries, never to held-while-blocked chains."""
+        if not self._kve_atomic_resume_enabled():
+            return None
+        if getattr(request, "_kve_bundle_granted", False):
+            return None
+        # Honest headroom: a counting/textworld fragment is ~12 blocks and
+        # decode adds ~8 within the call; 32 was double the real draw and
+        # each over-asked block delays the grant by ~one finisher.
+        headroom_blocks = 16
+        bundle = (
+            max(0, int(reload_blocks))
+            + self._kve_request_restore_span_blocks(request)
+            + headroom_blocks
+        )
+        free_blocks = self._managed_context_min_free_gpu_blocks()
+        if free_blocks >= bundle:
+            request._kve_bundle_granted = True
+            return None
+        return (
+            "resume is waiting for atomic bundle: "
+            f"need={bundle} free={free_blocks}"
+        )
+
+    def _kve_release_stream_mirror(self, request_id: str) -> None:
+        """Free a record's CONFIRMED mirror CPU ids; ids of still-in-flight
+        events are freed by the completion handler's orphan branch (the
+        record is gone by the time those events land)."""
+        mirror = self._kve_stream_mirrors.pop(request_id, None)
+        if mirror is None:
+            return
+        confirmed_ids = mirror.cpu_block_ids[: mirror.confirmed_blocks]
+        if confirmed_ids:
+            self._managed_context_free_cpu_block_ids((confirmed_ids,))
+
     def _pin_phase4_request_blocks(self, request: Request) -> str | None:
         trace_id = self._phase4_trace_id(request)
         if not trace_id or request.status in (
@@ -7485,10 +7935,60 @@ class Scheduler(SchedulerInterface):
         if not entries:
             return None
 
-        # The successor has finished successfully; replace the previous
-        # retained-state pin only now. This keeps call N's pin available for
-        # call N+1 preemption/retry until call N+1 can publish its own state.
+        # PIN-CHAIN DELTA (soft-pin): before replacing the previous pin,
+        # harvest its CPU copies. Both pins reference the SAME physical
+        # blocks for the shared window (soft attach), so any block the old
+        # pin already stored needs no new copy — its CPU id transfers to
+        # the new pin and the replace-release is told not to free it.
+        # Matching is per-block (id()), so eviction splices inherit the
+        # survivors too, not just a clean prefix. FIFO transfer-stream
+        # ordering makes store_pending inheritance safe: the old pin's
+        # store event precedes any new tail event, so by the time the new
+        # pin's store-done drops GPU refs, the inherited bytes are on CPU.
+        inherited_cpu_by_block: dict[int, int] = {}
+        if self._kve_soft_pin_enabled():
+            old_pin = self._phase4_pinned_blocks.get(trace_id)
+            if (
+                old_pin is not None
+                and old_pin.status in ("cpu_offloaded", "store_pending")
+                and len(old_pin.soft_entries) == 1
+                and len(old_pin.cpu_block_ids_by_group) == 1
+            ):
+                old_blocks = old_pin.soft_entries[0][1]
+                old_ids = old_pin.cpu_block_ids_by_group[0]
+                if len(old_blocks) == len(old_ids):
+                    old_map = {
+                        id(block): int(cpu_id)
+                        for block, cpu_id in zip(old_blocks, old_ids)
+                    }
+                    transferred: set[int] = set()
+                    for _manager, new_blocks in entries:
+                        for block in new_blocks:
+                            cpu_id = old_map.get(id(block))
+                            if cpu_id is not None:
+                                inherited_cpu_by_block[id(block)] = cpu_id
+                                transferred.add(cpu_id)
+                    if transferred:
+                        old_pin.cpu_block_ids_by_group = tuple(
+                            [
+                                cpu_id
+                                for cpu_id in group
+                                if cpu_id not in transferred
+                            ]
+                            for group in old_pin.cpu_block_ids_by_group
+                        )
         self._release_phase4_pins(trace_id, "replace")
+        soft_entries: list[tuple[Any, list[Any], list[Any], list[int]]] = []
+        if self._kve_soft_pin_enabled():
+            soft_entries = [
+                (
+                    manager,
+                    list(blocks),
+                    [block.block_hash for block in blocks],
+                    [int(block.logical_start) for block in blocks],
+                )
+                for manager, blocks in entries
+            ]
         self._phase4_pinned_blocks[trace_id] = Phase4Pin(
             entries=entries,
             token_count=request.num_tokens,
@@ -7496,6 +7996,7 @@ class Scheduler(SchedulerInterface):
             request_id=request.request_id[:8],
             call_idx=self._phase4_call_idx(request),
             created_at=time.monotonic(),
+            soft_entries=soft_entries,
         )
         self._phase4_pin_order.append(trace_id)
         self._prune_phase4_pins()
@@ -7507,6 +8008,38 @@ class Scheduler(SchedulerInterface):
                 request.num_tokens,
                 total_blocks,
             )
+        if self._kve_soft_pin_enabled():
+            # SOFT-PIN: start the CPU mirror now instead of waiting for
+            # pressure. GPU refs stay held until store-done confirms the
+            # copy (the existing _complete_phase4_pin_cpu_store path),
+            # then drop with hashes retained. On any decline (CPU pool
+            # full, transfer limit, archive disabled) the pin simply
+            # stays gpu_pinned — today's behavior.
+            pin = self._phase4_pinned_blocks.get(trace_id)
+            if pin is not None:
+                soft_err = self._start_phase4_pin_cpu_offload(
+                    trace_id,
+                    pin,
+                    reason="soft-pin-publish",
+                    stream_mirror_request_id=request.request_id,
+                    inherited_cpu_by_block=inherited_cpu_by_block,
+                )
+                if soft_err is not None and inherited_cpu_by_block:
+                    # The inherited ids were detached from the old pin and
+                    # the offload declined ownership — free exactly once.
+                    self._managed_context_free_cpu_block_ids(
+                        (sorted(set(inherited_cpu_by_block.values())),)
+                    )
+                if (
+                    soft_err is not None
+                    and os.environ.get("KVE_QUIET_PHASE4_LOGS") != "1"
+                ):
+                    logger.warning(
+                        "[SOFT-PIN] offload declined trace=%s: %s "
+                        "(pin stays gpu_pinned)",
+                        trace_id,
+                        soft_err,
+                    )
         return trace_id
 
     def _maybe_cold_release_phase4_published_pin(
@@ -8046,6 +8579,16 @@ class Scheduler(SchedulerInterface):
 
     def _request_kv_swap_protected_managed_trace_ids(self) -> set[str]:
         trace_ids = self._request_kv_swap_live_managed_trace_ids()
+        if self._kve_soft_pin_enabled():
+            # SOFT-PIN: pins are CPU-mirrored (GPU refs drop at store-done)
+            # and archive spans live on CPU — neither holds GPU residency
+            # that admission must respect between calls. Auto-protecting
+            # them made EVERY trace protected after its first compaction
+            # (all traces have spans by turn 7), which silently disabled
+            # the active-trace cap at exactly the over-commit scale it
+            # exists for (32/32 wedge #2, 2026-06-11). Live = currently
+            # materialized (running / mid-swap / holding restores) only.
+            return trace_ids
         for trace_id, pin in getattr(
             self, "_phase4_pinned_blocks", {}
         ).items():
@@ -8396,6 +8939,10 @@ class Scheduler(SchedulerInterface):
         target_usage = self._request_kv_swap_reload_target_usage()
         if target_usage is None or total_blocks <= 0:
             return None
+        if self._kve_atomic_resume_enabled():
+            # Atomic bundle gate owns capacity; skip the watermark clause
+            # (the absolute free-blocks check above still applies).
+            return None
 
         reload_blocks = int(getattr(swap, "kv_block_count", 0) or 0)
         extra_blocks = max(0, extra_required_gpu_blocks)
@@ -8572,7 +9119,10 @@ class Scheduler(SchedulerInterface):
             return "request has pending padding/output placeholders"
         if request_id in self._request_kv_swaps:
             return "request KV swap is already active"
-        if request_id in self._managed_context_active_restores:
+        if (
+            request_id in self._managed_context_active_restores
+            and not self._kve_soft_pin_revocable_restores_enabled()
+        ):
             return "request has active managed-context hidden KV"
         if request_id in self._managed_context_deferred_restores:
             return "request has deferred managed-context hidden KV"
@@ -8882,7 +9432,10 @@ class Scheduler(SchedulerInterface):
             return "request KV swap is already active"
         if request.padding_pending or request.num_output_placeholders:
             return "request has pending padding/output placeholders"
-        if request_id in self._managed_context_active_restores:
+        if (
+            request_id in self._managed_context_active_restores
+            and not self._kve_soft_pin_revocable_restores_enabled()
+        ):
             return "request has active managed-context hidden KV"
         if request_id in self._managed_context_deferred_restores:
             return "request has deferred managed-context hidden KV"
@@ -8923,22 +9476,44 @@ class Scheduler(SchedulerInterface):
             # version would keep resident ONLY blocks guaranteed resident
             # regardless (prefix held by the running set) — deferred.
             kept: list[tuple[int, Any]] = []
-            spilled: list[Any] = list(blocks)
+            # SOFT-PIN streaming mirror fast-path: blocks whose CPU copy is
+            # already CONFIRMED need no store — they free INSTANTLY (below,
+            # after the last refusal check) and the swap reuses their mirror
+            # CPU ids. Only the unconfirmed tail (typically the partial
+            # block + 1-2 freshly-filled ones) ships through a store event.
+            _sm_confirmed = 0
+            _sm_cpu_ids: list[int] = []
+            _sm_mirror = (
+                self._kve_stream_mirrors.get(request_id)
+                if self._kve_soft_pin_stream_mirror_enabled()
+                else None
+            )
+            if _sm_mirror is not None:
+                _sm_confirmed = min(_sm_mirror.confirmed_blocks, len(blocks))
+                _sm_cpu_ids = list(_sm_mirror.cpu_block_ids[:_sm_confirmed])
+            _sm_prefix_blocks = blocks[:_sm_confirmed]
+            spilled: list[Any] = list(blocks[_sm_confirmed:])
             entries.append((manager, spilled))
             logical_start_by_group.append(
-                [int(block.logical_start) for block in spilled]
+                [int(block.logical_start) for block in blocks]
             )
             kept_by_group.append(kept)
             total_by_group.append(len(blocks))
-            total_blocks += len(spilled)
+            total_blocks += len(blocks)
 
-        cpu_block_ids = self._alloc_managed_context_cpu_blocks(total_blocks)
-        if cpu_block_ids is None:
-            return (
-                f"request KV swap needs {total_blocks} CPU blocks, "
-                f"available={len(self._managed_context_cpu_free_block_ids)} "
-                f"max={self._managed_context_cpu_max_blocks}"
+        _sm_tail_count = total_blocks - len(_sm_cpu_ids)
+        tail_cpu_block_ids: list[int] = []
+        if _sm_tail_count > 0:
+            tail_cpu_block_ids = self._alloc_managed_context_cpu_blocks(
+                _sm_tail_count
             )
+            if tail_cpu_block_ids is None:
+                return (
+                    f"request KV swap needs {_sm_tail_count} CPU blocks, "
+                    f"available={len(self._managed_context_cpu_free_block_ids)} "
+                    f"max={self._managed_context_cpu_max_blocks}"
+                )
+        cpu_block_ids = _sm_cpu_ids + list(tail_cpu_block_ids)
 
         cpu_by_group: list[list[int]] = []
         offset = 0
@@ -8950,42 +9525,133 @@ class Scheduler(SchedulerInterface):
             self._managed_context_free_cpu_block_ids((cpu_block_ids,))
             return "request KV swap has inconsistent block metadata"
 
-        event_id = self._next_managed_context_transfer_event_id()
-        swap = RequestKVSwap(
-            request_id=request_id,
-            cpu_block_ids_by_group=tuple(cpu_by_group),
-            logical_start_by_group=tuple(logical_start_by_group),
-            kv_block_count=total_blocks,
-            num_computed_tokens=request.num_computed_tokens,
-            position_offset=request.position_offset,
-            status="store_pending",
-            created_at=time.monotonic(),
-            entries=entries,
-            store_event_id=event_id,
-            kept_blocks_by_group=tuple(kept_by_group),
-            total_blocks_by_group=tuple(total_by_group),
-        )
-        self._request_kv_swaps[request_id] = swap
-        self._request_kv_swap_store_event_to_request_id[event_id] = request_id
-        self._managed_context_store_events_to_submit[event_id] = (
-            ManagedContextCopyEvent(
-                event_id=event_id,
-                gpu_block_ids=self._managed_context_gpu_block_ids(entries),
-                cpu_block_ids=cpu_block_ids,
+        # SOFT-PIN revocable restores: ALL refusal checks have passed — the
+        # swap is now committed, so revoking here can never strand a running
+        # request without its recalled KV. Release the hidden restore (its
+        # bytes live in the CPU archive), reserve the spans against capacity
+        # eviction for the whole swap gap, and record the span ids for the
+        # mandatory re-attach gate at swap reload. The restore blocks are
+        # NOT in req_to_blocks, so the spilled-list snapshot above is
+        # unaffected. Emits the kind-2 visibility event (truthful: the spans
+        # leave visibility while the request is swapped out).
+        revoked_restore = self._managed_context_active_restores.get(request_id)
+        if revoked_restore is not None:
+            revoke_trace_id = self._managed_context_trace_id(request)
+            revoked_span_ids = list(revoked_restore.span_ids)
+            if revoke_trace_id and revoked_span_ids:
+                self._reserve_managed_context_restore_span_keys(
+                    request_id,
+                    {
+                        (revoke_trace_id, span_id)
+                        for span_id in revoked_span_ids
+                    },
+                )
+                self._kve_swap_revoked_restore_span_ids[request_id] = (
+                    revoked_span_ids
+                )
+            self._release_managed_context_active_restore(
+                request_id, "soft-pin-swap-revoke"
             )
-        )
-        if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
-            logger.warning(
-                "[REQUEST-KV-SWAP-OUT-SUBMIT] req=%s event=%d reason=%s "
-                "blocks=%d computed=%d position_offset=%d cpu_blocks=%s",
-                request_id[:8],
-                event_id,
-                reason,
-                total_blocks,
-                request.num_computed_tokens,
-                request.position_offset,
-                cpu_by_group,
+            if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
+                logger.warning(
+                    "[SOFT-PIN-RESTORE-REVOKE] req=%s spans=%s reason=%s",
+                    request_id[:8],
+                    revoked_span_ids,
+                    reason,
+                )
+
+        # SOFT-PIN streaming mirror: all refusal checks have passed — free
+        # the confirmed-mirrored prefix INSTANTLY (its CPU copy is already
+        # written; in-flight stream events for the unconfirmed range read
+        # tail blocks, which stay alive in `entries` until store-done).
+        # Ownership of the confirmed mirror CPU ids moves to the swap; ids
+        # of still-in-flight stream events are reclaimed by the completion
+        # handler's orphan branch.
+        if _sm_prefix_blocks:
+            managers[0].block_pool.free_blocks(_sm_prefix_blocks)
+            _sm_remaining = list(
+                managers[0].req_to_blocks.get(request_id, [])
             )
+            managers[0].req_to_blocks[request_id] = _sm_remaining[
+                _sm_confirmed:
+            ]
+        if _sm_mirror is not None:
+            self._kve_stream_mirrors.pop(request_id, None)
+
+        store_tail_blocks = sum(len(blocks) for _m, blocks in entries)
+        if store_tail_blocks > 0:
+            event_id = self._next_managed_context_transfer_event_id()
+            swap = RequestKVSwap(
+                request_id=request_id,
+                cpu_block_ids_by_group=tuple(cpu_by_group),
+                logical_start_by_group=tuple(logical_start_by_group),
+                kv_block_count=total_blocks,
+                num_computed_tokens=request.num_computed_tokens,
+                position_offset=request.position_offset,
+                status="store_pending",
+                created_at=time.monotonic(),
+                entries=entries,
+                store_event_id=event_id,
+                kept_blocks_by_group=tuple(kept_by_group),
+                total_blocks_by_group=tuple(total_by_group),
+            )
+            self._request_kv_swaps[request_id] = swap
+            self._request_kv_swap_store_event_to_request_id[event_id] = (
+                request_id
+            )
+            self._managed_context_store_events_to_submit[event_id] = (
+                ManagedContextCopyEvent(
+                    event_id=event_id,
+                    gpu_block_ids=self._managed_context_gpu_block_ids(entries),
+                    cpu_block_ids=cpu_block_ids[len(_sm_cpu_ids) :],
+                )
+            )
+            if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
+                logger.warning(
+                    "[REQUEST-KV-SWAP-OUT-SUBMIT] req=%s event=%d reason=%s "
+                    "blocks=%d instant_freed=%d store_tail=%d computed=%d "
+                    "position_offset=%d",
+                    request_id[:8],
+                    event_id,
+                    reason,
+                    total_blocks,
+                    len(_sm_prefix_blocks),
+                    store_tail_blocks,
+                    request.num_computed_tokens,
+                    request.position_offset,
+                )
+        else:
+            # Fully-mirrored: no store phase at all. The swap is born
+            # "swapped" — relief is instantaneous.
+            swap = RequestKVSwap(
+                request_id=request_id,
+                cpu_block_ids_by_group=tuple(cpu_by_group),
+                logical_start_by_group=tuple(logical_start_by_group),
+                kv_block_count=total_blocks,
+                num_computed_tokens=request.num_computed_tokens,
+                position_offset=request.position_offset,
+                status="swapped",
+                created_at=time.monotonic(),
+                entries=entries,
+                store_event_id=None,
+                kept_blocks_by_group=tuple(kept_by_group),
+                total_blocks_by_group=tuple(total_by_group),
+            )
+            swap._t_swapped = time.monotonic()
+            self._request_kv_swaps[request_id] = swap
+            self._release_request_kv_swap_entries(request_id, swap.entries)
+            self._request_kv_swap_ready_queue.append(request_id)
+            if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
+                logger.warning(
+                    "[SOFT-PIN-INSTANT-SWAP] req=%s reason=%s blocks=%d "
+                    "instant_freed=%d computed=%d position_offset=%d",
+                    request_id[:8],
+                    reason,
+                    total_blocks,
+                    len(_sm_prefix_blocks),
+                    request.num_computed_tokens,
+                    request.position_offset,
+                )
         # Whole-trace swap (design B): the window is now swapping out; ALSO
         # offload this rollout's gpu_pinned ARCHIVE spans so the ENTIRE trace
         # leaves the GPU together, instead of stranding the archive resident
@@ -8993,9 +9659,17 @@ class Scheduler(SchedulerInterface):
         # 618 GiB of per-span streaming). The spans become cpu_offloaded and
         # are recalled on demand. Only in deferred mode (immediate already
         # offloads at eviction). Best-effort: a CPU-full span just stays pinned.
-        if not self._managed_context_cpu_offload_immediate:
+        # SOFT-PIN streaming: SKIP the demotion — rotation-swaps fire per
+        # call, and demoting resident spans on every rotation strips exactly
+        # the residency the touch-based recall re-attach depends on (v6:
+        # 601 demotion rounds → every re-attach paid H2D). Spans stay
+        # resident; pressure evicts them via the normal hot-budget paths.
+        if (
+            not self._managed_context_cpu_offload_immediate
+            and not self._kve_soft_pin_stream_mirror_enabled()
+        ):
             swap_trace_id = self._managed_context_trace_id(request)
-            if swap_trace_id:
+            if swap_trace_id:  # noqa: SIM102 — keep the demotion body intact
                 for arch_key in list(self._managed_context_archive_order):
                     if arch_key[0] != swap_trace_id:
                         continue
@@ -9368,6 +10042,9 @@ class Scheduler(SchedulerInterface):
         swap = self._request_kv_swaps.pop(request_id, None)
         if swap is None:
             return
+        # Atomic-resume grant is consumed; a future re-park re-applies.
+        if getattr(request, "_kve_bundle_granted", False):
+            request._kve_bundle_granted = False
         # SWAP-AGE readout: where did a slow round-trip wait? room1 = store
         # flight, room2 = on CPU waiting to be PICKED, room3 = load flight +
         # scheduler admission. Logged only for the tail (>15s total).
@@ -9548,13 +10225,19 @@ class Scheduler(SchedulerInterface):
         if swap.status == "store_pending":
             return False
         if swap.status == "swapped":
-            ready_head = self._request_kv_swap_ready_head()
-            if ready_head is not None and ready_head != request_id:
-                swap.last_error = (
-                    "request KV swap load is waiting behind ready request: "
-                    f"head={ready_head[:8]}"
-                )
-                return False
+            # SOFT-PIN streaming: no head-of-line — reloads run concurrently,
+            # bounded by load admissibility (free blocks) and
+            # MAX_PENDING_LOADS. The serial ready-queue was an anti-thrash
+            # brake for the expensive-reload era; the census run showed it
+            # serializing every returning leader behind every other returner.
+            if not self._kve_soft_pin_stream_mirror_enabled():
+                ready_head = self._request_kv_swap_ready_head()
+                if ready_head is not None and ready_head != request_id:
+                    swap.last_error = (
+                        "request KV swap load is waiting behind ready "
+                        f"request: head={ready_head[:8]}"
+                    )
+                    return False
             extra_required_gpu_blocks = (
                 self._request_kv_swap_next_allocation_block_demand(
                     request,
@@ -9573,6 +10256,14 @@ class Scheduler(SchedulerInterface):
                     ),
                 )
             )
+            bundle_error = self._kve_atomic_resume_bundle_error(
+                request,
+                reload_blocks=int(swap.kv_block_count)
+                + max(0, extra_required_gpu_blocks),
+            )
+            if bundle_error is not None:
+                swap.last_error = bundle_error
+                return False
             error = self._start_request_kv_swap_load(
                 request,
                 extra_required_gpu_blocks=extra_required_gpu_blocks,
@@ -9585,9 +10276,28 @@ class Scheduler(SchedulerInterface):
                         request_id[:8],
                         error,
                     )
+            elif request_id in self._kve_swap_revoked_restore_span_ids:
+                # ATOMIC RESUME: kick the revoked-restore reload in the SAME
+                # step as the window reload — both transfers fly together;
+                # the load_pending re-attach gate still sequences completion.
+                request.num_computed_tokens = swap.num_computed_tokens
+                request.position_offset = swap.position_offset
+                self._kve_try_reattach_revoked_restores(request)
             return False
         if swap.status == "load_pending":
             if request_id not in self._request_kv_swap_finished_load_req_ids:
+                return False
+            # SOFT-PIN revocable restores: the visible KV is back, but the
+            # request may not schedule until its revoked recalled spans are
+            # re-attached (else it would decode without them — semantically
+            # wrong even though nothing crashes). Restore the frame scalars
+            # first so the kind-1 attach event records the true frame; the
+            # completion below re-assigns both (idempotent).
+            request.num_computed_tokens = swap.num_computed_tokens
+            request.position_offset = swap.position_offset
+            reattach_wait = self._kve_try_reattach_revoked_restores(request)
+            if reattach_wait is not None:
+                swap.last_error = reattach_wait
                 return False
             self._complete_request_kv_swap_load(request)
             request.status = RequestStatus.PREEMPTED
@@ -9604,6 +10314,105 @@ class Scheduler(SchedulerInterface):
         if swap.status == "expired":
             return False
         return False
+
+    def _kve_try_reattach_revoked_restores(
+        self, request: Request
+    ) -> str | None:
+        """Re-attach spans revoked at swap-out. None = done/nothing to do
+        (the swap reload may complete); a string = still waiting (reason).
+
+        Resident spans re-attach via touch (free); cpu_offloaded spans go
+        through the normal pending-load machinery (H2D + activate at
+        load-done). Unavailable spans are dropped loudly rather than
+        wedging — same semantics as the drop-unavailable-restore flag."""
+        request_id = request.request_id
+        span_ids = self._kve_swap_revoked_restore_span_ids.get(request_id)
+        if not span_ids:
+            return None
+        if request_id in self._managed_context_active_restores:
+            # Already re-attached (e.g. a prior poll's pending load
+            # completed) — clean up and proceed.
+            self._kve_swap_revoked_restore_span_ids.pop(request_id, None)
+            self._release_managed_context_restore_reservation(
+                request_id, "soft-pin-swap-reattach"
+            )
+            return None
+        if request_id in self._managed_context_pending_loads:
+            if request_id in self._managed_context_finished_load_req_ids:
+                self._complete_managed_context_pending_load(request)
+                self._kve_swap_revoked_restore_span_ids.pop(request_id, None)
+                self._release_managed_context_restore_reservation(
+                    request_id, "soft-pin-swap-reattach"
+                )
+                request.needs_rebuild = True
+                return None
+            return "revoked restore reload is in flight"
+
+        trace_id = self._managed_context_trace_id(request)
+        spans: list[ManagedContextSpan] = []
+        dropped: list[str] = []
+        for span_id in span_ids:
+            span = (
+                self._managed_context_archive.get((trace_id, span_id))
+                if trace_id
+                else None
+            )
+            if span is None or span.status == "expired":
+                dropped.append(span_id)
+                continue
+            spans.append(span)
+        if dropped:
+            logger.warning(
+                "[SOFT-PIN-RESTORE-REATTACH-DROP] req=%s dropped=%s "
+                "(span unavailable after swap gap; proceeding without)",
+                request_id[:8],
+                dropped,
+            )
+        if not spans:
+            self._kve_swap_revoked_restore_span_ids.pop(request_id, None)
+            self._release_managed_context_restore_reservation(
+                request_id, "soft-pin-swap-reattach-empty"
+            )
+            return None
+        if self._managed_context_restore_needs_cpu_load(spans):
+            start = self._start_managed_context_cpu_load(request, spans)
+            if start.error is None:
+                if request_id in self._managed_context_pending_loads:
+                    return "revoked restore reload submitted"
+                # No load was actually needed/registered — fall through to
+                # the resident attach below on the next poll.
+                return "revoked restore reload pending retry"
+            if start.retryable:
+                return start.error
+            logger.warning(
+                "[SOFT-PIN-RESTORE-REATTACH-DROP] req=%s spans=%s "
+                "non-retryable reload error: %s (proceeding without)",
+                request_id[:8],
+                [span.span_id for span in spans],
+                start.error,
+            )
+            self._kve_swap_revoked_restore_span_ids.pop(request_id, None)
+            self._release_managed_context_restore_reservation(
+                request_id, "soft-pin-swap-reattach-failed"
+            )
+            return None
+        self._activate_managed_context_restore(
+            request,
+            spans,
+            restored_entries_by_span={},
+        )
+        request.needs_rebuild = True
+        self._kve_swap_revoked_restore_span_ids.pop(request_id, None)
+        self._release_managed_context_restore_reservation(
+            request_id, "soft-pin-swap-reattach"
+        )
+        if os.environ.get("KVE_TRACE_REQUEST_KV_SWAP") == "1":
+            logger.warning(
+                "[SOFT-PIN-RESTORE-REATTACH] req=%s spans=%s resident",
+                request_id[:8],
+                [span.span_id for span in spans],
+            )
+        return None
 
     def _release_managed_context_span_gpu_entries(
         self, span: ManagedContextSpan
@@ -11248,7 +12057,9 @@ class Scheduler(SchedulerInterface):
             load_block_count + max(0, extra_required_gpu_blocks),
             protected={self._managed_context_span_key(span) for span in spans},
         )
-        if self._managed_context_scheduler_accounted_restore:
+        if self._managed_context_scheduler_accounted_restore and not getattr(
+            request, "_kve_bundle_granted", False
+        ):
             wait_reason = _managed_context_gpu_reload_wait_reason(
                 reload_blocks=load_block_count,
                 extra_blocks=extra_required_gpu_blocks,
@@ -11703,7 +12514,15 @@ class Scheduler(SchedulerInterface):
         if entries is None:
             return None
         if entries.status != "gpu_pinned":
-            return None
+            # SOFT-PIN: the refs are gone (cpu_offloaded) or going
+            # (store_pending), but the published blocks are usually still
+            # physically intact. Re-attach them trace-keyed after per-block
+            # validation — this serves multi-frame chains (smart-bump seams)
+            # that the hash walk's frame-uniformity rule truncates, exactly
+            # like the hard pin-attach used to.
+            return self._phase4_soft_pinned_cache_blocks(
+                trace_id, entries, expected_cached_tokens
+            )
 
         by_manager_id = {
             id(manager): blocks for manager, blocks in entries.entries
@@ -11737,6 +12556,98 @@ class Scheduler(SchedulerInterface):
                 inherited_offset = block_offset
                 break
 
+        return (
+            self.kv_cache_manager.create_kv_cache_blocks(tuple(groups)),
+            min_cached_tokens,
+            inherited_offset,
+        )
+
+    def _phase4_soft_pinned_cache_blocks(
+        self,
+        trace_id: str,
+        pin: Phase4Pin,
+        expected_cached_tokens: int,
+    ) -> tuple[KVCacheBlocks, int, int] | None:
+        """Trace-keyed attach of soft-pinned (ref-0 or mid-store) blocks.
+
+        Every block must still carry the exact hash + logical_start recorded
+        at publish (get_new_blocks resets both at reclaim), else decline and
+        let the prefix walk / pin CPU reload handle the call. All-or-nothing
+        over the expected prefix: a partially-reclaimed window declines.
+        """
+        if not self._kve_soft_pin_enabled():
+            return None
+        if pin.status not in ("store_pending", "cpu_offloaded"):
+            return None
+        if not pin.soft_entries:
+            return None
+
+        by_manager_id = {
+            id(manager): (blocks, hashes, logical_starts)
+            for manager, blocks, hashes, logical_starts in pin.soft_entries
+        }
+        groups: list[list[Any]] = []
+        min_cached_tokens = expected_cached_tokens
+        for manager in self.kv_cache_manager.coordinator.single_type_managers:
+            snapshot = by_manager_id.get(id(manager))
+            if snapshot is None:
+                return None
+            blocks, hashes, logical_starts = snapshot
+            num_blocks = expected_cached_tokens // manager.block_size
+            if len(blocks) < num_blocks:
+                return None
+            for block, rec_hash, rec_ls in zip(
+                blocks[:num_blocks],
+                hashes[:num_blocks],
+                logical_starts[:num_blocks],
+            ):
+                if (
+                    rec_hash is None
+                    or block.block_hash is None
+                    or block.block_hash != rec_hash
+                    or int(block.logical_start) != int(rec_ls)
+                ):
+                    if os.environ.get("KVE_TRACE_PHASE4_PIN") == "1":
+                        logger.warning(
+                            "[SOFT-PIN-ATTACH-DECLINE] trace=%s block=%d "
+                            "reclaimed_or_rewritten (hash_match=%s ls=%s/%s)",
+                            trace_id,
+                            block.block_id,
+                            block.block_hash == rec_hash,
+                            block.logical_start,
+                            rec_ls,
+                        )
+                    return None
+            groups.append(list(blocks[:num_blocks]))
+            min_cached_tokens = min(
+                min_cached_tokens, num_blocks * manager.block_size
+            )
+
+        inherited_offset = 0
+        first_group = groups[0] if groups else []
+        block_size = (
+            self.kv_cache_manager.coordinator.single_type_managers[0].block_size
+            if self.kv_cache_manager.coordinator.single_type_managers
+            else max(1, self._compaction_block_size)
+        )
+        for block_idx, block in enumerate(first_group):
+            if block.logical_start < 0:
+                continue
+            block_offset = block.logical_start - block_idx * block_size
+            if block_offset != 0:
+                inherited_offset = block_offset
+                break
+
+        if os.environ.get("KVE_TRACE_PHASE4_PIN") == "1":
+            logger.warning(
+                "[SOFT-PIN-ATTACH] trace=%s status=%s blocks=%d tokens=%d "
+                "inherited_offset=%d",
+                trace_id,
+                pin.status,
+                sum(len(g) for g in groups),
+                min_cached_tokens,
+                inherited_offset,
+            )
         return (
             self.kv_cache_manager.create_kv_cache_blocks(tuple(groups)),
             min_cached_tokens,
@@ -13434,6 +14345,8 @@ class Scheduler(SchedulerInterface):
         self._release_managed_context_deferred_restore(
             request_id, "free-request"
         )
+        self._kve_swap_revoked_restore_span_ids.pop(request_id, None)
+        self._kve_release_stream_mirror(request_id)
         # Free partial-reload parked-prefix CPU blocks (the parked middle that
         # stayed on CPU after a partial swap-in). No leak on finish/abort.
         parked = self._request_kv_swap_parked.pop(request_id, None)
@@ -13867,6 +14780,19 @@ class Scheduler(SchedulerInterface):
         self, output: ManagedContextTransferOutput
     ) -> None:
         for event_id in output.completed_store_event_ids:
+            stream_meta = self._kve_stream_mirror_event_meta.pop(event_id, None)
+            if stream_meta is not None:
+                meta_request_id, confirmed_upto, meta_cpu_ids = stream_meta
+                stream_mirror = self._kve_stream_mirrors.get(meta_request_id)
+                if stream_mirror is None:
+                    # Owner already preempted/finished — orphaned copy;
+                    # reclaim its CPU ids.
+                    self._managed_context_free_cpu_block_ids((meta_cpu_ids,))
+                else:
+                    stream_mirror.confirmed_blocks = max(
+                        stream_mirror.confirmed_blocks, confirmed_upto
+                    )
+                continue
             if self._complete_phase4_pin_cpu_store(event_id):
                 continue
             span = self._managed_context_store_event_to_span.pop(event_id, None)

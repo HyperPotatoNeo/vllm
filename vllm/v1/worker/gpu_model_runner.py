@@ -2686,6 +2686,29 @@ class GPUModelRunner(
             visible_positions
             + per_token_offset * is_post_sys
         )
+        if os.environ.get("KVE_TRACE_HIDDEN_POSITIONS") == "1":
+            for _ri in range(num_reqs):
+                _hid = int(self.input_batch.hidden_kv_num_tokens_cpu[_ri])
+                if _hid <= 0:
+                    continue
+                _qs = int(self.query_start_loc.cpu[_ri])
+                _qe = int(self.query_start_loc.cpu[_ri + 1])
+                if _qe <= _qs:
+                    continue
+                _rid = self.input_batch.req_ids[_ri]
+                logger.warning(
+                    "[HIDDEN-POS] req=%s sched=%d computed=%d hidden=%d "
+                    "offset=%d ppl=%d seq_len=%d rope_first=%d rope_last=%d",
+                    str(_rid)[-12:],
+                    _qe - _qs,
+                    int(self.num_computed_tokens[_ri]),
+                    _hid,
+                    int(self.input_batch.position_offsets_cpu_tensor[_ri]),
+                    int(self.input_batch.protected_prefix_lens_cpu_tensor[_ri]),
+                    int(self.seq_lens[_ri]),
+                    int(self.positions[_qs]),
+                    int(self.positions[_qe - 1]),
+                )
 
         import os as _os
         if (
