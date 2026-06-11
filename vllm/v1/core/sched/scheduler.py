@@ -14449,7 +14449,13 @@ class Scheduler(SchedulerInterface):
         return num_waiting + len(self.running)
 
     def has_finished_requests(self) -> bool:
-        return len(self.finished_req_ids) > 0
+        # _pending_engine_core_outputs holds farewell outputs queued by
+        # in-schedule aborts; they only drain inside update_from_output, so
+        # the engine must keep stepping (empty batch is fine) until they
+        # ship — otherwise the aborted request's client waits forever.
+        return len(self.finished_req_ids) > 0 or bool(
+            self._pending_engine_core_outputs
+        )
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
