@@ -7657,6 +7657,26 @@ class Scheduler(SchedulerInterface):
         )
         return True
 
+    def _kve_soft_pin_lazy_publish_enabled(self) -> bool:
+        """KVE_SOFT_PIN_LAZY_PUBLISH=1: skip the publish-time CPU mirror
+        while GPU pool usage is below KVE_SOFT_PIN_LAZY_PUBLISH_USAGE
+        (default 0.80). The pin stays gpu_pinned (the existing decline
+        fallback); once usage crosses the threshold, publishes mirror
+        again and the proactive offload path (0.90) backs older pins
+        before the pressure valve can victimize them. Kills the per-call
+        D2H toll on short-turn workloads where the pool never fills."""
+        return os.environ.get(
+            "KVE_SOFT_PIN_LAZY_PUBLISH", "0"
+        ).strip().lower() not in ("0", "false", "no", "off", "")
+
+    def _kve_soft_pin_lazy_publish_usage(self) -> float:
+        try:
+            return float(
+                os.environ.get("KVE_SOFT_PIN_LAZY_PUBLISH_USAGE", "0.80")
+            )
+        except ValueError:
+            return 0.80
+
     def _kve_soft_pin_enabled(self) -> bool:
         """SOFT-PIN (KVE_SOFT_PIN=1): publish-then-offload retained state.
 
@@ -8074,6 +8094,23 @@ class Scheduler(SchedulerInterface):
             # then drop with hashes retained. On any decline (CPU pool
             # full, transfer limit, archive disabled) the pin simply
             # stays gpu_pinned — today's behavior.
+            #
+            # LAZY PUBLISH: below the usage threshold the mirror buys
+            # nothing (no reclaim risk) but costs a D2H per call-end —
+            # skip it like a decline. Inherited CPU ids were already
+            # detached from the predecessor pin by the caller, so free
+            # them exactly as the decline branch does.
+            if self._kve_soft_pin_lazy_publish_enabled():
+                _usage = self._phase4_gpu_block_usage()
+                if (
+                    _usage is not None
+                    and _usage[2] < self._kve_soft_pin_lazy_publish_usage()
+                ):
+                    if inherited_cpu_by_block:
+                        self._managed_context_free_cpu_block_ids(
+                            (sorted(set(inherited_cpu_by_block.values())),)
+                        )
+                    return trace_id
             pin = self._phase4_pinned_blocks.get(trace_id)
             if pin is not None:
                 soft_err = self._start_phase4_pin_cpu_offload(
