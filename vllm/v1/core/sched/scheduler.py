@@ -7026,9 +7026,49 @@ class Scheduler(SchedulerInterface):
                 )
             return True
         pin.status = "gpu_pinned"
-        self._managed_context_free_cpu_block_ids(pin.cpu_block_ids_by_group)
-        pin.cpu_block_ids_by_group = ()
-        pin.logical_start_by_group = ()
+        if self._kve_pin_reload_keep_cpu_enabled():
+            # RELOAD-INHERITANCE CARRY: keep the CPU copy through the
+            # reload (bytes are still valid — H2D doesn't consume them)
+            # and re-stamp soft_entries to the CURRENT GPU blocks so the
+            # next publish's id()-based delta inheritance matches the
+            # successor's blocks. Without this, every post-reload publish
+            # re-stores the whole window (store_tail ~430 vs ~24 blocks,
+            # the c64 thrash). Ids are freed at pin replace/expire
+            # (_release_phase4_pins frees cpu_block_ids_by_group).
+            if (
+                len(pin.entries) == 1
+                and len(pin.cpu_block_ids_by_group) == 1
+                and len(pin.entries[0][1])
+                == len(pin.cpu_block_ids_by_group[0])
+            ):
+                manager, blocks = pin.entries[0]
+                starts = (
+                    list(pin.logical_start_by_group[0])
+                    if len(pin.logical_start_by_group) == 1
+                    else [
+                        getattr(b, "logical_start", -1) for b in blocks
+                    ]
+                )
+                pin.soft_entries = [
+                    (
+                        manager,
+                        list(blocks),
+                        [getattr(b, "block_hash", None) for b in blocks],
+                        starts,
+                    )
+                ]
+            else:
+                self._managed_context_free_cpu_block_ids(
+                    pin.cpu_block_ids_by_group
+                )
+                pin.cpu_block_ids_by_group = ()
+                pin.logical_start_by_group = ()
+        else:
+            self._managed_context_free_cpu_block_ids(
+                pin.cpu_block_ids_by_group
+            )
+            pin.cpu_block_ids_by_group = ()
+            pin.logical_start_by_group = ()
         pin.last_loaded_at = time.monotonic()
         if os.environ.get("KVE_QUIET_PHASE4_LOGS") != "1":
             logger.warning(
@@ -7657,6 +7697,16 @@ class Scheduler(SchedulerInterface):
         )
         return True
 
+    def _kve_pin_reload_keep_cpu_enabled(self) -> bool:
+        """KVE_PIN_RELOAD_KEEP_CPU=1: a pin H2D reload keeps its CPU copy
+        and re-stamps soft_entries to the loaded GPU blocks, so the next
+        publish's delta inheritance survives the reload (fixes the
+        store_tail ~430-block full re-store after every reclaim/reload
+        cycle — the managed@c64 thrash)."""
+        return os.environ.get(
+            "KVE_PIN_RELOAD_KEEP_CPU", "0"
+        ).strip().lower() not in ("0", "false", "no", "off", "")
+
     def _kve_soft_pin_lazy_publish_enabled(self) -> bool:
         """KVE_SOFT_PIN_LAZY_PUBLISH=1: skip the publish-time CPU mirror
         while GPU pool usage is below KVE_SOFT_PIN_LAZY_PUBLISH_USAGE
@@ -8027,9 +8077,18 @@ class Scheduler(SchedulerInterface):
         inherited_cpu_by_block: dict[int, int] = {}
         if self._kve_soft_pin_enabled():
             old_pin = self._phase4_pinned_blocks.get(trace_id)
+            # gpu_pinned with surviving CPU ids = a kept-CPU reload
+            # (KVE_PIN_RELOAD_KEEP_CPU): its CPU bytes are still valid,
+            # so the successor inherits across the reload too.
             if (
                 old_pin is not None
-                and old_pin.status in ("cpu_offloaded", "store_pending")
+                and (
+                    old_pin.status in ("cpu_offloaded", "store_pending")
+                    or (
+                        old_pin.status == "gpu_pinned"
+                        and old_pin.cpu_block_ids_by_group
+                    )
+                )
                 and len(old_pin.soft_entries) == 1
                 and len(old_pin.cpu_block_ids_by_group) == 1
             ):
