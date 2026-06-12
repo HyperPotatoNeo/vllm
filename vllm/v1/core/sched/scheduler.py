@@ -1391,15 +1391,38 @@ class Scheduler(SchedulerInterface):
             max_sched_len = self.max_model_len
             if not request.padding_pending:
                 max_sched_len -= 1
-            num_new_tokens = min(
-                num_new_tokens,
-                max(
-                    0,
-                    max_sched_len
-                    - hidden_kv_num_tokens
-                    - request.num_computed_tokens,
-                ),
+            model_len_headroom = max(
+                0,
+                max_sched_len
+                - hidden_kv_num_tokens
+                - request.num_computed_tokens,
             )
+            if num_new_tokens > 0 and model_len_headroom == 0:
+                # Unfinishable request: visible context + hidden restored KV
+                # already sit at the model-length boundary, so its remaining
+                # tokens can never be scheduled. Skipping it would no-op-step
+                # forever (engine spins in the sleep(0.001) branch while the
+                # client hangs silently — observed as the 63/64 textworld
+                # straggler with computed=14591/14592 + 1792 hidden recall
+                # tokens = exactly max_model_len). Finish as length-capped so
+                # the farewell output ships and the rollout ends cleanly.
+                logger.warning(
+                    "[SCHED-MODEL-LEN-WEDGE] req=%s computed=%d hidden_kv=%d "
+                    "prompt=%d num_tokens=%d max_model_len=%d -> "
+                    "FINISHED_LENGTH_CAPPED",
+                    request.request_id[:8],
+                    request.num_computed_tokens,
+                    hidden_kv_num_tokens,
+                    request.num_prompt_tokens,
+                    request.num_tokens,
+                    self.max_model_len,
+                )
+                request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+                self._free_request(request)
+                self._queue_finished_request_output(request)
+                self.running.pop(req_index)
+                continue
+            num_new_tokens = min(num_new_tokens, model_len_headroom)
             num_new_tokens = (
                 self._cap_managed_context_deferred_prefill_tokens(
                     request,
@@ -7826,6 +7849,42 @@ class Scheduler(SchedulerInterface):
                 for prio, age, rid, reason in rows[:5]
             ],
         )
+
+        # RUNNING-but-stalled rows: a request in self.running absent from the
+        # previous step's scheduled set is the no-op-step wedge signature
+        # (engine spins in the time.sleep(0.001) branch, client sees a hang).
+        # Pure getattr probes only — no method calls, census must not mutate.
+        prev_ids = getattr(self, "prev_step_scheduled_req_ids", None) or set()
+        stalled = []
+        for req in self.running:
+            if req.request_id in prev_ids:
+                continue
+            flags = [classify(req)]
+            for attr, tag in (
+                ("padding_pending", "padding_pending"),
+                ("_kve_compact_replay_segmented_refill_active", "seg-refill"),
+                ("_kve_compact_replay_full_refill_active", "full-refill"),
+                ("needs_rebuild", "needs_rebuild"),
+                ("skip_reading_prefix_cache", "skip-prefix-read"),
+            ):
+                if getattr(req, attr, False):
+                    flags.append(tag)
+            stalled.append(
+                (
+                    req.request_id[:8],
+                    f"C{req.num_computed_tokens}/T{req.num_tokens}"
+                    f"/P{req.num_prompt_tokens}",
+                    f"ph{req.num_output_placeholders}",
+                    f"off{getattr(req, 'position_offset', 0)}",
+                    ",".join(flags)[:96],
+                )
+            )
+        if stalled:
+            logger.warning(
+                "[SCHED-CENSUS-RUNNING-STALLED] n=%d %s",
+                len(stalled),
+                stalled[:4],
+            )
 
     def _kve_atomic_resume_enabled(self) -> bool:
         """KVE_SOFT_PIN_ATOMIC_RESUME=1: a returning call's GPU needs are
