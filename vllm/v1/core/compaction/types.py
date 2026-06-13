@@ -141,3 +141,18 @@ class CompactionEvent(
     # attend to the spans even though they were already in the token list
     # when the restore attached. -1 on eviction events.
     visibility_boundary_computed: int = -1
+
+    # kind 1 only, recall token-surfacing (KVE_RECALL_SURFACE_TOKENS): the
+    # token ids of the SINGLE restored span, so a trainer whose sample never
+    # saw the span's birth (the span was evicted on a side-channel handshake
+    # call before this sample's first captured turn) can reconstruct its KV
+    # by forwarding these tokens at restored_span_pos_start.. positions.
+    # Empty when surfacing is off or the span's rows are already in-sample.
+    restored_span_token_ids: list[int] = msgspec.field(default_factory=list)
+
+    # kind 1 only: absolute RoPE position of restored_span_token_ids[0]
+    # (the rest follow contiguously). This is the position the engine used
+    # when it first computed the span's KV; the trainer must reuse it so the
+    # recalled keys carry the same rotation the sampler attended to. -1 when
+    # no tokens are surfaced.
+    restored_span_pos_start: int = -1

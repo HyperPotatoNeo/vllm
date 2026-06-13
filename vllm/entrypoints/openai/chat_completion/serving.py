@@ -1671,6 +1671,13 @@ class OpenAIServingChat(OpenAIServing):
                     visibility_boundary_computed=int(
                         getattr(e, "visibility_boundary_computed", -1)
                     ),
+                    restored_span_token_ids=[
+                        int(x)
+                        for x in getattr(e, "restored_span_token_ids", []) or []
+                    ],
+                    restored_span_pos_start=int(
+                        getattr(e, "restored_span_pos_start", -1)
+                    ),
                 )
                 for e in compaction_events
             ]

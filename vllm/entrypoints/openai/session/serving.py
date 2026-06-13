@@ -85,6 +85,12 @@ def _compaction_event_to_dict(e: Any) -> dict[str, Any]:
         "visibility_boundary_computed": int(
             getattr(e, "visibility_boundary_computed", -1)
         ),
+        "restored_span_token_ids": [
+            int(x) for x in getattr(e, "restored_span_token_ids", []) or []
+        ],
+        "restored_span_pos_start": int(
+            getattr(e, "restored_span_pos_start", -1)
+        ),
     }
 
 

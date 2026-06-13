@@ -11366,6 +11366,26 @@ class Scheduler(SchedulerInterface):
             if replay_token_ids is not None
             else len(request._all_token_ids)
         )
+        # Recall token-surfacing: on a hidden-restore ATTACH, ride the archived
+        # span's own token ids + first absolute position so a trainer whose
+        # sample never saw the span's birth can reconstruct its KV. Only the
+        # single-span case (the perpetual-anchor recall) is surfaced; multi-span
+        # restores fall back to the in-sample archive path. Gated default-ON but
+        # inert for non-recall modes (they emit no kind-1 events).
+        restored_span_token_ids: list[int] = []
+        restored_span_pos_start: int = -1
+        if (
+            kind == 1
+            and len(span_ids) == 1
+            and os.environ.get("KVE_RECALL_SURFACE_TOKENS", "1") != "0"
+        ):
+            trace_id = self._managed_context_trace_id(request)
+            span = self._managed_context_archive.get((trace_id, span_ids[0]))
+            if span is not None and span.token_ids:
+                restored_span_token_ids = list(span.token_ids)
+                restored_span_pos_start = int(
+                    span.evict_start + span.position_offset_frame
+                )
         event = CompactionEvent(
             num_output_tokens_at_compaction=request.num_total_generated,
             tokens_evicted=0,
@@ -11374,6 +11394,8 @@ class Scheduler(SchedulerInterface):
             writer_len_at_compaction=writer_len,
             event_kind=kind,
             restored_span_ids=list(span_ids),
+            restored_span_token_ids=restored_span_token_ids,
+            restored_span_pos_start=restored_span_pos_start,
             # num_computed_tokens counts PHYSICAL KV; while a restore is
             # active the attached hidden blocks (block-granular, so larger
             # than restore.num_tokens) are part of it. Subtract the exact

@@ -141,6 +141,11 @@ class CompactionEventPayload(OpenAIBaseModel):
     # at positions >= this boundary see / stop seeing the restored spans.
     # -1 on eviction events.
     visibility_boundary_computed: int = -1
+    # kind 1 recall token-surfacing: the single restored span's token ids and
+    # the absolute position of its first token (rest contiguous). Lets a
+    # trainer reconstruct a recalled span whose birth turn is not in-sample.
+    restored_span_token_ids: list[int] = Field(default_factory=list)
+    restored_span_pos_start: int = -1
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
