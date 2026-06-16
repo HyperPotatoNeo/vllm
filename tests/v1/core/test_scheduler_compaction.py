@@ -826,6 +826,28 @@ def test_compaction_event_kept_slice_default_empty():
     assert decoded.kept_token_ids == []
 
 
+def test_compaction_event_kv_selection_fields_roundtrip():
+    ev = CompactionEvent(
+        num_output_tokens_at_compaction=0,
+        tokens_evicted=32,
+        position_offset_after=32,
+        evict_start=32,
+        kept_indices=[0, 1, 48, 49],
+        kept_token_ids=[10, 11, 20, 21],
+        evicted_ranges=[32, 48, 64, 80],
+        selection_candidate_turn_indices=[0, 1, 2],
+        selection_kept_turn_indices=[1],
+        selection_evicted_turn_indices=[0, 2],
+    )
+    decoded = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(ev), type=CompactionEvent
+    )
+    assert decoded.evicted_ranges == [32, 48, 64, 80]
+    assert decoded.selection_candidate_turn_indices == [0, 1, 2]
+    assert decoded.selection_kept_turn_indices == [1]
+    assert decoded.selection_evicted_turn_indices == [0, 2]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Turn-mode compaction tests
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1061,6 +1083,50 @@ def test_turn_mode_stride_two_evicts_two_turns():
         f"{ev.last_turn_evicted}"
     )
     assert ev.num_turns_evicted_after == 2
+
+
+def test_turn_mode_kv_selection_keeps_selected_candidate_turn():
+    """kv-selection xargs keep a chosen turn from the would-be evicted band.
+
+    max_turns=4, stride=3 makes the normal candidate band turns [0,1,2].
+    Keeping offset 1 should evict turns 0 and 2 while preserving turn 1 and
+    the newest non-candidate turn 3 in chronological order.
+    """
+    sys_len = 32
+    scheduler = _make_turn_scheduler(
+        sys_len=sys_len, max_turns=4, turn_stride=3,
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=sys_len, max_tokens=2048,
+        ignore_eos=True, block_size=16,
+    )
+    request.sampling_params.extra_args = {
+        "kve_selection_enabled": 1,
+        "kve_selection_keep_offsets": [1],
+        "kve_selection_keep_budget": 1,
+    }
+    sys_prompt = _make_system_prompt(sys_len)
+    request.prompt_token_ids[:] = sys_prompt
+    request._all_token_ids[:] = list(sys_prompt)
+    scheduler.add_request(request)
+
+    _drive_scheduler(scheduler, request, _turn_script(4, turn_token_count=7))
+
+    assert len(request.compaction_events) >= 1
+    ev = request.compaction_events[0]
+    assert ev.evicted_ranges == [32, 48, 64, 80]
+    assert ev.selection_candidate_turn_indices == [0, 1, 2]
+    assert ev.selection_kept_turn_indices == [1]
+    assert ev.selection_evicted_turn_indices == [0, 2]
+    assert ev.tokens_evicted == 32
+    assert ev.archived_span_ids == []
+    assert ev.archived_span_bounds == []
+
+    evicted = set(range(32, 48)) | set(range(64, 80))
+    pre_event_len = len(ev.kept_indices) + ev.tokens_evicted
+    assert set(ev.kept_indices) == set(range(pre_event_len)) - evicted
+    assert list(request._all_token_ids[:sys_len]) == sys_prompt
+    assert getattr(request, "live_turn_ids", []) == [1, 3]
 
 
 def test_turn_mode_block_alignment_too_short():

@@ -121,6 +121,7 @@ class CompactingKVCacheManager(FullAttentionManager):
         request_id: str,
         prompt_tokens: int,
         explicit_block_range: tuple[int, int] | None = None,
+        explicit_block_ranges: list[tuple[int, int]] | None = None,
     ) -> int:
         """Evict oldest post-prompt blocks. Returns tokens evicted.
 
@@ -132,15 +133,28 @@ class CompactingKVCacheManager(FullAttentionManager):
         4. Return tokens evicted
 
         explicit_block_range overrides both stride_blocks and prompt_tokens
-        when set: evicts blocks[start:end] verbatim. Used by turn-mode
-        compaction in the scheduler, which computes its own block-aligned
-        range from completed-turn boundaries. prompt_tokens is still passed
-        for symmetry but ignored in this path.
+        when set: evicts blocks[start:end] verbatim. explicit_block_ranges is
+        the multi-range variant used by sparse turn selection. prompt_tokens is
+        still passed for symmetry but ignored in these paths.
         """
         blocks = self.req_to_blocks[request_id]
         prompt_blocks = (prompt_tokens + self.block_size - 1) // self.block_size
 
-        if explicit_block_range is not None:
+        if explicit_block_range is not None and explicit_block_ranges is not None:
+            return 0
+        if explicit_block_ranges is not None:
+            evict_indices: list[int] = []
+            seen: set[int] = set()
+            for start, end in explicit_block_ranges:
+                if not 0 <= start <= end <= len(blocks):
+                    return 0
+                for i in range(start, end):
+                    if i in seen:
+                        return 0
+                    seen.add(i)
+                    evict_indices.append(i)
+            evict_indices.sort()
+        elif explicit_block_range is not None:
             start, end = explicit_block_range
             if not 0 <= start <= end <= len(blocks):
                 return 0

@@ -1678,6 +1678,26 @@ class OpenAIServingChat(OpenAIServing):
                     restored_span_pos_start=int(
                         getattr(e, "restored_span_pos_start", -1)
                     ),
+                    evicted_ranges=[
+                        int(x) for x in getattr(e, "evicted_ranges", []) or []
+                    ],
+                    selection_candidate_turn_indices=[
+                        int(x)
+                        for x in getattr(
+                            e, "selection_candidate_turn_indices", []
+                        )
+                        or []
+                    ],
+                    selection_kept_turn_indices=[
+                        int(x)
+                        for x in getattr(e, "selection_kept_turn_indices", [])
+                        or []
+                    ],
+                    selection_evicted_turn_indices=[
+                        int(x)
+                        for x in getattr(e, "selection_evicted_turn_indices", [])
+                        or []
+                    ],
                 )
                 for e in compaction_events
             ]

@@ -156,3 +156,14 @@ class CompactionEvent(
     # recalled keys carry the same rotation the sampler attended to. -1 when
     # no tokens are surfaced.
     restored_span_pos_start: int = -1
+
+    # KV-selection extension: explicit pre-event token ranges evicted by this
+    # event, flattened as [start0, end0, start1, end1, ...]. Empty for legacy
+    # contiguous events, where evict_start/tokens_evicted remains sufficient.
+    evicted_ranges: list[int] = msgspec.field(default_factory=list)
+
+    # KV-selection extension: absolute turn ids in the candidate band, the
+    # subset kept by the selector, and the subset physically evicted.
+    selection_candidate_turn_indices: list[int] = msgspec.field(default_factory=list)
+    selection_kept_turn_indices: list[int] = msgspec.field(default_factory=list)
+    selection_evicted_turn_indices: list[int] = msgspec.field(default_factory=list)

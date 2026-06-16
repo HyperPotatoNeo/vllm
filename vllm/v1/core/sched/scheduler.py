@@ -4997,6 +4997,7 @@ class Scheduler(SchedulerInterface):
             if toks[i] == end_id:
                 positions.append(i + 1)  # position AFTER the im_end token
         request.last_turn_scan_pos = end
+        self._ensure_live_turn_ids(request)
 
     def _turn_mode_effective_prompt(self, request: Request) -> int:
         """Eviction boundary in turn mode = end of the system prompt
@@ -5027,6 +5028,80 @@ class Scheduler(SchedulerInterface):
         if n < 1:
             return 0
         return (n - 1) // 2
+
+    def _ensure_live_turn_ids(self, request: Request) -> list[int]:
+        """Keep absolute ids for completed live turns in sync with markers.
+
+        Prefix eviction historically encoded turn identity with the scalar
+        ``num_turns_evicted``. KV-selection can keep an older turn while
+        evicting later candidate turns, so the live stream needs an explicit
+        per-turn id list.
+        """
+        live_turns = self._num_live_completed_turns(request)
+        raw_ids = getattr(request, "live_turn_ids", None)
+        if raw_ids is None:
+            start = max(0, int(getattr(request, "num_turns_evicted", 0) or 0))
+            ids = list(range(start, start + live_turns))
+            request.live_turn_ids = ids
+            request.next_turn_id = start + live_turns
+            return ids
+
+        ids = [int(x) for x in list(raw_ids)[:live_turns]]
+        next_id = int(getattr(request, "next_turn_id", 0) or 0)
+        if ids:
+            next_id = max(next_id, max(ids) + 1)
+        else:
+            next_id = max(
+                next_id,
+                max(0, int(getattr(request, "num_turns_evicted", 0) or 0)),
+            )
+        while len(ids) < live_turns:
+            ids.append(next_id)
+            next_id += 1
+        request.live_turn_ids = ids
+        request.next_turn_id = next_id
+        return ids
+
+    @staticmethod
+    def _kve_xarg_int_list(raw: Any) -> list[int]:
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = [p.strip() for p in text.split(",") if p.strip()]
+            return Scheduler._kve_xarg_int_list(parsed)
+        if isinstance(raw, (list, tuple)):
+            out: list[int] = []
+            for item in raw:
+                try:
+                    out.append(int(item))
+                except (TypeError, ValueError):
+                    continue
+            return out
+        try:
+            return [int(raw)]
+        except (TypeError, ValueError):
+            return []
+
+    @staticmethod
+    def _kve_xarg_int(raw: Any, default: int = 0) -> int:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _kve_xarg_truthy(raw: Any) -> bool:
+        if isinstance(raw, bool):
+            return raw
+        if raw is None:
+            return False
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
     def _compaction_synthetic_live_turns(self, request: Request) -> int:
         """Number of SYNTHETIC (recall-handshake control) turns currently live
@@ -5539,90 +5614,126 @@ class Scheduler(SchedulerInterface):
         # snapped inward to block boundaries; block-FIFO mode lets the
         # manager pick the default range from (effective_prompt, stride).
         explicit_block_range: tuple[int, int] | None = None
+        explicit_block_ranges: list[tuple[int, int]] | None = None
         last_turn_evicted = -1
         stride_used = 0
         archived_span_ids: list[str] | None = []
         archived_span_bounds: list[int] = []
+        selection_plan: dict[str, Any] | None = None
+        evict_ranges: list[tuple[int, int]] = []
+        selection_candidate_turn_indices: list[int] = []
+        selection_kept_turn_indices: list[int] = []
+        selection_evicted_turn_indices: list[int] = []
         if self._compaction_max_turns > 0:
-            plan = self._plan_turn_evict_range(
+            selection_plan = self._plan_turn_selection_evict_ranges(
                 request, block_size,
                 effective_num_computed=effective_num_computed,
             )
-            if plan is None:
-                return 0  # Nothing safe to evict (e.g. too-short turns)
-            evict_start, evict_end, last_turn_evicted, stride_used = plan
-            explicit_block_range = (
-                evict_start // block_size, evict_end // block_size
-            )
-            total_evicted = evict_end - evict_start
-            if (
-                self._compact_replay_segmented_refill_enabled()
-                and not self._compact_replay_segmented_full_fallback_enabled()
-                and self._managed_context_replay_only_archive_enabled()
-                and block_size > 0
-            ):
-                replay_token_ids = getattr(
-                    request, "_kve_compact_replay_token_ids", None
+            if selection_plan is not None:
+                evict_ranges = list(selection_plan["token_ranges"])
+                explicit_block_ranges = list(selection_plan["block_ranges"])
+                selection_candidate_turn_indices = list(
+                    selection_plan["candidate_turn_indices"]
                 )
-                writer_len_for_replay = (
-                    len(replay_token_ids)
-                    if replay_token_ids is not None
-                    else len(request._all_token_ids)
+                selection_kept_turn_indices = list(
+                    selection_plan["kept_turn_indices"]
                 )
-                if writer_len_for_replay % block_size != 0:
-                    if os.environ.get("KVE_TRACE_COMPACT_REPREFILL") == "1":
-                        logger.warning(
-                            "[COMPACT-REPLAY-SEGMENTED-DEFER-UNALIGNED] "
-                            "req=%s writer_tokens=%d block_size=%d "
-                            "evict=[%d,%d) generated=%d",
-                            request.request_id[:8],
-                            writer_len_for_replay,
-                            block_size,
-                            evict_start,
-                            evict_end,
-                            request.num_total_generated,
+                selection_evicted_turn_indices = list(
+                    selection_plan["evicted_turn_indices"]
+                )
+                evict_start = evict_ranges[0][0]
+                evict_end = evict_ranges[-1][1]
+                total_evicted = sum(end - start for start, end in evict_ranges)
+                last_turn_evicted = max(selection_evicted_turn_indices, default=-1)
+                stride_used = len(selection_evicted_turn_indices)
+                tokens_evicted = compaction_mgr.compact_request(
+                    request.request_id,
+                    effective_prompt,
+                    explicit_block_ranges=explicit_block_ranges,
+                )
+                if tokens_evicted != total_evicted:
+                    return 0
+            else:
+                plan = self._plan_turn_evict_range(
+                    request, block_size,
+                    effective_num_computed=effective_num_computed,
+                )
+                if plan is None:
+                    return 0  # Nothing safe to evict (e.g. too-short turns)
+                evict_start, evict_end, last_turn_evicted, stride_used = plan
+                evict_ranges = [(evict_start, evict_end)]
+                explicit_block_range = (
+                    evict_start // block_size, evict_end // block_size
+                )
+                total_evicted = evict_end - evict_start
+                if (
+                    self._compact_replay_segmented_refill_enabled()
+                    and not self._compact_replay_segmented_full_fallback_enabled()
+                    and self._managed_context_replay_only_archive_enabled()
+                    and block_size > 0
+                ):
+                    replay_token_ids = getattr(
+                        request, "_kve_compact_replay_token_ids", None
+                    )
+                    writer_len_for_replay = (
+                        len(replay_token_ids)
+                        if replay_token_ids is not None
+                        else len(request._all_token_ids)
+                    )
+                    if writer_len_for_replay % block_size != 0:
+                        if os.environ.get("KVE_TRACE_COMPACT_REPREFILL") == "1":
+                            logger.warning(
+                                "[COMPACT-REPLAY-SEGMENTED-DEFER-UNALIGNED] "
+                                "req=%s writer_tokens=%d block_size=%d "
+                                "evict=[%d,%d) generated=%d",
+                                request.request_id[:8],
+                                writer_len_for_replay,
+                                block_size,
+                                evict_start,
+                                evict_end,
+                                request.num_total_generated,
+                            )
+                        return 0
+                archived_span_ids = self._archive_managed_context_span(
+                    request,
+                    compaction_mgr=compaction_mgr,
+                    evict_start=evict_start,
+                    evict_end=evict_end,
+                    explicit_block_range=explicit_block_range,
+                    last_turn_evicted=last_turn_evicted,
+                    stride_used=stride_used,
+                )
+                if archived_span_ids is None:
+                    return 0
+                # Per-span [start, end) bounds in the same pre-event frame as
+                # evict_start, read back from the archive registry before any
+                # prune can drop the spans. Restore events reference spans by
+                # id; these bounds are how a consumer maps the id to rows.
+                _bounds_trace_id = self._managed_context_trace_id(request)
+                for _sid in archived_span_ids:
+                    _span = self._managed_context_archive.get(
+                        (_bounds_trace_id, _sid)
+                    )
+                    if _span is None:
+                        archived_span_bounds.extend((-1, -1))
+                    else:
+                        archived_span_bounds.extend(
+                            (int(_span.evict_start), int(_span.evict_end))
+                        )
+                tokens_evicted = compaction_mgr.compact_request(
+                    request.request_id,
+                    effective_prompt,
+                    explicit_block_range=explicit_block_range,
+                )
+                if tokens_evicted != total_evicted:
+                    # Manager refused (out-of-bounds guard tripped). Should be
+                    # impossible given _plan_turn_evict_range's checks.
+                    trace_id = self._managed_context_trace_id(request)
+                    for span_id in archived_span_ids:
+                        self._release_managed_context_span(
+                            (trace_id, span_id), "compact-refused"
                         )
                     return 0
-            archived_span_ids = self._archive_managed_context_span(
-                request,
-                compaction_mgr=compaction_mgr,
-                evict_start=evict_start,
-                evict_end=evict_end,
-                explicit_block_range=explicit_block_range,
-                last_turn_evicted=last_turn_evicted,
-                stride_used=stride_used,
-            )
-            if archived_span_ids is None:
-                return 0
-            # Per-span [start, end) bounds in the same pre-event frame as
-            # evict_start, read back from the archive registry before any
-            # prune can drop the spans. Restore events reference spans by
-            # id; these bounds are how a consumer maps the id to rows.
-            _bounds_trace_id = self._managed_context_trace_id(request)
-            for _sid in archived_span_ids:
-                _span = self._managed_context_archive.get(
-                    (_bounds_trace_id, _sid)
-                )
-                if _span is None:
-                    archived_span_bounds.extend((-1, -1))
-                else:
-                    archived_span_bounds.extend(
-                        (int(_span.evict_start), int(_span.evict_end))
-                    )
-            tokens_evicted = compaction_mgr.compact_request(
-                request.request_id,
-                effective_prompt,
-                explicit_block_range=explicit_block_range,
-            )
-            if tokens_evicted != total_evicted:
-                # Manager refused (out-of-bounds guard tripped). Should be
-                # impossible given _plan_turn_evict_range's checks.
-                trace_id = self._managed_context_trace_id(request)
-                for span_id in archived_span_ids:
-                    self._release_managed_context_span(
-                        (trace_id, span_id), "compact-refused"
-                    )
-                return 0
         else:
             tokens_evicted = compaction_mgr.compact_request(
                 request.request_id, effective_prompt
@@ -5634,6 +5745,7 @@ class Scheduler(SchedulerInterface):
                 (effective_prompt + block_size - 1) // block_size
             ) * block_size
             evict_end = evict_start + total_evicted
+            evict_ranges = [(evict_start, evict_end)]
 
         # Snapshot the actual evicted token ids when an external consumer
         # asks for them. Full replay needs the ids to reconstruct compacted
@@ -5646,9 +5758,8 @@ class Scheduler(SchedulerInterface):
             or self._compact_replay_refill_enabled()
             or self._managed_context_replay_only_archive_enabled()
         ):
-            evicted_token_ids = list(
-                request._all_token_ids[evict_start:evict_end]
-            )
+            for start, end in evict_ranges:
+                evicted_token_ids.extend(request._all_token_ids[start:end])
 
         # Snapshot the KEPT slice (in pre-event coords) BEFORE mutation.
         # Scheduler is the single source of truth for what physically
@@ -5656,19 +5767,18 @@ class Scheduler(SchedulerInterface):
         # don't re-derive the slice from scalar fields (which is how the
         # trainer's evict_start_per_boundary plumbing went dead).
         pre_event_len = len(request._all_token_ids)
-        kept_indices = (
-            list(range(0, evict_start))
-            + list(range(evict_end, pre_event_len))
-        )
-        kept_token_ids = (
-            list(request._all_token_ids[0:evict_start])
-            + list(request._all_token_ids[evict_end:pre_event_len])
-        )
+        kept_indices: list[int] = []
+        cursor = 0
+        for start, end in evict_ranges:
+            kept_indices.extend(range(cursor, start))
+            cursor = end
+        kept_indices.extend(range(cursor, pre_event_len))
+        kept_token_ids = [request._all_token_ids[i] for i in kept_indices]
         writer_len_at_compaction = pre_event_len
         mark_replay_eviction = getattr(
             request, "mark_compact_replay_eviction", None
         )
-        if callable(mark_replay_eviction):
+        if callable(mark_replay_eviction) and selection_plan is None:
             replay_marked = mark_replay_eviction(evict_start, total_evicted)
             replay_token_ids = getattr(
                 request, "_kve_compact_replay_token_ids", None
@@ -5719,10 +5829,12 @@ class Scheduler(SchedulerInterface):
         _recalled_dbg = self._compaction_recalled_turns(request)
         _protect_dbg = self._compaction_protect_oldest_turns()
         _eff_max_dbg = self._effective_compaction_max_turns(request)
+        def _dbg_in_evict_ranges(pos: int) -> bool:
+            return any(start < pos <= end for start, end in evict_ranges)
         _ex_evicted_dbg = sum(
             1 for _k in range(1, len(_pos_dbg) // 2 + 1)
             if 2 * _k < len(_pos_dbg)
-            and evict_start < _pos_dbg[2 * _k] <= evict_end
+            and _dbg_in_evict_ranges(_pos_dbg[2 * _k])
         )
         logger.warning(
             "[COMPACT] req=%s effective_prompt=%d num_prompt=%d "
@@ -5755,15 +5867,24 @@ class Scheduler(SchedulerInterface):
         # `len(prompt_token_ids) == num_prompt_tokens` consistent
         # (otherwise the scheduler tries to re-prefill the un-trimmed
         # tail and hangs).
-        prompt_tokens_evicted, output_tokens_evicted = self._apply_trim(
-            request,
-            evict_start=evict_start,
-            evict_end=evict_end,
-            total_evicted=total_evicted,
-            stride_used=stride_used,
-            num_turns_evicted_after=num_turns_evicted_after,
-            trim_prompt_token_ids=post_prefill_admission,
-        )
+        if selection_plan is not None:
+            prompt_tokens_evicted, output_tokens_evicted = self._apply_trim_ranges(
+                request,
+                evict_ranges=evict_ranges,
+                total_evicted=total_evicted,
+                num_turns_evicted_after=num_turns_evicted_after,
+                evicted_turn_indices=selection_evicted_turn_indices,
+            )
+        else:
+            prompt_tokens_evicted, output_tokens_evicted = self._apply_trim(
+                request,
+                evict_start=evict_start,
+                evict_end=evict_end,
+                total_evicted=total_evicted,
+                stride_used=stride_used,
+                num_turns_evicted_after=num_turns_evicted_after,
+                trim_prompt_token_ids=post_prefill_admission,
+            )
 
         if prompt_tokens_evicted > 0:
             logger.warning(
@@ -5811,6 +5932,14 @@ class Scheduler(SchedulerInterface):
             new_user_fragment_len=new_user_fragment_len,
             archived_span_ids=archived_span_ids,
             archived_span_bounds=archived_span_bounds,
+            evicted_ranges=(
+                [x for r in evict_ranges for x in r]
+                if selection_plan is not None
+                else []
+            ),
+            selection_candidate_turn_indices=selection_candidate_turn_indices,
+            selection_kept_turn_indices=selection_kept_turn_indices,
+            selection_evicted_turn_indices=selection_evicted_turn_indices,
         )
         request.compaction_events.append(event)
         if os.environ.get("KV_EVICTION_BUG_TRACE") == "1":
@@ -5960,6 +6089,177 @@ class Scheduler(SchedulerInterface):
         # (their absolute indices stay below num_turns_evicted forever).
         last_turn_evicted = request.num_turns_evicted + protect + stride - 1
         return (evict_start, evict_end, last_turn_evicted, stride)
+
+    def _plan_turn_selection_evict_ranges(
+        self,
+        request: Request,
+        block_size: int,
+        effective_num_computed: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Plan sparse complete-turn eviction from selection xargs.
+
+        The client supplies absolute turn ids via ``kve_selection_keep_turns``
+        or candidate-relative offsets via ``kve_selection_keep_offsets``. The
+        scheduler computes the candidate band from the current live turn
+        markers and ignores ids outside that band. Ranges must be block-exact;
+        otherwise callers fall back to regular contiguous turn eviction.
+        """
+        extra_args = getattr(request.sampling_params, "extra_args", None)
+        if not isinstance(extra_args, dict):
+            return None
+        selection_keys = (
+            "kve_selection_enabled",
+            "kve_selection_keep_turns",
+            "kve_selection_keep_turn_ids",
+            "kve_selection_keep_offsets",
+            "kve_selection_keep_budget",
+        )
+        if not any(key in extra_args for key in selection_keys):
+            return None
+        if (
+            not self._kve_xarg_truthy(extra_args.get("kve_selection_enabled"))
+            and not any(
+                key in extra_args
+                for key in (
+                    "kve_selection_keep_turns",
+                    "kve_selection_keep_turn_ids",
+                    "kve_selection_keep_offsets",
+                )
+            )
+        ):
+            return None
+
+        positions = request.turn_end_positions
+        live_turns = self._num_live_completed_turns(request)
+        if live_turns < self._effective_compaction_max_turns(request):
+            return None
+
+        recalled = self._compaction_recalled_turns(request)
+        stride_base = self._compaction_eviction_turn_stride
+        if os.environ.get(
+            "KVE_COMPACTION_STRIDE_IGNORE_RECALLED", "0"
+        ).strip().lower() not in ("1", "true", "yes", "on"):
+            stride_base -= recalled
+        protect = self._compaction_protect_oldest_turns()
+        if protect > 0:
+            protect = min(protect, max(0, live_turns - 1))
+        stride = min(max(1, stride_base), live_turns - protect)
+        if stride <= 0:
+            return None
+
+        candidate_live_indices = list(range(protect, protect + stride))
+        if not candidate_live_indices:
+            return None
+        live_turn_ids = self._ensure_live_turn_ids(request)
+        if len(live_turn_ids) < live_turns:
+            return None
+        candidate_turn_ids = [int(live_turn_ids[i]) for i in candidate_live_indices]
+        id_to_live_index = {
+            turn_id: live_idx
+            for turn_id, live_idx in zip(candidate_turn_ids, candidate_live_indices)
+        }
+
+        keep_order: list[int] = []
+        seen: set[int] = set()
+
+        def _add_keep_live_index(live_idx: int) -> None:
+            if live_idx in candidate_live_indices and live_idx not in seen:
+                seen.add(live_idx)
+                keep_order.append(live_idx)
+
+        for offset in self._kve_xarg_int_list(
+            extra_args.get("kve_selection_keep_offsets")
+        ):
+            if 0 <= offset < len(candidate_live_indices):
+                _add_keep_live_index(candidate_live_indices[offset])
+
+        keep_turns = (
+            self._kve_xarg_int_list(extra_args.get("kve_selection_keep_turns"))
+            + self._kve_xarg_int_list(
+                extra_args.get("kve_selection_keep_turn_ids")
+            )
+        )
+        for turn_id in keep_turns:
+            live_idx = id_to_live_index.get(int(turn_id))
+            if live_idx is not None:
+                _add_keep_live_index(live_idx)
+
+        raw_budget = extra_args.get("kve_selection_keep_budget")
+        if raw_budget is None:
+            keep_budget = len(keep_order)
+        else:
+            keep_budget = self._kve_xarg_int(raw_budget, default=0)
+        keep_budget = min(max(0, keep_budget), max(0, len(candidate_live_indices) - 1))
+        if not keep_order and keep_budget > 0:
+            keep_order = candidate_live_indices[-keep_budget:]
+
+        selected_live_indices = set(keep_order[:keep_budget])
+        evicted_live_indices = [
+            idx for idx in candidate_live_indices
+            if idx not in selected_live_indices
+        ]
+        if not evicted_live_indices:
+            return None
+
+        clamp_ceiling = (
+            request.num_computed_tokens
+            if effective_num_computed is None
+            else effective_num_computed
+        )
+        computed_block_floor = (clamp_ceiling // block_size) * block_size
+        token_ranges: list[tuple[int, int]] = []
+        for live_idx in evicted_live_indices:
+            start_pos = positions[2 * live_idx]
+            end_pos = positions[2 * live_idx + 2]
+            if start_pos % block_size != 0 or end_pos % block_size != 0:
+                logger.warning(
+                    "[COMPACT-SELECTION] req=%s fallback: turn id=%d "
+                    "range=[%d,%d) not block-aligned (block_size=%d)",
+                    request.request_id[:8],
+                    int(live_turn_ids[live_idx]),
+                    start_pos,
+                    end_pos,
+                    block_size,
+                )
+                return None
+            if end_pos > computed_block_floor:
+                logger.warning(
+                    "[COMPACT-SELECTION] req=%s fallback: turn id=%d "
+                    "range=[%d,%d) exceeds computed floor %d",
+                    request.request_id[:8],
+                    int(live_turn_ids[live_idx]),
+                    start_pos,
+                    end_pos,
+                    computed_block_floor,
+                )
+                return None
+            token_ranges.append((start_pos, end_pos))
+
+        token_ranges.sort()
+        coalesced: list[tuple[int, int]] = []
+        for start_pos, end_pos in token_ranges:
+            if not coalesced or coalesced[-1][1] < start_pos:
+                coalesced.append((start_pos, end_pos))
+            else:
+                coalesced[-1] = (coalesced[-1][0], max(coalesced[-1][1], end_pos))
+
+        return {
+            "token_ranges": coalesced,
+            "block_ranges": [
+                (start_pos // block_size, end_pos // block_size)
+                for start_pos, end_pos in coalesced
+            ],
+            "candidate_turn_indices": candidate_turn_ids,
+            "kept_turn_indices": [
+                int(live_turn_ids[idx])
+                for idx in candidate_live_indices
+                if idx in selected_live_indices
+            ],
+            "evicted_turn_indices": [
+                int(live_turn_ids[idx]) for idx in evicted_live_indices
+            ],
+            "evicted_live_indices": evicted_live_indices,
+        }
 
     def _compute_new_user_fragment_len(
         self, request: Request, evict_end: int
@@ -13003,10 +13303,21 @@ class Scheduler(SchedulerInterface):
         # bit-for-bit — system prompt is never evicted.
         if self._compaction_max_turns > 0:
             old = request.turn_end_positions
+            old_live_ids = list(getattr(request, "live_turn_ids", []) or [])
+            if not old_live_ids:
+                live_before = (len(old) - 1) // 2 if old else 0
+                start_turn = max(
+                    0, int(getattr(request, "num_turns_evicted", 0) or 0)
+                )
+                old_live_ids = list(range(start_turn, start_turn + live_before))
             kept_tail = [p - total_evicted for p in old[2 * stride_used + 1:]]
             request.turn_end_positions = [old[0]] + kept_tail
             request.last_turn_scan_pos = len(request._all_token_ids)
+            request.live_turn_ids = old_live_ids[stride_used:][
+                : self._num_live_completed_turns(request)
+            ]
             request.num_turns_evicted = num_turns_evicted_after
+            self._ensure_live_turn_ids(request)
 
         # 7. Prefix-cache rebuild. After eviction, request.block_hashes is
         # stale (refers to the pre-eviction token sequence + evicted parent
@@ -13019,6 +13330,101 @@ class Scheduler(SchedulerInterface):
         # window. No-op when prefix caching is disabled.
         self._rehash_after_eviction(request)
 
+        return prompt_tokens_evicted, output_tokens_evicted
+
+    def _apply_trim_ranges(
+        self,
+        request: Request,
+        *,
+        evict_ranges: list[tuple[int, int]],
+        total_evicted: int,
+        num_turns_evicted_after: int,
+        evicted_turn_indices: list[int],
+    ) -> tuple[int, int]:
+        """Mutate request state for sparse eviction of multiple token ranges."""
+        if not evict_ranges:
+            return 0, 0
+        ranges = sorted(evict_ranges)
+        prompt_len = request.num_prompt_tokens
+        prompt_tokens_evicted = 0
+        output_tokens_evicted = 0
+
+        for start, end in ranges:
+            prompt_tokens_evicted += max(0, min(prompt_len, end) - start)
+            if end > prompt_len:
+                output_tokens_evicted += end - max(prompt_len, start)
+
+        for start, end in reversed(ranges):
+            del request._all_token_ids[start:end]
+        request.all_token_ids = ConstantList(request._all_token_ids)
+
+        if prompt_tokens_evicted > 0:
+            assert request.prompt_token_ids is not None, (
+                "prompt-overlapping eviction requires prompt_token_ids"
+            )
+            for start, end in reversed(ranges):
+                ps = start
+                pe = min(prompt_len, end)
+                if pe > ps:
+                    del request.prompt_token_ids[ps:pe]
+
+        if output_tokens_evicted > 0:
+            for start, end in reversed(ranges):
+                os_ = max(prompt_len, start) - prompt_len
+                oe = end - prompt_len
+                if oe > os_:
+                    del request._output_token_ids[os_:oe]
+        request.output_token_ids = ConstantList(request._output_token_ids)
+
+        if prompt_tokens_evicted > 0:
+            request.num_prompt_tokens -= prompt_tokens_evicted
+
+        had_kv = request.num_computed_tokens > 0
+        if had_kv:
+            overlap = sum(
+                max(0, min(request.num_computed_tokens, end) - start)
+                for start, end in ranges
+            )
+            request.num_computed_tokens -= overlap
+            request.position_offset += total_evicted
+
+        if self._compaction_max_turns > 0:
+            old_positions = list(request.turn_end_positions)
+            old_live_ids = list(getattr(request, "live_turn_ids", []) or [])
+            if not old_live_ids:
+                live_before = (len(old_positions) - 1) // 2 if old_positions else 0
+                start_turn = max(
+                    0, int(getattr(request, "num_turns_evicted", 0) or 0)
+                )
+                old_live_ids = list(range(start_turn, start_turn + live_before))
+
+            def _token_evicted(token_idx: int) -> bool:
+                return any(start <= token_idx < end for start, end in ranges)
+
+            def _deleted_before(pos: int) -> int:
+                return sum(max(0, min(pos, end) - start) for start, end in ranges)
+
+            new_positions: list[int] = []
+            for pos in old_positions:
+                marker_token_idx = pos - 1
+                if _token_evicted(marker_token_idx):
+                    continue
+                new_positions.append(pos - _deleted_before(pos))
+            if old_positions and (not new_positions or new_positions[0] != old_positions[0]):
+                # The system marker should never be in a selection range. Keep a
+                # hard fallback so a malformed range cannot strand turn mode.
+                new_positions.insert(0, old_positions[0])
+            request.turn_end_positions = new_positions
+            request.last_turn_scan_pos = len(request._all_token_ids)
+
+            evicted_set = {int(x) for x in evicted_turn_indices}
+            request.live_turn_ids = [
+                int(x) for x in old_live_ids if int(x) not in evicted_set
+            ][: self._num_live_completed_turns(request)]
+            request.num_turns_evicted = num_turns_evicted_after
+            self._ensure_live_turn_ids(request)
+
+        self._rehash_after_eviction(request)
         return prompt_tokens_evicted, output_tokens_evicted
 
     def _rehash_after_eviction(self, request: Request) -> None:

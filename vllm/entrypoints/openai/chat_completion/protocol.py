@@ -146,6 +146,12 @@ class CompactionEventPayload(OpenAIBaseModel):
     # trainer reconstruct a recalled span whose birth turn is not in-sample.
     restored_span_token_ids: list[int] = Field(default_factory=list)
     restored_span_pos_start: int = -1
+    # KV-selection extension: explicit pre-event token ranges and turn ids for
+    # sparse complete-turn selection. Empty for legacy contiguous eviction.
+    evicted_ranges: list[int] = Field(default_factory=list)
+    selection_candidate_turn_indices: list[int] = Field(default_factory=list)
+    selection_kept_turn_indices: list[int] = Field(default_factory=list)
+    selection_evicted_turn_indices: list[int] = Field(default_factory=list)
 
 
 class ChatCompletionResponse(OpenAIBaseModel):

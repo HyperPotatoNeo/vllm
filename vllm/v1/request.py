@@ -225,6 +225,11 @@ class Request:
         # Count of whole turns (user+assistant pairs) physically evicted by
         # prior compactions on this request. Monotonic.
         self.num_turns_evicted: int = 0
+        # Absolute ids for completed turns currently represented by
+        # turn_end_positions. Prefix eviction can derive these from
+        # num_turns_evicted, but sparse kv-selection needs the explicit list.
+        self.live_turn_ids: list[int] = []
+        self.next_turn_id: int = 0
         # Streaming-session marker: num_computed_tokens at the moment of the
         # most recent _update_request_as_session call, i.e. the partition
         # between "pre-existing cached prompt" (positions [0, boundary)) and
