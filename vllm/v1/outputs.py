@@ -160,6 +160,18 @@ class ECConnectorOutput:
     finished_recving: set[str] | None = None
 
 
+@dataclass
+class ManagedContextTransferOutput:
+    completed_store_event_ids: list[int] = field(default_factory=list)
+    completed_load_event_ids: list[int] = field(default_factory=list)
+
+    def is_empty(self) -> bool:
+        return (
+            not self.completed_store_event_ids
+            and not self.completed_load_event_ids
+        )
+
+
 # ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use list instead.
 @dataclass
@@ -194,6 +206,8 @@ class ModelRunnerOutput:
     kv_connector_output: KVConnectorOutput | None = None
 
     ec_connector_output: ECConnectorOutput | None = None
+
+    managed_context_transfer_output: ManagedContextTransferOutput | None = None
 
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None

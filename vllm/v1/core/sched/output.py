@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -42,12 +42,48 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # KV cache compaction: cumulative RoPE offset for this request at
+    # the moment it enters the worker. Non-zero only when in-step
+    # admission eviction fired in `Scheduler.schedule()` BEFORE this
+    # SchedulerOutput was built — the helper bumps `request.position_
+    # offset` by `total_evicted` so the worker's prefill kernel rotates
+    # Q at the post-eviction absolute frame matching the cached K
+    # vectors (which were written by prior requests at their original
+    # absolute positions). Without this field, NewRequestData would
+    # default the worker-side offset to 0, the prefill's K writes
+    # would be rotated in the LOCAL frame, and the first decode token
+    # (which DOES pick up the bumped offset via `request.position_
+    # offset` on subsequent steps) would attend the prefilled K with
+    # an offset-by-total_evicted skew — surfacing as token loops and
+    # the model answering the previous turn's question.
+    position_offset: int = 0
+
+    # 2-piece piecewise position fix: physical positions [0, protected_prefix_len)
+    # rotate at offset 0 (sys K stays correct at logical [0..protected_prefix_len)).
+    # Physical positions >= protected_prefix_len rotate at `position_offset`.
+    # Required by the piecewise position_offset fix
+    # (plans/piecewise_position_offset.md) to keep sys K correct while letting
+    # admission bump the offset to clear survivor logical positions for new K.
+    protected_prefix_len: int = 0
+
+    # Managed context: hidden original-position KV blocks restored for this
+    # request. These blocks are prepended only to the worker-side block table;
+    # they are not prompt_token_ids and must not make the worker skip visible
+    # prompt prefill.
+    hidden_kv_block_ids: tuple[list[int], ...] = field(default_factory=tuple)
+    hidden_kv_num_tokens: int = 0
+    hidden_kv_span_ids: list[str] = field(default_factory=list)
+
     @classmethod
     def from_request(
         cls,
         request: Request,
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
+        protected_prefix_len: int = 0,
+        hidden_kv_block_ids: tuple[list[int], ...] = (),
+        hidden_kv_num_tokens: int = 0,
+        hidden_kv_span_ids: list[str] | None = None,
     ) -> "NewRequestData":
         return cls(
             req_id=request.request_id,
@@ -60,6 +96,11 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prefill_token_ids=prefill_token_ids,
+            position_offset=request.position_offset,
+            protected_prefix_len=protected_prefix_len,
+            hidden_kv_block_ids=hidden_kv_block_ids,
+            hidden_kv_num_tokens=hidden_kv_num_tokens,
+            hidden_kv_span_ids=list(hidden_kv_span_ids or []),
         )
 
     def __repr__(self) -> str:
@@ -107,6 +148,23 @@ class NewRequestData:
 
 
 @dataclass
+class CompactReplayData:
+    token_ids: tuple[int, ...]
+    death_indices: tuple[int, ...]
+    live_writer_indices: tuple[int, ...]
+    evictions: int
+
+    @classmethod
+    def from_snapshot(cls, snapshot) -> "CompactReplayData":
+        return cls(
+            token_ids=tuple(snapshot.token_ids),
+            death_indices=tuple(snapshot.death_indices),
+            live_writer_indices=tuple(snapshot.live_writer_indices),
+            evictions=int(snapshot.evictions),
+        )
+
+
+@dataclass
 class CachedRequestData:
     req_ids: list[str]
     # For request ids not in resumed_req_ids, new_block_ids will be appended to
@@ -123,6 +181,26 @@ class CachedRequestData:
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
 
+    # Compaction: requests that were compacted and need full rebuild.
+    rebuild_req_ids: set[str] = field(default_factory=set)
+    # Position offsets for compacted requests (req_id -> cumulative offset).
+    position_offsets: dict[str, int] = field(default_factory=dict)
+    # Updated prompt lengths for compacted requests whose prompt tokens
+    # were evicted (turn-based eviction with protected prefix).
+    prompt_lengths: dict[str, int] = field(default_factory=dict)
+    # 2-piece piecewise position: per-request protected_prefix_len for
+    # compacted requests. Worker uses physical >= protected_prefix_len
+    # to decide whether to apply position_offset. Static during a request's
+    # lifetime (= sys boundary), so only needs to be shipped on rebuild.
+    protected_prefix_lens: dict[str, int] = field(default_factory=dict)
+    # Managed context: rebuilds can prepend restored hidden-KV blocks to an
+    # already-running request. The worker also needs the token count so its
+    # physical positions and attention lengths match the rebuilt block table.
+    hidden_kv_num_tokens: dict[str, int] = field(default_factory=dict)
+    # Compact replay: scheduler-side writer timeline needed by a future
+    # FlexAttention refill to replay dead and live rows with exact liveness.
+    compact_replay_data: dict[str, CompactReplayData] = field(default_factory=dict)
+
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
         new_token_ids_lens = [len(toks) for toks in self.new_token_ids]
@@ -137,7 +215,9 @@ class CachedRequestData:
             f"all_token_ids_lens={all_token_ids_lens},"
             f"new_block_ids={self.new_block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
-            f"num_output_tokens={self.num_output_tokens}"
+            f"num_output_tokens={self.num_output_tokens},"
+            f"hidden_kv_num_tokens={self.hidden_kv_num_tokens},"
+            f"compact_replay_reqs={list(self.compact_replay_data)}"
             f")"
         )
 
@@ -173,6 +253,22 @@ class CachedRequestData:
             num_computed_tokens=[],
             num_output_tokens=[],
         )
+
+
+@dataclass
+class ManagedContextCopyEvent:
+    event_id: int
+    gpu_block_ids: list[int]
+    cpu_block_ids: list[int]
+
+
+@dataclass
+class ManagedContextTransferMetadata:
+    store_events: list[ManagedContextCopyEvent] = field(default_factory=list)
+    load_events: list[ManagedContextCopyEvent] = field(default_factory=list)
+
+    def is_empty(self) -> bool:
+        return not self.store_events and not self.load_events
 
 
 @dataclass
@@ -233,10 +329,22 @@ class SchedulerOutput:
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
 
+    # Managed context CPU archive/reload transfer metadata. This is distinct
+    # from the generic KV connector because ownership is span-ID based rather
+    # than prefix/hash based.
+    managed_context_transfer_metadata: ManagedContextTransferMetadata | None = None
+
     # Block IDs freshly allocated from the pool during this scheduling step.
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+
+    # KV cache compaction: request IDs whose scheduled tokens are filler
+    # padding used to block-align the KV cache at request finish (see
+    # `compaction_block_aligned_finish` in CacheConfig). The worker
+    # should run the forward to write K/V for these tokens but skip
+    # sampling — no new output tokens are produced this step.
+    no_sample_req_ids: set[str] = field(default_factory=set)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

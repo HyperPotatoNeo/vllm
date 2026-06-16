@@ -126,6 +126,17 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # Logical position of the first K vector stored in this block, set
+    # when the block is first written for a request. RoPE rotations are
+    # baked into the K at write time using this logical_start (i.e. K at
+    # slot S within this block is rotated at logical position
+    # logical_start + S). Required so that chained-admission prefix-cache
+    # hits don't collide with new prefill positions — see
+    # plans/piecewise_position_offset.md and
+    # `feedback-chained-admission-rope-collision` in agent memory.
+    # -1 = not yet written (allocated block, no K yet).
+    logical_start: int = -1
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
@@ -140,6 +151,16 @@ class KVCacheBlock:
     def reset_hash(self):
         """Reset the block hash when the block is evicted."""
         self._block_hash = None
+
+    def reset_logical_start(self):
+        """Reset the logical_start when the block is freed.
+
+        Required so that a re-allocation of this block (in a different
+        request, or this same request after free+realloc) starts with no
+        stale logical_start. The new allocation will set logical_start
+        based on the new request's frame.
+        """
+        self.logical_start = -1
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__

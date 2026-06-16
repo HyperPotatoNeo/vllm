@@ -1001,6 +1001,11 @@ class Worker(WorkerBase):
         torch.accelerator.synchronize()
 
     def shutdown(self) -> None:
+        transfer_worker = getattr(
+            self.model_runner, "managed_context_cpu_transfer_worker", None
+        )
+        if transfer_worker is not None:
+            transfer_worker.shutdown()
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()

@@ -15,6 +15,7 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.compaction.types import CompactionEvent
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 from vllm.v1.serial_utils import UtilityResult
@@ -179,6 +180,25 @@ class EngineCoreOutput(
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
+    # KV cache compaction events that have fired for this request so far.
+    # The scheduler sends the full cumulative list on every output; the client
+    # overwrites its accumulated copy. Compaction events are append-only, so
+    # overwrite semantics are safe. None when compaction is disabled or when
+    # the request has had no compaction events yet.
+    compaction_events: list[CompactionEvent] | None = None
+    # Managed-context recall movement verdict for this request (or None if the
+    # request triggered no recall): {"kind": str, "spans": int, "resident": int,
+    # "h2d": int}. Echoed to the client so its [MANAGED-CONTEXT-CLIENT-RESTORE]
+    # log can show CPU->GPU(H2D) vs GPU-RESIDENT(NO-MOVE). Pure metadata.
+    managed_context_restore_kind: dict | None = None
+    # KV cache compaction auto-pad: filler token ids appended to this
+    # request's KV cache at finish-time so the trailing block lands in the
+    # prefix cache. Emitted on the same EngineCoreOutput that carries
+    # finish_reason. Excluded from the visible completion (these tokens were
+    # not sampled), but the orchestrator MUST forward them to the trainer so
+    # its persistent KV cache layout matches vLLM's (V's cache for the next
+    # call will inherit these padded blocks via prefix cache).
+    padding_token_ids: list[int] | None = None
 
     @property
     def finished(self) -> bool:

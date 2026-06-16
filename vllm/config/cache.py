@@ -168,6 +168,70 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
+    compaction_window_size: int = 0
+    """KV cache compaction: maximum number of tokens before eviction triggers.
+    0 = disabled (default). When set, the scheduler evicts the oldest post-prompt
+    KV blocks when a request's KV length exceeds this window. Mutually exclusive
+    with compaction_max_turns."""
+    compaction_stride: int = 0
+    """KV cache compaction: number of tokens to evict per compaction event.
+    Must be a multiple of block_size."""
+    compaction_protected_prefix_tokens: int = 0
+    """KV cache compaction: number of prefix tokens to protect from eviction.
+    0 = protect full prompt (default, backward compat). -1 = auto-detect
+    from the first system message (scan prompt_token_ids for the first
+    eos_token, protecting everything up to and including it). When > 0,
+    only the first N tokens of each request's prompt are protected; tokens
+    between N and the full prompt length become evictable. Useful for
+    multi-turn envs where the system prompt should be preserved but old
+    conversation turns
+    can be reclaimed."""
+    compaction_max_turns: int = 0
+    """KV cache compaction: max number of live (user+assistant) turns to
+    keep in context. 0 = disable turn mode (use block-FIFO compaction).
+    The system prompt is NOT a turn and is always protected. When set,
+    eviction fires once num_live_turns >= compaction_max_turns and removes
+    the oldest compaction_eviction_turn_stride turns at once. Mutually
+    exclusive with compaction_window_size/compaction_stride."""
+    compaction_eviction_turn_stride: int = 1
+    """KV cache compaction: how many oldest turns to evict at once when
+    compaction_max_turns is exceeded. Must be >= 1. Larger = fewer but
+    bigger compaction events."""
+    compaction_turn_end_token_id: int | None = None
+    """KV cache compaction: token id marking the end of a chat message
+    (e.g. <|im_end|> = 151645 for Qwen3). None = auto-detect at Scheduler
+    init from the request's eos_token_id at first use. Only consulted when
+    compaction_max_turns > 0."""
+    compaction_assume_aligned_turn_boundaries: bool = False
+    """KV cache compaction (turn mode): when True, assume the client has
+    padded each <|im_end|> such that the FIRST token of the NEXT message
+    lands on a block boundary (i.e. `pos_after_im_end + n_pads` is a
+    multiple of block_size). Under that invariant, the eviction end is
+    snapped UP (align_up) to include the padding of the last evicted turn,
+    so no tail of that turn is orphaned in the kept KV region. When False
+    (default), evict_end is snapped inward (align_down), which is safe
+    without padding but leaves up to block_size-1 orphan tokens from the
+    tail of the last evicted turn. Only consulted when
+    compaction_max_turns > 0."""
+
+    compaction_block_aligned_finish: bool = False
+    """KV cache compaction: when True, after each request finishes
+    generation, append filler tokens to extend the request's KV cache
+    to a block boundary. This makes the FINAL partial block enter the
+    prefix cache too, so subsequent inheritor requests can recover
+    those tokens without re-prefilling them. Eliminates the
+    'partial-tail re-prefill' that V does on subsequent calls
+    (currently the dominant K-mismatch source for trainer-vs-inference
+    KL on context-recall predictions). Requires enable_prefix_caching."""
+
+    compaction_filler_token_id: int = 151643
+    """KV cache compaction: token ID used by
+    compaction_block_aligned_finish to pad the cache to a block
+    boundary. Should match the orchestrator's chat-template filler
+    token so that subsequent submitted prompts hash-match the
+    auto-padded prefix cache at the padded positions. Default is
+    Qwen3's `<|endoftext|>` (151643)."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -197,6 +261,16 @@ class CacheConfig:
             "num_cpu_blocks",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
+            # Compaction is a runtime scheduler feature
+            "compaction_window_size",
+            "compaction_stride",
+            "compaction_protected_prefix_tokens",
+            "compaction_max_turns",
+            "compaction_eviction_turn_stride",
+            "compaction_turn_end_token_id",
+            "compaction_assume_aligned_turn_boundaries",
+            "compaction_block_aligned_finish",
+            "compaction_filler_token_id",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors

@@ -14,6 +14,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.collection_utils import swap_dict_values
+from vllm.v1.core.sched.output import CompactReplayData
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import (
@@ -52,6 +53,22 @@ class CachedRequestState:
     # for pooling models
     pooling_params: PoolingParams | None = None
     pooling_states: PoolingStates | None = None
+
+    # KV cache compaction: cumulative evicted tokens for RoPE correction.
+    position_offset: int = 0
+
+    # 2-piece piecewise position fix: sys boundary. position_offset is
+    # applied to Q only when physical >= protected_prefix_len.
+    protected_prefix_len: int = 0
+
+    # Managed context: hidden restored KV prefix length. This affects only
+    # worker-side block-table slot positions and attention seq_lens; token
+    # selection and RoPE positions remain based on the visible prompt stream.
+    hidden_kv_num_tokens: int = 0
+
+    # Compact replay metadata for exact writer-timeline re-prefill. Present
+    # only while a compacted request is being rebuilt through the replay path.
+    compact_replay_data: CompactReplayData | None = None
 
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
@@ -148,6 +165,42 @@ class InputBatch:
             pin_memory=pin_memory,
         )
         self.num_computed_tokens_cpu = self.num_computed_tokens_cpu_tensor.numpy()
+
+        self.hidden_kv_num_tokens_cpu_tensor = torch.zeros(
+            (max_num_reqs,),
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=pin_memory,
+        )
+        self.hidden_kv_num_tokens_cpu = (
+            self.hidden_kv_num_tokens_cpu_tensor.numpy()
+        )
+
+        # KV cache compaction: position offsets for RoPE correction.
+        self.position_offsets_cpu_tensor = torch.zeros(
+            (max_num_reqs,),
+            device="cpu",
+            dtype=torch.int64,
+            pin_memory=pin_memory,
+        )
+        self.position_offsets_cpu = self.position_offsets_cpu_tensor.numpy()
+
+        # KV cache compaction (2-piece position fix): per-request boundary
+        # at which `position_offset` starts applying. Physical positions
+        # [0, protected_prefix_len) get offset=0 (sys); physical positions
+        # >= protected_prefix_len get the request's position_offset.
+        # Required so sys K (frozen at logical [0..ppl)) is read at its
+        # original logical positions while admission can bump offset
+        # high for post-sys K.
+        self.protected_prefix_lens_cpu_tensor = torch.zeros(
+            (max_num_reqs,),
+            device="cpu",
+            dtype=torch.int64,
+            pin_memory=pin_memory,
+        )
+        self.protected_prefix_lens_cpu = (
+            self.protected_prefix_lens_cpu_tensor.numpy()
+        )
 
         # Block table.
         self.block_table = MultiGroupBlockTable(
@@ -355,6 +408,9 @@ class InputBatch:
         self.num_tokens_no_spec[req_index] = request.num_tokens
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
+        self.hidden_kv_num_tokens_cpu[req_index] = request.hidden_kv_num_tokens
+        self.position_offsets_cpu[req_index] = request.position_offset
+        self.protected_prefix_lens_cpu[req_index] = request.protected_prefix_len
         self.block_table.add_row(request.block_ids, req_index)
 
         if sampling_params := request.sampling_params:
@@ -577,6 +633,10 @@ class InputBatch:
             self.num_computed_tokens_cpu[i2],
             self.num_computed_tokens_cpu[i1],
         )
+        self.hidden_kv_num_tokens_cpu[i1], self.hidden_kv_num_tokens_cpu[i2] = (
+            self.hidden_kv_num_tokens_cpu[i2],
+            self.hidden_kv_num_tokens_cpu[i1],
+        )
 
         # NOTE: the following is unsafe
         # self.token_ids_cpu[i1, ...], self.token_ids_cpu[i2, ...], =\
@@ -733,6 +793,15 @@ class InputBatch:
             self.num_computed_tokens_cpu[empty_index] = self.num_computed_tokens_cpu[
                 last_req_index
             ]
+            self.hidden_kv_num_tokens_cpu[empty_index] = (
+                self.hidden_kv_num_tokens_cpu[last_req_index]
+            )
+            self.position_offsets_cpu[empty_index] = self.position_offsets_cpu[
+                last_req_index
+            ]
+            self.protected_prefix_lens_cpu[empty_index] = (
+                self.protected_prefix_lens_cpu[last_req_index]
+            )
             self.block_table.move_row(last_req_index, empty_index)
 
             self.request_lora_mapping[empty_index] = self.request_lora_mapping[

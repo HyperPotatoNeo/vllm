@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -109,7 +110,6 @@ from vllm.utils.nvtx_pytorch_hooks import PytHooks
 from vllm.utils.platform_utils import is_pin_memory_available, num_compute_units
 from vllm.utils.torch_utils import (
     get_dtype_size,
-    is_quantized_kv_cache,
     kv_cache_dtype_str_to_dtype,
 )
 from vllm.v1.attention.backend import (
@@ -123,12 +123,14 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
-    NULL_BLOCK_ID,
     create_fast_prefill_custom_backend,
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import (
+    ManagedContextTransferMetadata,
+    NewRequestData,
+)
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -151,18 +153,19 @@ from vllm.v1.outputs import (
     KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
+    ManagedContextTransferOutput,
     ModelRunnerOutput,
     PoolerOutput,
     SamplerOutput,
     make_empty_encoder_model_runner_output,
 )
+from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
-from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
@@ -211,7 +214,7 @@ from .utils import (
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
-    from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
+    from vllm.v1.worker.gpu.mm.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
 
@@ -372,6 +375,467 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
         return self._model_runner_output
 
 
+ManagedContextBlockRange: TypeAlias = tuple[int, int, int]
+
+
+@dataclass
+class ManagedContextTransferEventState:
+    event_id: int
+    event: torch.Event
+    submitted_at: float
+    direction: str
+    num_blocks: int
+    num_cache_tensors: int
+    num_ranges: int
+    num_copy_calls: int
+    num_block_copy_calls: int
+    num_bytes: int
+
+
+def _coalesce_managed_context_block_ranges(
+    src_blocks: Sequence[int],
+    dst_blocks: Sequence[int],
+) -> list[ManagedContextBlockRange]:
+    """Group paired block IDs into maximal contiguous source/destination runs."""
+    if len(src_blocks) != len(dst_blocks):
+        raise ValueError(
+            "managed-context copy block ID length mismatch: "
+            f"src={len(src_blocks)} dst={len(dst_blocks)}"
+        )
+    if not src_blocks:
+        return []
+
+    ranges: list[ManagedContextBlockRange] = []
+    src_start = int(src_blocks[0])
+    dst_start = int(dst_blocks[0])
+    prev_src = src_start
+    prev_dst = dst_start
+    length = 1
+
+    for raw_src, raw_dst in zip(src_blocks[1:], dst_blocks[1:]):
+        src = int(raw_src)
+        dst = int(raw_dst)
+        if src == prev_src + 1 and dst == prev_dst + 1:
+            length += 1
+        else:
+            ranges.append((src_start, dst_start, length))
+            src_start = src
+            dst_start = dst
+            length = 1
+        prev_src = src
+        prev_dst = dst
+
+    ranges.append((src_start, dst_start, length))
+    return ranges
+
+
+class ManagedContextCPUTransferWorker:
+    """Worker-side async copies for managed-context CPU archive spans."""
+
+    def __init__(self, num_cpu_blocks: int):
+        self.num_cpu_blocks = num_cpu_blocks
+        self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
+        self.cpu_kv_caches: dict[str, torch.Tensor] | None = None
+        self.device: torch.device | None = None
+        self.load_stream: torch.cuda.Stream | None = None
+        self.store_stream: torch.cuda.Stream | None = None
+        self._load_events: list[ManagedContextTransferEventState] = []
+        self._store_events: list[ManagedContextTransferEventState] = []
+        self._load_hwm = -1
+        self._store_hwm = -1
+        self._pending_load_event_ids: set[int] = set()
+        self._pending_store_event_ids: set[int] = set()
+
+    def register_kv_caches(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        kv_cache_config: KVCacheConfig,
+    ) -> None:
+        if not kv_caches:
+            logger.warning("[MANAGED-CONTEXT-CPU] no KV caches registered")
+            return
+
+        def _repr_tensor(value: torch.Tensor | list[torch.Tensor]) -> torch.Tensor:
+            assert isinstance(value, torch.Tensor | list)
+            return value if isinstance(value, torch.Tensor) else value[0]
+
+        any_tensor = _repr_tensor(next(iter(kv_caches.values())))
+        self.device = any_tensor.device
+        num_gpu_blocks = kv_cache_config.num_blocks
+
+        seen_ptrs: dict[int, tuple[str, torch.Tensor]] = {}
+        for name, value in kv_caches.items():
+            tensor = _repr_tensor(value)
+            ptr = tensor.untyped_storage().data_ptr()
+            if ptr not in seen_ptrs:
+                seen_ptrs[ptr] = (name, tensor)
+
+        unique_gpu_caches: dict[str, torch.Tensor] = {}
+        for name, tensor in seen_ptrs.values():
+            storage = tensor.untyped_storage()
+            raw = torch.empty(0, dtype=torch.int8, device=self.device).set_(
+                storage, 0, (storage.nbytes(),)
+            )
+            element_size = tensor.element_size()
+            page_size_bytes = storage.nbytes() // num_gpu_blocks
+            outer_dims = [
+                dim
+                for dim in range(tensor.ndim)
+                if tensor.stride(dim) * element_size > page_size_bytes
+            ]
+            if not outer_dims:
+                unique_gpu_caches[name] = raw.view(num_gpu_blocks, -1)
+            else:
+                segment_stride = tensor.stride(outer_dims[0]) * element_size
+                for idx in range(tensor.shape[outer_dims[0]]):
+                    offset = idx * segment_stride
+                    segment = raw[offset : offset + segment_stride]
+                    unique_gpu_caches[f"{name}.{idx}"] = segment.view(
+                        num_gpu_blocks, -1
+                    )
+
+        pin_memory = is_pin_memory_available()
+        if not pin_memory:
+            logger.warning(
+                "[MANAGED-CONTEXT-CPU] pinned memory unavailable; transfers may be slow"
+            )
+
+        # Idempotency: re-registration (e.g. any future re-init path) REUSES
+        # the existing pinned CPU pool when geometry matches. Never drop the
+        # old pool while its pages are still cudaHostRegister'ed — freeing
+        # registered memory is undefined behavior and re-pinning the reused
+        # VA range fails with cudaErrorHostMemoryAlreadyRegistered.
+        if self.cpu_kv_caches is not None and self.cpu_kv_caches:
+            existing = self.cpu_kv_caches
+            compatible = set(existing) == set(unique_gpu_caches) and all(
+                existing[name].shape[1:] == gpu_tensor.shape[1:]
+                and existing[name].dtype == gpu_tensor.dtype
+                for name, gpu_tensor in unique_gpu_caches.items()
+            )
+            if not compatible:
+                raise RuntimeError(
+                    "managed-context CPU pool re-registration with "
+                    "incompatible geometry; refusing to reallocate a "
+                    "still-pinned pool"
+                )
+            self.gpu_kv_caches = unique_gpu_caches
+            logger.warning(
+                "[MANAGED-CONTEXT-CPU] reusing existing pinned CPU pool "
+                "(%d tensors) for re-registration",
+                len(existing),
+            )
+            return
+
+        self.gpu_kv_caches = unique_gpu_caches
+        self.cpu_kv_caches = {}
+        for name, gpu_tensor in unique_gpu_caches.items():
+            cpu_shape = (self.num_cpu_blocks,) + gpu_tensor.shape[1:]
+            tensor = torch.zeros(cpu_shape, dtype=gpu_tensor.dtype, device="cpu")
+            if pin_memory:
+                pin_tensor(tensor)
+            self.cpu_kv_caches[name] = tensor
+
+        low_pri, _ = torch.cuda.Stream.priority_range()
+        self.load_stream = torch.cuda.Stream(priority=low_pri)
+        self.store_stream = torch.cuda.Stream(priority=low_pri)
+        total_bytes_per_block = sum(
+            tensor.stride(0) * tensor.element_size()
+            for tensor in unique_gpu_caches.values()
+        )
+        logger.warning(
+            "[MANAGED-CONTEXT-CPU] registered %d cache tensors, cpu_blocks=%d "
+            "capacity=%.2f GiB",
+            len(unique_gpu_caches),
+            self.num_cpu_blocks,
+            (self.num_cpu_blocks * total_bytes_per_block) / (1024**3),
+        )
+
+    def submit_and_poll(
+        self, metadata: ManagedContextTransferMetadata | None
+    ) -> ManagedContextTransferOutput | None:
+        if self.gpu_kv_caches is None or self.cpu_kv_caches is None:
+            if metadata and not metadata.is_empty():
+                raise RuntimeError(
+                    "managed-context CPU transfer requested before KV cache registration"
+                )
+            return None
+
+        if metadata is not None:
+            for event in metadata.load_events:
+                self._pending_load_event_ids.add(event.event_id)
+                self._launch_copy(
+                    event.cpu_block_ids,
+                    event.gpu_block_ids,
+                    is_store=False,
+                    event_idx=event.event_id,
+                )
+            for event in metadata.store_events:
+                self._pending_store_event_ids.add(event.event_id)
+                self._launch_copy(
+                    event.gpu_block_ids,
+                    event.cpu_block_ids,
+                    is_store=True,
+                    event_idx=event.event_id,
+                )
+
+        completed_loads: list[int] = []
+        completed_stores: list[int] = []
+        if self._pending_load_event_ids:
+            load_hwm = self._poll_stream_events(is_store=False)
+            for event_id in [
+                event_id
+                for event_id in self._pending_load_event_ids
+                if event_id <= load_hwm
+            ]:
+                self._pending_load_event_ids.discard(event_id)
+                completed_loads.append(event_id)
+        if self._pending_store_event_ids:
+            store_hwm = self._poll_stream_events(is_store=True)
+            for event_id in [
+                event_id
+                for event_id in self._pending_store_event_ids
+                if event_id <= store_hwm
+            ]:
+                self._pending_store_event_ids.discard(event_id)
+                completed_stores.append(event_id)
+
+        output = ManagedContextTransferOutput(
+            completed_store_event_ids=completed_stores,
+            completed_load_event_ids=completed_loads,
+        )
+        return None if output.is_empty() else output
+
+    def _launch_copy(
+        self,
+        src_blocks: list[int],
+        dst_blocks: list[int],
+        *,
+        is_store: bool,
+        event_idx: int,
+    ) -> None:
+        # Defensive OOB guard. A swap's block list has intermittently carried an
+        # out-of-bounds / -1 GPU block id (latent bug under investigation): the
+        # index_select fast path ASSERTS on it (engine death) and the slice path
+        # silently wraps a negative index. Clamp + log loudly so it can't crash
+        # the engine and so the anomaly is captured for root-cause. The clamped
+        # transfer is wrong for that (rare) rollout, but the run survives.
+        if (
+            self.gpu_kv_caches is not None
+            and self.cpu_kv_caches is not None
+            and src_blocks
+        ):
+            gpu_pool = next(iter(self.gpu_kv_caches.values())).shape[0]
+            cpu_pool = next(iter(self.cpu_kv_caches.values())).shape[0]
+            src_pool = gpu_pool if is_store else cpu_pool
+            dst_pool = cpu_pool if is_store else gpu_pool
+            if (
+                min(src_blocks) < 0
+                or max(src_blocks) >= src_pool
+                or min(dst_blocks) < 0
+                or max(dst_blocks) >= dst_pool
+            ):
+                logger.warning(
+                    "[MANAGED-CONTEXT-OOB-BLOCK] dir=%s event=%d n=%d "
+                    "src[min=%d max=%d pool=%d] dst[min=%d max=%d pool=%d] "
+                    "src_ids=%s dst_ids=%s",
+                    "D2H" if is_store else "H2D",
+                    event_idx,
+                    len(src_blocks),
+                    min(src_blocks),
+                    max(src_blocks),
+                    src_pool,
+                    min(dst_blocks),
+                    max(dst_blocks),
+                    dst_pool,
+                    src_blocks[:32],
+                    dst_blocks[:32],
+                )
+                src_blocks = [min(max(b, 0), src_pool - 1) for b in src_blocks]
+                dst_blocks = [min(max(b, 0), dst_pool - 1) for b in dst_blocks]
+        try:
+            ranges = _coalesce_managed_context_block_ranges(src_blocks, dst_blocks)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        stream = self.store_stream if is_store else self.load_stream
+        events = self._store_events if is_store else self._load_events
+        assert stream is not None
+        assert self.gpu_kv_caches is not None and self.cpu_kv_caches is not None
+        src_caches = self.gpu_kv_caches if is_store else self.cpu_kv_caches
+        dst_caches = self.cpu_kv_caches if is_store else self.gpu_kv_caches
+        # The CPU archive side is allocated as a contiguous increasing run
+        # (see _pop_contiguous_managed_context_cpu_blocks); the GPU side is
+        # scattered. Fast path: collapse the per-(tensor, block-range) copy_
+        # loop into one index_select gather (store) / index_copy_ scatter
+        # (load) per cache tensor. The old loop fired num_tensors * num_ranges
+        # copy_ calls per event (~72 * 61 ~= 4400), costing ~25ms of CPU-side
+        # enqueue per transfer; the gather/scatter is num_tensors calls.
+        # NOTE: the fast path is gated on cpu_contiguous because index_select/
+        # index_copy_ ASSERT on an out-of-bounds GPU block id, whereas the
+        # per-range slice fallback silently tolerates it. A scattered-CPU
+        # transfer was observed to carry an out-of-bounds GPU id (latent issue,
+        # under investigation); until that is understood the scattered case
+        # stays on the slice path. See plans/request_kv_swap_preemption.md.
+        num_blocks = len(src_blocks)
+        cpu_blocks = dst_blocks if is_store else src_blocks
+        gpu_blocks = src_blocks if is_store else dst_blocks
+        cpu_contiguous = num_blocks > 0 and cpu_blocks == list(
+            range(cpu_blocks[0], cpu_blocks[0] + num_blocks)
+        )
+        gpu_device = next(iter(self.gpu_kv_caches.values())).device
+        num_bytes = 0
+        used_fast_path = False
+        submit_start = time.perf_counter()
+        with torch.cuda.stream(stream):
+            if cpu_contiguous:
+                used_fast_path = True
+                gpu_idx = torch.tensor(
+                    gpu_blocks, device=gpu_device, dtype=torch.long
+                )
+                cpu_start = cpu_blocks[0]
+                for name, src_cache in src_caches.items():
+                    dst_cache = dst_caches[name]
+                    if is_store:
+                        # gather scattered GPU blocks -> contiguous CPU slice
+                        dst_cache[cpu_start : cpu_start + num_blocks].copy_(
+                            src_cache.index_select(0, gpu_idx),
+                            non_blocking=True,
+                        )
+                    else:
+                        # contiguous CPU slice -> H2D staging -> scatter to GPU
+                        staging = src_cache[
+                            cpu_start : cpu_start + num_blocks
+                        ].to(gpu_device, non_blocking=True)
+                        dst_cache.index_copy_(0, gpu_idx, staging)
+                    num_bytes += (
+                        num_blocks * int(src_cache.stride(0))
+                        * int(src_cache.element_size())
+                    )
+            else:
+                # Fallback (scattered CPU side): original per-range copy_ loop.
+                for name, src_cache in src_caches.items():
+                    dst_cache = dst_caches[name]
+                    for src_start, dst_start, length in ranges:
+                        if length == 1:
+                            dst_cache[dst_start].copy_(
+                                src_cache[src_start],
+                                non_blocking=True,
+                            )
+                        else:
+                            dst_cache[dst_start : dst_start + length].copy_(
+                                src_cache[src_start : src_start + length],
+                                non_blocking=True,
+                            )
+                        num_bytes += (
+                            int(length) * int(src_cache.stride(0))
+                            * int(src_cache.element_size())
+                        )
+            event = torch.Event()
+            event.record(stream)
+        state = ManagedContextTransferEventState(
+            event_id=event_idx,
+            event=event,
+            submitted_at=submit_start,
+            direction="D2H" if is_store else "H2D",
+            num_blocks=num_blocks,
+            num_cache_tensors=len(src_caches),
+            num_ranges=len(ranges),
+            num_copy_calls=(
+                len(src_caches)
+                if used_fast_path
+                else len(src_caches) * len(ranges)
+            ),
+            num_block_copy_calls=len(src_caches) * num_blocks,
+            num_bytes=num_bytes,
+        )
+        if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+            logger.warning(
+                "[MANAGED-CONTEXT-CPU-%s-SUBMIT] event=%d blocks=%d "
+                "cache_tensors=%d ranges=%d copy_calls=%d "
+                "per_block_copy_calls=%d bytes=%d submit_ms=%.3f",
+                state.direction,
+                state.event_id,
+                state.num_blocks,
+                state.num_cache_tensors,
+                state.num_ranges,
+                state.num_copy_calls,
+                state.num_block_copy_calls,
+                state.num_bytes,
+                (time.perf_counter() - submit_start) * 1000.0,
+            )
+        events.append(state)
+
+    def _poll_stream_events(self, *, is_store: bool) -> int:
+        events = self._store_events if is_store else self._load_events
+        hwm = self._store_hwm if is_store else self._load_hwm
+        while events:
+            state = events[0]
+            if not state.event.query():
+                break
+            hwm = state.event_id
+            events.pop(0)
+            if os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1":
+                elapsed_s = time.perf_counter() - state.submitted_at
+                gib_per_s = (
+                    (state.num_bytes / (1024**3)) / elapsed_s
+                    if elapsed_s > 0.0
+                    else 0.0
+                )
+                logger.warning(
+                    "[MANAGED-CONTEXT-CPU-%s-DONE] event=%d blocks=%d "
+                    "ranges=%d copy_calls=%d bytes=%d elapsed_ms=%.3f "
+                    "effective_gib_s=%.3f",
+                    state.direction,
+                    state.event_id,
+                    state.num_blocks,
+                    state.num_ranges,
+                    state.num_copy_calls,
+                    state.num_bytes,
+                    elapsed_s * 1000.0,
+                    gib_per_s,
+                )
+        if is_store:
+            self._store_hwm = hwm
+        else:
+            self._load_hwm = hwm
+        return hwm
+
+    def shutdown(self) -> None:
+        for state in list(self._load_events):
+            state.event.synchronize()
+            self._load_hwm = max(self._load_hwm, state.event_id)
+        self._load_events.clear()
+        for state in list(self._store_events):
+            state.event.synchronize()
+            self._store_hwm = max(self._store_hwm, state.event_id)
+        self._store_events.clear()
+
+    def __del__(self) -> None:
+        try:
+            self.shutdown()
+        except Exception:
+            pass
+
+
+def _merge_managed_context_transfer_outputs(
+    first: ManagedContextTransferOutput | None,
+    second: ManagedContextTransferOutput | None,
+) -> ManagedContextTransferOutput | None:
+    if first is None:
+        return second
+    if second is None:
+        return first
+    merged = ManagedContextTransferOutput(
+        completed_store_event_ids=(
+            first.completed_store_event_ids + second.completed_store_event_ids
+        ),
+        completed_load_event_ids=(
+            first.completed_load_event_ids + second.completed_load_event_ids
+        ),
+    )
+    return None if merged.is_empty() else merged
+
+
 class ExecuteModelState(NamedTuple):
     """Ephemeral cached state transferred between execute_model() and
     sample_tokens(), after execute_model() returns None."""
@@ -386,6 +850,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    managed_context_transfer_output: ManagedContextTransferOutput | None
 
 
 class GPUModelRunner(
@@ -452,6 +917,7 @@ class GPUModelRunner(
         # Model-related.
         self.num_query_heads = model_config.get_num_attention_heads(parallel_config)
         self.inputs_embeds_size = model_config.get_inputs_embeds_size()
+        self.attention_chunk_size = model_config.attention_chunk_size
         # Only relevant for models using ALiBi (e.g, MPT)
         self.use_alibi = model_config.uses_alibi
 
@@ -492,6 +958,29 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        try:
+            managed_context_cpu_blocks = int(
+                os.environ.get("KVE_MANAGED_CONTEXT_CPU_OFFLOAD_MAX_BLOCKS", "0")
+                or "0"
+            )
+        except ValueError:
+            managed_context_cpu_blocks = 0
+        self.managed_context_cpu_transfer_worker = (
+            ManagedContextCPUTransferWorker(managed_context_cpu_blocks)
+            if (
+                os.environ.get("KVE_MANAGED_CONTEXT_ARCHIVE_DEVICE", "gpu")
+                .strip()
+                .lower()
+                # Accept the whole CPU device family the scheduler recognizes:
+                # cpu (immediate) + cpu_explicit / cpu_deferred (lazy/deferred
+                # offload). Worker must agree with the scheduler or it will
+                # receive CPU-transfer metadata it can't service -> RuntimeError.
+                .startswith("cpu")
+                or os.environ.get("KVE_MANAGED_CONTEXT_CPU_OFFLOAD", "0") == "1"
+            )
+            and managed_context_cpu_blocks > 0
+            else None
+        )
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -517,7 +1006,6 @@ class GPUModelRunner(
                 | NgramProposerGPU
                 | SuffixDecodingProposer
                 | EagleProposer
-                | DFlashProposer
                 | DraftModelProposer
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
@@ -549,9 +1037,6 @@ class GPUModelRunner(
                 self._ngram_pinned_val_buf = torch.zeros(
                     self.max_num_reqs, dtype=torch.int32, pin_memory=True
                 )
-            elif self.speculative_config.use_dflash():
-                self.drafter = DFlashProposer(self.vllm_config, self.device, self)
-                self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
             elif self.speculative_config.use_eagle():
@@ -594,6 +1079,7 @@ class GPUModelRunner(
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
+        self.comm_stream = torch.cuda.Stream()
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -687,6 +1173,27 @@ class GPUModelRunner(
         self.num_computed_tokens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
+        # KV cache compaction: pre-allocated GPU buffer for position offsets.
+        # Required for RoPE absolute positions after mid-gen or admission
+        # eviction (position = physical + offset). The admission path now
+        # runs entirely inside `Scheduler.schedule()` — the worker is
+        # compaction-ignorant beyond reading position_offsets through
+        # the standard CachedRequestData rebuild flow.
+        self.position_offsets_gpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.int64, device=self.device
+        )
+        self.hidden_kv_num_tokens_gpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.int64, device=self.device
+        )
+        # 2-piece position fix (plans/piecewise_position_offset.md): per-request
+        # sys boundary. Physical positions < protected_prefix_len rotate at
+        # offset 0; physical positions >= protected_prefix_len rotate at
+        # position_offset. Keeps sys K correct (frozen at logical [0..ppl))
+        # while admission can bump position_offset to clear survivor logical
+        # positions for new K writes.
+        self.protected_prefix_lens_gpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.int64, device=self.device
+        )
         self.prev_num_draft_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
@@ -718,6 +1225,16 @@ class GPUModelRunner(
         self.num_accepted_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
+
+        # Only relevant for multimodal models
+        if self.supports_mm_inputs:
+            # Double buffer to avoid race condition: previous iteration's async
+            # copy may still be reading from CPU while current iteration writes.
+            self.is_mm_embed_buffers = [
+                self._make_buffer(self.max_num_tokens, dtype=torch.bool),
+                self._make_buffer(self.max_num_tokens, dtype=torch.bool),
+            ]
+            self.is_mm_embed_idx = 0
 
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -887,7 +1404,7 @@ class GPUModelRunner(
           If these are left at 0.0 (default after wake_up), all KV cache values
           become effectively zero, causing gibberish output.
         """
-        if not is_quantized_kv_cache(self.cache_config.cache_dtype):
+        if not self.cache_config.cache_dtype.startswith("fp8"):
             return
 
         kv_caches = getattr(self, "kv_caches", [])
@@ -1046,13 +1563,6 @@ class GPUModelRunner(
     def _sync_device(self) -> None:
         torch.accelerator.synchronize()
 
-    def _get_or_create_async_output_copy_stream(self) -> torch.cuda.Stream:
-        stream = self.async_output_copy_stream
-        if stream is None:
-            stream = torch.cuda.Stream()
-            self.async_output_copy_stream = stream
-        return stream
-
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -1120,6 +1630,10 @@ class GPUModelRunner(
         reqs_to_add: list[CachedRequestState] = []
         deferred_spec_decode_corrections = []
 
+        splice_hidden_after_protected_prefix = (
+            self._splice_hidden_after_protected_prefix
+        )
+
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
@@ -1150,6 +1664,16 @@ class GPUModelRunner(
                 to_update = model.pooler.get_pooling_updates(task)
                 to_update.apply(pooling_params)
 
+            hidden_block_ids = new_req_data.hidden_kv_block_ids
+            if hidden_block_ids:
+                block_ids = splice_hidden_after_protected_prefix(
+                    new_req_data.block_ids,
+                    hidden_block_ids,
+                    new_req_data.protected_prefix_len,
+                )
+            else:
+                block_ids = new_req_data.block_ids
+
             req_state = CachedRequestState(
                 req_id=req_id,
                 prompt_token_ids=new_req_data.prompt_token_ids,
@@ -1158,10 +1682,22 @@ class GPUModelRunner(
                 sampling_params=sampling_params,
                 pooling_params=pooling_params,
                 generator=generator,
-                block_ids=new_req_data.block_ids,
+                block_ids=block_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                # KV cache compaction: pick up the scheduler-side
+                # position_offset that in-step admission eviction set
+                # before this SchedulerOutput was built. Without this,
+                # the worker's input_batch row would default to 0 and
+                # the prefill kernel would rotate Q in the local
+                # post-trim frame while cached K vectors (from prior
+                # requests' prefix-cache hits) remain rotated at their
+                # original absolute frame, producing a relative-position
+                # skew at the prefill/decode boundary.
+                position_offset=new_req_data.position_offset,
+                protected_prefix_len=new_req_data.protected_prefix_len,
+                hidden_kv_num_tokens=new_req_data.hidden_kv_num_tokens,
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -1258,6 +1794,43 @@ class GPUModelRunner(
                         self.input_batch.num_tokens_no_spec[req_index] += (
                             optimistic_num_accepted
                         )
+
+            # Handle compacted requests: remove from batch, re-add with
+            # fresh state. This rebuilds the block_table, token_ids_cpu,
+            # and num_computed_tokens in InputBatch from the trimmed data.
+            if req_id in req_data.rebuild_req_ids:
+                req_state.num_computed_tokens = num_computed_tokens
+                req_state.block_ids = new_block_ids
+                req_state.position_offset = req_data.position_offsets.get(
+                    req_id, 0
+                )
+                # 2-piece position fix: protected_prefix_len is static
+                # per-request after admission, but we still ship it on
+                # every rebuild as a defensive resync.
+                if req_id in req_data.protected_prefix_lens:
+                    req_state.protected_prefix_len = (
+                        req_data.protected_prefix_lens[req_id]
+                    )
+                req_state.hidden_kv_num_tokens = (
+                    req_data.hidden_kv_num_tokens.get(req_id, 0)
+                )
+                req_state.compact_replay_data = req_data.compact_replay_data.get(
+                    req_id
+                )
+                # Update prompt length if prompt tokens were evicted
+                # (turn-based eviction with protected prefix).
+                if req_id in req_data.prompt_lengths:
+                    req_state.num_prompt_tokens = (
+                        req_data.prompt_lengths[req_id]
+                    )
+                if req_id in req_data.all_token_ids:
+                    all_tids = req_data.all_token_ids[req_id]
+                    prompt_len = req_state.num_prompt_tokens
+                    req_state.output_token_ids = list(all_tids[prompt_len:])
+                if req_index is not None:
+                    self.input_batch.remove_request(req_id)
+                reqs_to_add.append(req_state)
+                continue
 
             # Update the cached states.
             req_state.num_computed_tokens = num_computed_tokens
@@ -1468,6 +2041,42 @@ class GPUModelRunner(
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
 
+    def _splice_hidden_after_protected_prefix(
+        self,
+        visible_block_ids: tuple[list[int], ...],
+        hidden_block_ids: tuple[list[int], ...],
+        protected_prefix_len: int,
+    ) -> tuple[list[int], ...]:
+        spliced: list[list[int]] = []
+        for group_idx, visible_ids in enumerate(visible_block_ids):
+            block_table = self.input_batch.block_table[group_idx]
+            manager_block_size = (
+                block_table.block_size * block_table.blocks_per_kv_block
+            )
+            if (
+                protected_prefix_len % manager_block_size != 0
+                and os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1"
+            ):
+                logger.warning(
+                    "[MANAGED-CONTEXT-SPLICE-WARN] req protected prefix "
+                    "is not block aligned: protected_prefix_len=%d "
+                    "block_size=%d group=%d",
+                    protected_prefix_len,
+                    manager_block_size,
+                    group_idx,
+                )
+            prefix_blocks = min(
+                len(visible_ids),
+                (protected_prefix_len + manager_block_size - 1)
+                // manager_block_size,
+            )
+            spliced.append(
+                list(visible_ids[:prefix_blocks])
+                + list(hidden_block_ids[group_idx])
+                + list(visible_ids[prefix_blocks:])
+            )
+        return tuple(spliced)
+
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
     ) -> CachedRequestState:
@@ -1488,8 +2097,22 @@ class GPUModelRunner(
         req_state.sampling_params = new_req_data.sampling_params
         req_state.pooling_params = new_req_data.pooling_params
         self.late_interaction_runner.register_request(req_id, req_state.pooling_params)
-        req_state.block_ids = new_req_data.block_ids
+        if new_req_data.hidden_kv_block_ids:
+            req_state.block_ids = self._splice_hidden_after_protected_prefix(
+                new_req_data.block_ids,
+                new_req_data.hidden_kv_block_ids,
+                new_req_data.protected_prefix_len,
+            )
+        else:
+            req_state.block_ids = new_req_data.block_ids
         req_state.num_computed_tokens = new_req_data.num_computed_tokens
+        # Streaming-session resume must adopt the scheduler's current RoPE
+        # frame: UPDATE-time admission eviction may have bumped
+        # position_offset, and the resume-step prefill rows read these from
+        # the cached state (gpu_input_batch), not from NewRequestData.
+        req_state.position_offset = new_req_data.position_offset
+        req_state.protected_prefix_len = new_req_data.protected_prefix_len
+        req_state.hidden_kv_num_tokens = new_req_data.hidden_kv_num_tokens
         req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             req_state.prompt_token_ids, req_state.prompt_embeds
         )
@@ -1929,6 +2552,15 @@ class GPUModelRunner(
         self.discard_request_mask.np[:num_reqs] = (
             self.optimistic_seq_lens_cpu[:num_reqs].numpy() < num_tokens_np
         )
+        # KV cache compaction auto-pad: requests in the padding step
+        # forward filler tokens but produce no sampled output. Mark them
+        # as discard so their sampled_token_ids slot is cleared before
+        # returning to the scheduler.
+        no_sample_req_ids = getattr(scheduler_output, "no_sample_req_ids", None)
+        if no_sample_req_ids:
+            for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                if req_id in no_sample_req_ids:
+                    self.discard_request_mask.np[i] = True
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
         # Sync num_accepted_tokens from CPU (set by
@@ -1995,20 +2627,248 @@ class GPUModelRunner(
         self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
         self.num_scheduled_tokens.copy_to_gpu(num_reqs)
         num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
-        self.positions[:total_num_scheduled_tokens] = (
+        # Visible positions are positions in the submitted compact prompt.
+        # Managed-context hidden KV is not part of prompt_token_ids, so token
+        # selection and RoPE stay in this visible coordinate frame.
+        visible_positions = (
             self.num_computed_tokens[req_indices_gpu].to(torch.int64)
             + self.query_pos.gpu[:total_num_scheduled_tokens]
         )
+        self.hidden_kv_num_tokens_gpu[:num_reqs].copy_(
+            self.input_batch.hidden_kv_num_tokens_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
+        self.position_offsets_gpu[:num_reqs].copy_(
+            self.input_batch.position_offsets_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
+        self.protected_prefix_lens_gpu[:num_reqs].copy_(
+            self.input_batch.protected_prefix_lens_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
+        per_token_hidden_kv = self.hidden_kv_num_tokens_gpu[req_indices_gpu]
+        per_token_ppl = self.protected_prefix_lens_gpu[req_indices_gpu]
+        # Physical positions are worker block-table positions. Hidden KV blocks
+        # are spliced after the protected/system prefix, so only post-prefix
+        # visible tokens move right.
+        is_after_hidden_insert = (visible_positions >= per_token_ppl).to(
+            torch.int64
+        )
+        physical_positions = (
+            visible_positions
+            + per_token_hidden_kv * is_after_hidden_insert
+        )
         self.seq_lens[:num_reqs] = (
-            self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
+            self.hidden_kv_num_tokens_gpu[:num_reqs].to(torch.int32)
+            + self.num_computed_tokens[:num_reqs]
+            + num_scheduled_tokens_gpu
         )
         self.seq_lens[num_reqs:].fill_(0)
 
+        # Slot mapping uses physical positions (block indices within the
+        # spliced block_table).
         self.input_batch.block_table.compute_slot_mapping(
             num_reqs,
             self.query_start_loc.gpu[: num_reqs + 1],
-            self.positions[:total_num_scheduled_tokens],
+            physical_positions,
         )
+
+        # RoPE positions: 2-piece piecewise (plans/piecewise_position_offset.md).
+        #   physical [0, protected_prefix_len) → offset 0     (sys K frozen at [0..ppl))
+        #   physical [protected_prefix_len, ...) → position_offset  (post-sys, smart-bumped)
+        # Sys K stays at its original logical positions while admission can bump
+        # position_offset high enough to clear survivor logical positions.
+        # Bulk-copy both per-request scalars from CPU to pre-allocated GPU
+        # buffers above, before physical slot mapping.
+        per_token_offset = self.position_offsets_gpu[req_indices_gpu]
+        is_post_sys = (visible_positions >= per_token_ppl).to(torch.int64)
+        self.positions[:total_num_scheduled_tokens] = (
+            visible_positions
+            + per_token_offset * is_post_sys
+        )
+        if os.environ.get("KVE_TRACE_HIDDEN_POSITIONS") == "1":
+            for _ri in range(num_reqs):
+                _hid = int(self.input_batch.hidden_kv_num_tokens_cpu[_ri])
+                if _hid <= 0:
+                    continue
+                _qs = int(self.query_start_loc.cpu[_ri])
+                _qe = int(self.query_start_loc.cpu[_ri + 1])
+                if _qe <= _qs:
+                    continue
+                _rid = self.input_batch.req_ids[_ri]
+                logger.warning(
+                    "[HIDDEN-POS] req=%s sched=%d computed=%d hidden=%d "
+                    "offset=%d ppl=%d seq_len=%d rope_first=%d rope_last=%d",
+                    str(_rid)[-12:],
+                    _qe - _qs,
+                    int(self.num_computed_tokens[_ri]),
+                    _hid,
+                    int(self.input_batch.position_offsets_cpu_tensor[_ri]),
+                    int(self.input_batch.protected_prefix_lens_cpu_tensor[_ri]),
+                    int(self.seq_lens[_ri]),
+                    int(self.positions[_qs]),
+                    int(self.positions[_qe - 1]),
+                )
+
+        import os as _os
+        if (
+            _os.environ.get("KVE_TRACE_MANAGED_CONTEXT") == "1"
+            and torch.any(self.hidden_kv_num_tokens_gpu[:num_reqs] > 0)
+        ):
+            try:
+                _visible_cpu = visible_positions.detach().cpu().tolist()
+                _physical_cpu = physical_positions.detach().cpu().tolist()
+                _logical_cpu = self.positions[
+                    :total_num_scheduled_tokens
+                ].detach().cpu().tolist()
+                _slot_cpu = (
+                    self.input_batch.block_table[0]
+                    .slot_mapping.gpu[:total_num_scheduled_tokens]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                _hidden_cpu = (
+                    self.hidden_kv_num_tokens_gpu[:num_reqs]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                _seq_cpu = self.seq_lens[:num_reqs].detach().cpu().tolist()
+                _offset_cpu = (
+                    self.position_offsets_gpu[:num_reqs]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                _ppl_cpu = (
+                    self.protected_prefix_lens_gpu[:num_reqs]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                _req_idx_cpu = req_indices_gpu.detach().cpu().tolist()
+                _bt = self.input_batch.block_table[0]
+                _block_size = _bt.block_size
+                for _req_i in range(num_reqs):
+                    if _hidden_cpu[_req_i] <= 0:
+                        continue
+                    _start = int(self.query_start_loc.np[_req_i])
+                    _end = int(self.query_start_loc.np[_req_i + 1])
+                    _num_blocks = int(_bt.num_blocks_per_row[_req_i])
+                    _row_blocks = _bt.block_table.np[
+                        _req_i, : min(_num_blocks, 16)
+                    ].tolist()
+                    _row_blocks_gpu = (
+                        _bt.block_table.gpu[
+                            _req_i, : min(_num_blocks, 16)
+                        ]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
+                    _hidden_capacity = (
+                        (_hidden_cpu[_req_i] + _block_size - 1)
+                        // _block_size
+                    ) * _block_size
+                    logger.warning(
+                        "[MANAGED-CONTEXT-RUNNER] req=%s idx=%d "
+                        "hidden_tokens=%d hidden_block_capacity=%d "
+                        "seq_len=%d visible_seq_len=%d num_computed=%d "
+                        "scheduled=%d prompt_len=%d position_offset=%d "
+                        "protected_prefix_len=%d block_size=%d row_blocks_head=%s "
+                        "row_blocks_gpu_head=%s "
+                        "first_token=(visible=%s physical=%s logical=%s slot=%s) "
+                        "last_token=(visible=%s physical=%s logical=%s slot=%s)",
+                        self.input_batch.req_ids[_req_i][:8],
+                        _req_i,
+                        _hidden_cpu[_req_i],
+                        _hidden_capacity,
+                        _seq_cpu[_req_i],
+                        int(self.optimistic_seq_lens_cpu[_req_i].item()),
+                        int(self.input_batch.num_computed_tokens_cpu[_req_i]),
+                        int(num_scheduled_tokens[_req_i]),
+                        int(self.input_batch.num_prompt_tokens[_req_i]),
+                        _offset_cpu[_req_i],
+                        _ppl_cpu[_req_i],
+                        _block_size,
+                        _row_blocks,
+                        _row_blocks_gpu,
+                        _visible_cpu[_start] if _start < _end else None,
+                        _physical_cpu[_start] if _start < _end else None,
+                        _logical_cpu[_start] if _start < _end else None,
+                        _slot_cpu[_start] if _start < _end else None,
+                        _visible_cpu[_end - 1] if _start < _end else None,
+                        _physical_cpu[_end - 1] if _start < _end else None,
+                        _logical_cpu[_end - 1] if _start < _end else None,
+                        _slot_cpu[_end - 1] if _start < _end else None,
+                    )
+                for _tok_i in range(min(total_num_scheduled_tokens, 24)):
+                    logger.warning(
+                        "[MANAGED-CONTEXT-RUNNER-TOKEN] t=%d req_idx=%d "
+                        "visible=%s physical=%s logical=%s slot=%s",
+                        _tok_i,
+                        _req_idx_cpu[_tok_i],
+                        _visible_cpu[_tok_i],
+                        _physical_cpu[_tok_i],
+                        _logical_cpu[_tok_i],
+                        _slot_cpu[_tok_i],
+                    )
+            except Exception as _e:
+                logger.warning("[MANAGED-CONTEXT-RUNNER] trace failed: %s", _e)
+
+        # [POS-TRACE] dump per-token positions so we can verify RoPE
+        # positions are monotonically increasing across the request
+        # lifetime (especially across decode steps after admission
+        # compaction). Gated on env var KV_EVICTION_POS_TRACE=1 to
+        # avoid spamming the log.
+        if _os.environ.get("KV_EVICTION_POS_TRACE", "0") == "1":
+            try:
+                _visible_cpu = visible_positions.detach().cpu().tolist()
+                _physical_cpu = physical_positions.detach().cpu().tolist()
+                _offsets_cpu = (
+                    self.position_offsets_gpu[req_indices_gpu]
+                    .detach().cpu().tolist()
+                )
+                _logical_cpu = self.positions[
+                    :total_num_scheduled_tokens
+                ].detach().cpu().tolist()
+                _req_idx_cpu = req_indices_gpu.detach().cpu().tolist()
+                _num_computed = self.num_computed_tokens[
+                    :num_reqs
+                ].detach().cpu().tolist()
+                _num_offset_per_req = (
+                    self.position_offsets_gpu[:num_reqs]
+                    .detach().cpu().tolist()
+                )
+                logger.info(
+                    "[POS-TRACE] step: num_reqs=%d total_tokens=%d "
+                    "per_req: num_computed=%s position_offsets=%s",
+                    num_reqs, total_num_scheduled_tokens,
+                    _num_computed, _num_offset_per_req,
+                )
+                logger.info(
+                    "[POS-TRACE] per-token (req_idx, visible, physical, "
+                    "offset, logical):"
+                )
+                for _i in range(min(total_num_scheduled_tokens, 32)):
+                    logger.info(
+                        "[POS-TRACE]   t%d: req=%d visible=%d phys=%d "
+                        "offset=%d logical=%d",
+                        _i,
+                        _req_idx_cpu[_i],
+                        _visible_cpu[_i],
+                        _physical_cpu[_i],
+                        _offsets_cpu[_i],
+                        _logical_cpu[_i],
+                    )
+                if total_num_scheduled_tokens > 32:
+                    logger.info(
+                        "[POS-TRACE]   ... %d more tokens truncated",
+                        total_num_scheduled_tokens - 32,
+                    )
+            except Exception as _e:
+                logger.warning("[POS-TRACE] dump failed: %s", _e)
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -2124,13 +2984,22 @@ class GPUModelRunner(
         if ubatch_slices is not None:
             attn_metadata = [dict() for _ in range(len(ubatch_slices))]
 
+        visible_seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs_padded]
+        hidden_seq_lens_cpu = (
+            self.input_batch.hidden_kv_num_tokens_cpu_tensor[:num_reqs_padded]
+        )
+        if torch.any(hidden_seq_lens_cpu[:num_reqs]):
+            attn_seq_lens_cpu = visible_seq_lens_cpu + hidden_seq_lens_cpu
+        else:
+            attn_seq_lens_cpu = visible_seq_lens_cpu
+
         if for_cudagraph_capture:
             # For some attention backends (e.g. FA) with sliding window models we need
             # to make sure the backend see a max_seq_len that is larger to the sliding
             # window size when capturing to make sure the correct kernel is selected.
             max_seq_len = self.max_model_len
         else:
-            max_seq_len = self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max().item()
+            max_seq_len = attn_seq_lens_cpu[:num_reqs].max().item()
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
@@ -2147,9 +3016,9 @@ class GPUModelRunner(
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 blk_table_tensor = blk_table.get_device_tensor(num_reqs_padded)
 
-            # Fill unused block table entries with NULL_BLOCK_ID (null block)
-            # for CUDAGraph padding. Block 0 is reserved for padding.
-            blk_table_tensor[num_reqs:num_reqs_padded].fill_(NULL_BLOCK_ID)
+            # Fill unused with -1. Needed for reshape_and_cache in full cuda
+            # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
+            blk_table_tensor[num_reqs:num_reqs_padded].fill_(-1)
             return blk_table_tensor
 
         assert slot_mappings is not None
@@ -2166,7 +3035,7 @@ class GPUModelRunner(
         num_prompt_tokens_cpu = self.input_batch.num_prompt_tokens_cpu_tensor[
             :num_reqs_padded
         ]
-        seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs_padded]
+        seq_lens_cpu = attn_seq_lens_cpu
 
         # is_prefilling: True if request is still in prefill phase.
         # Used by mamba backends to distinguish actual decodes from
@@ -2194,9 +3063,48 @@ class GPUModelRunner(
             is_prefilling=is_prefilling,
         )
 
+        compact_replay_death_indices = None
+        compact_replay_active_reqs = None
+        if not for_cudagraph_capture:
+            compact_replay_items = []
+            max_replay_len = 0
+            for req_id in self.input_batch.req_ids[:num_reqs]:
+                replay_data = self.requests[req_id].compact_replay_data
+                compact_replay_items.append(replay_data)
+                if replay_data is not None:
+                    max_replay_len = max(
+                        max_replay_len,
+                        len(replay_data.death_indices),
+                    )
+            if max_replay_len > 0:
+                compact_replay_death_indices = torch.full(
+                    (num_reqs_padded, max_replay_len),
+                    max_replay_len,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                compact_replay_active_reqs = torch.zeros(
+                    num_reqs_padded,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                for req_idx, replay_data in enumerate(compact_replay_items):
+                    if replay_data is None:
+                        continue
+                    deaths = torch.tensor(
+                        replay_data.death_indices,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    compact_replay_death_indices[
+                        req_idx,
+                        : deaths.numel(),
+                    ] = deaths
+                    compact_replay_active_reqs[req_idx] = True
+
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
-                self.optimistic_seq_lens_cpu[:num_reqs],
+                attn_seq_lens_cpu[:num_reqs],
                 self.dcp_world_size,
                 self.dcp_rank,
                 self.parallel_config.cp_kv_cache_interleave_size,
@@ -2277,6 +3185,19 @@ class GPUModelRunner(
                 if builder.supports_update_block_table:
                     cached_attn_metadata[cache_key] = attn_metadata_i
 
+            if hasattr(attn_metadata_i, "compact_replay_death_indices"):
+                attn_metadata_i.compact_replay_death_indices = (
+                    compact_replay_death_indices
+                )
+                attn_metadata_i.compact_replay_active_reqs = (
+                    compact_replay_active_reqs
+                )
+            elif compact_replay_death_indices is not None:
+                raise RuntimeError(
+                    "Compact replay full refill requires the FlexAttention "
+                    "backend so death-index liveness can be enforced."
+                )
+
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
                 attn_metadata_dict = attn_metadata
@@ -2306,7 +3227,7 @@ class GPUModelRunner(
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, (EagleProposer, DFlashProposer)):
+                if isinstance(self.drafter, EagleProposer):
                     if self.drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
                 else:
@@ -2332,8 +3253,13 @@ class GPUModelRunner(
                 req_idx = self.input_batch.req_id_to_index[req_id]
                 req_doc_ranges[req_idx] = image_doc_ranges
 
-            # Set mm_prefix_range for all attention metadata
-            self._set_mm_prefix_range_for_metadata(attn_metadata, req_doc_ranges)
+            if isinstance(attn_metadata, list):
+                for ub_metadata in attn_metadata:
+                    for _metadata in ub_metadata.values():
+                        _metadata.mm_prefix_range = req_doc_ranges  # type: ignore[attr-defined]
+            else:
+                for _metadata in attn_metadata.values():
+                    _metadata.mm_prefix_range = req_doc_ranges  # type: ignore[attr-defined]
 
         if spec_decode_common_attn_metadata is not None and (
             num_reqs != num_reqs_padded or num_tokens != num_tokens_padded
@@ -2783,20 +3709,7 @@ class GPUModelRunner(
             )
             self.lora_manager.set_active_adapters(lora_requests, tower_mapping)
 
-            # Only set connector mapping if the model actually has a connector.
-            # Some multimodal models inherit a stub `get_num_mm_connector_tokens`
-            # from `SupportsMultiModal`, which returns None and should not be
-            # treated as a signal that connector LoRA is supported.
-            mm_mapping = (
-                self.model.get_mm_mapping()  # type: ignore[attr-defined]
-                if hasattr(self.model, "get_mm_mapping")
-                else None
-            )
-            if (
-                mm_mapping is not None
-                and mm_mapping.connector
-                and hasattr(self.model, "get_num_mm_connector_tokens")
-            ):
+            if hasattr(self.model, "get_num_mm_connector_tokens"):
                 post_op_counts = [
                     self.model.get_num_mm_connector_tokens(num_tokens)  # type: ignore[attr-defined]
                     for num_tokens in encoder_token_counts
@@ -2915,10 +3828,14 @@ class GPUModelRunner(
     ) -> tuple[list[torch.Tensor], torch.Tensor]:
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
 
+        # Swap to the other buffer to avoid race condition with previous
+        # iteration's async copy that may still be reading from CPU.
+        self.is_mm_embed_idx = 1 - self.is_mm_embed_idx
+        is_mm_embed_buf = self.is_mm_embed_buffers[self.is_mm_embed_idx]
+
         mm_embeds = list[torch.Tensor]()
-        is_mm_embed = torch.zeros(
-            total_num_scheduled_tokens, dtype=torch.bool, device="cpu"
-        )
+        is_mm_embed = is_mm_embed_buf.cpu
+        is_mm_embed[:total_num_scheduled_tokens] = False
 
         req_start_idx = 0
         should_sync_mrope_positions = False
@@ -3000,6 +3917,8 @@ class GPUModelRunner(
 
             mm_embeds.extend(mm_embeds_req)
             req_start_idx += num_scheduled_tokens
+
+        is_mm_embed = is_mm_embed_buf.copy_to_gpu(total_num_scheduled_tokens)
 
         if should_sync_mrope_positions:
             self._calc_mrope_positions(scheduler_output)
@@ -3124,6 +4043,7 @@ class GPUModelRunner(
         num_scheduled_tokens: int,
         num_scheduled_tokens_np: np.ndarray,
         kv_connector_output: KVConnectorOutput | None,
+        managed_context_transfer_output: ManagedContextTransferOutput | None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         num_reqs = self.input_batch.num_reqs
         assert num_reqs == len(self.input_batch.pooling_params), (
@@ -3161,27 +4081,28 @@ class GPUModelRunner(
             req_ids=self.input_batch.req_ids.copy(),
             req_id_to_index=self.input_batch.req_id_to_index.copy(),
             kv_connector_output=kv_connector_output,
+            managed_context_transfer_output=managed_context_transfer_output,
         )
 
         if raw_pooler_output is None or not any(finished_mask):
             model_runner_output.pooler_output = [None] * num_reqs
             return model_runner_output
 
-        if not current_platform.is_cuda_alike():
-            # cpu/xpu runners cannot use the CUDA stream/event-based wrapper.
-            model_runner_output.pooler_output = _copy_pooler_output_to_cpu(
+        if self.use_async_scheduling:
+            return AsyncGPUPoolingModelRunnerOutput(
+                model_runner_output=model_runner_output,
                 raw_pooler_output=raw_pooler_output,
                 finished_mask=finished_mask,
+                async_output_copy_stream=self.async_output_copy_stream,
             )
-            self._sync_device()
-            return model_runner_output
 
-        return AsyncGPUPoolingModelRunnerOutput(
-            model_runner_output=model_runner_output,
+        model_runner_output.pooler_output = _copy_pooler_output_to_cpu(
             raw_pooler_output=raw_pooler_output,
             finished_mask=finished_mask,
-            async_output_copy_stream=self._get_or_create_async_output_copy_stream(),
         )
+        self._sync_device()
+
+        return model_runner_output
 
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
         # Pad tokens to multiple of tensor_parallel_size when
@@ -3812,12 +4733,35 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        managed_context_transfer_output: ManagedContextTransferOutput | None = None
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
-            # Update persistent batch states.
+            # Update persistent batch states. Admission-eviction patches
+            # (block_table splice, position_offset bump, prompt trim)
+            # have already been applied inside `Scheduler.schedule()`,
+            # so the CachedRequestData below carries the post-eviction
+            # state. No worker-side compaction dispatch is needed —
+            # `execute_model` runs a single normal forward.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            managed_context_metadata = (
+                scheduler_output.managed_context_transfer_metadata
+            )
+            if self.managed_context_cpu_transfer_worker is not None:
+                managed_context_transfer_output = (
+                    self.managed_context_cpu_transfer_worker.submit_and_poll(
+                        managed_context_metadata
+                    )
+                )
+            elif (
+                managed_context_metadata is not None
+                and not managed_context_metadata.is_empty()
+            ):
+                raise RuntimeError(
+                    "managed-context CPU transfer metadata received, but "
+                    "KVE_MANAGED_CONTEXT_CPU_OFFLOAD_MAX_BLOCKS is not enabled"
+                )
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -3842,8 +4786,23 @@ class GPUModelRunner(
                     self._dummy_run(1)
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                    if managed_context_transfer_output is None:
+                        return EMPTY_MODEL_RUNNER_OUTPUT
+                    return ModelRunnerOutput(
+                        req_ids=[],
+                        req_id_to_index={},
+                        managed_context_transfer_output=managed_context_transfer_output,
+                    )
+                output = self.kv_connector_no_forward(
+                    scheduler_output, self.vllm_config
+                )
+                if managed_context_transfer_output is not None:
+                    if output is EMPTY_MODEL_RUNNER_OUTPUT:
+                        output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
+                    output.managed_context_transfer_output = (
+                        managed_context_transfer_output
+                    )
+                return output
 
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
@@ -4063,11 +5022,21 @@ class GPUModelRunner(
 
                 if self.is_pooling_model:
                     # Return the pooling output.
+                    if self.managed_context_cpu_transfer_worker is not None:
+                        managed_context_transfer_output = (
+                            _merge_managed_context_transfer_outputs(
+                                managed_context_transfer_output,
+                                self.managed_context_cpu_transfer_worker.submit_and_poll(
+                                    None
+                                ),
+                            )
+                        )
                     return self._pool(
                         hidden_states,
                         num_scheduled_tokens,
                         num_scheduled_tokens_np,
                         kv_connector_output,
+                        managed_context_transfer_output,
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
@@ -4102,6 +5071,14 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+        if self.managed_context_cpu_transfer_worker is not None:
+            managed_context_transfer_output = (
+                _merge_managed_context_transfer_outputs(
+                    managed_context_transfer_output,
+                    self.managed_context_cpu_transfer_worker.submit_and_poll(None),
+                )
+            )
+
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
@@ -4113,6 +5090,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            managed_context_transfer_output,
         )
         self.kv_connector_output = kv_connector_output
 
@@ -4130,19 +5108,39 @@ class GPUModelRunner(
         if self.execute_model_state is None:
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
+            managed_context_transfer_output = None
+            if self.managed_context_cpu_transfer_worker is not None:
+                managed_context_transfer_output = (
+                    self.managed_context_cpu_transfer_worker.submit_and_poll(None)
+                )
             # receive sampled token ids from the last PP rank.
             if self.use_async_scheduling and get_pp_group().world_size > 1:
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
             if not kv_connector_output:
+                if managed_context_transfer_output is not None:
+                    return ModelRunnerOutput(
+                        req_ids=[],
+                        req_id_to_index={},
+                        managed_context_transfer_output=(
+                            managed_context_transfer_output
+                        ),
+                    )
                 return None  # type: ignore[return-value]
 
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             if kv_connector_output.is_empty():
-                return EMPTY_MODEL_RUNNER_OUTPUT
+                if managed_context_transfer_output is None:
+                    return EMPTY_MODEL_RUNNER_OUTPUT
+                output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
+                output.managed_context_transfer_output = (
+                    managed_context_transfer_output
+                )
+                return output
 
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
+            output.managed_context_transfer_output = managed_context_transfer_output
             return output
 
         # Unpack ephemeral state.
@@ -4157,6 +5155,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            managed_context_transfer_output,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -4207,7 +5206,6 @@ class GPUModelRunner(
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
         if spec_config is not None:
-            # Decide whether to run the drafter or zero out draft tokens.
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
                 <= self.effective_drafter_max_model_len
@@ -4222,10 +5220,7 @@ class GPUModelRunner(
                 # as inputs, and does not need to wait for bookkeeping to finish.
                 assert isinstance(
                     self.drafter,
-                    EagleProposer
-                    | DFlashProposer
-                    | DraftModelProposer
-                    | ExtractHiddenStatesProposer,
+                    EagleProposer | DraftModelProposer | ExtractHiddenStatesProposer,
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
@@ -4243,6 +5238,10 @@ class GPUModelRunner(
                     self._copy_valid_sampled_token_count(
                         next_token_ids, valid_sampled_tokens_count
                     )
+                    self._draft_token_ids = torch.zeros(
+                        1, device=self.device, dtype=torch.int32
+                    ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
+                    self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
             elif (
                 spec_config.use_ngram_gpu()
                 and not spec_config.disable_padded_drafter_batch
@@ -4265,19 +5264,14 @@ class GPUModelRunner(
                     self._copy_valid_sampled_token_count(
                         next_token_ids, valid_sampled_tokens_count
                     )
+                    # Since we couldn't run the drafter,
+                    # just use zeros for the draft tokens.
+                    self._draft_token_ids = torch.zeros(
+                        1, device=self.device, dtype=torch.int32
+                    ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
+                    self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
-
-            if not input_fits_in_drafter:
-                # Zero out draft tokens so the scheduler doesn't schedule
-                # stale drafts from the previous step.
-                # For Nemotron-H: it is necessary to zero out the draft tokens,
-                # otherwise the stale tokens will corrupt Mamba recurrent
-                # state and logprobs for sequences near max_model_len.
-                self._draft_token_ids = torch.zeros(
-                    1, device=self.device, dtype=torch.int32
-                ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
-                self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
@@ -4314,6 +5308,13 @@ class GPUModelRunner(
         # self.kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+        if self.managed_context_cpu_transfer_worker is not None:
+            managed_context_transfer_output = (
+                _merge_managed_context_transfer_outputs(
+                    managed_context_transfer_output,
+                    self.managed_context_cpu_transfer_worker.submit_and_poll(None),
+                )
+            )
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
@@ -4333,6 +5334,7 @@ class GPUModelRunner(
                 ec_connector_output=ec_connector_output
                 if self.supports_mm_inputs
                 else None,
+                managed_context_transfer_output=managed_context_transfer_output,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
             )
@@ -4348,7 +5350,7 @@ class GPUModelRunner(
                 sampled_token_ids=sampler_output.sampled_token_ids,
                 logprobs_tensors=sampler_output.logprobs_tensors,
                 invalid_req_indices=invalid_req_indices,
-                async_output_copy_stream=self._get_or_create_async_output_copy_stream(),
+                async_output_copy_stream=self.async_output_copy_stream,
                 vocab_size=self.input_batch.vocab_size,
             )
         with record_function_or_nullcontext(
@@ -4611,14 +5613,8 @@ class GPUModelRunner(
                 next_token_ids, valid_sampled_tokens_count
             )
 
-        elif (
-            spec_config.use_eagle()
-            or spec_config.use_dflash()
-            or spec_config.uses_draft_model()
-        ):
-            assert isinstance(
-                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
-            )
+        elif spec_config.use_eagle() or spec_config.uses_draft_model():
+            assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
 
             if spec_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be
@@ -4872,9 +5868,6 @@ class GPUModelRunner(
             self.vllm_config.compilation_config.mode
             == CompilationMode.STOCK_TORCH_COMPILE
         ):
-            from vllm.env_override import _apply_constrain_to_fx_strides_patch
-
-            _apply_constrain_to_fx_strides_patch()
             backend = self.vllm_config.compilation_config.init_backend(self.vllm_config)
             compilation_counter.stock_torch_compile_count += 1
             self.model.compile(fullgraph=True, backend=backend)
@@ -4919,13 +5912,10 @@ class GPUModelRunner(
             return None
 
         hf_config = self.speculative_config.draft_model_config.hf_config
+        if not hasattr(hf_config, "eagle_aux_hidden_state_layer_ids"):
+            return None
 
-        layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
-        if not layer_ids:
-            dflash_config = getattr(hf_config, "dflash_config", None)
-            if dflash_config and isinstance(dflash_config, dict):
-                layer_ids = dflash_config.get("target_layer_ids")
-
+        layer_ids = hf_config.eagle_aux_hidden_state_layer_ids
         if layer_ids and isinstance(layer_ids, (list, tuple)):
             return tuple(layer_ids)
 
@@ -5369,17 +6359,11 @@ class GPUModelRunner(
         attn_metadata: PerLayerAttnMetadata | None = None
 
         slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-            num_tokens_padded=num_tokens_padded,
+            num_tokens_padded=num_tokens,
             num_reqs_padded=num_reqs_padded,
             num_tokens_unpadded=num_tokens_unpadded,
             ubatch_slices=ubatch_slices_padded,
         )
-
-        # Dummy runs have no real slot assignments — fill with -1 so
-        # concat_and_cache kernels skip the KV write.
-        if slot_mappings_by_group is not None:
-            for sm in slot_mappings_by_group.values():
-                sm.fill_(-1)
 
         # _dummy_run shares pinned CPU buffers (seq_lens, query_start_loc,
         # etc.) with execute_model.  It must participate in the same event
@@ -5518,10 +6502,7 @@ class GPUModelRunner(
             ):
                 assert isinstance(
                     self.drafter,
-                    EagleProposer
-                    | DFlashProposer
-                    | DraftModelProposer
-                    | ExtractHiddenStatesProposer,
+                    EagleProposer | DraftModelProposer | ExtractHiddenStatesProposer,
                 )
                 assert self.speculative_config is not None
                 # Eagle currently only supports PIECEWISE cudagraphs.
@@ -5611,7 +6592,6 @@ class GPUModelRunner(
             top_k=dummy_tensors(logits.size(1) - 1),
             generators={},
             max_num_logprobs=None,
-            logprob_token_ids=None,
             no_penalties=True,
             prompt_token_ids=None,
             frequency_penalties=dummy_tensors(0.1),
@@ -5843,7 +6823,7 @@ class GPUModelRunner(
         )
         self.cache_config.num_gpu_blocks_override = saved_override
 
-        self.initialize_kv_cache(minimal_config, is_profiling=True)
+        self.initialize_kv_cache(minimal_config, register_offload_workers=False)
         self.cache_config.num_gpu_blocks = minimal_config.num_blocks
 
         logger.debug("Initialized minimal KV cache for CUDA graph profiling")
@@ -5883,13 +6863,6 @@ class GPUModelRunner(
                 layer.kv_cache = (
                     torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
                 )
-            # Clean up quantized KV cache scale views
-            # (int8_per_token_head, fp8_per_token_head)
-            if hasattr(layer, "impl"):
-                if hasattr(layer.impl, "_k_scale_cache"):
-                    layer.impl._k_scale_cache = None
-                if hasattr(layer.impl, "_v_scale_cache"):
-                    layer.impl._v_scale_cache = None
 
         gc.collect()
         torch.accelerator.empty_cache()
@@ -6019,7 +6992,7 @@ class GPUModelRunner(
                 SupportsEncoderCudaGraph,
                 supports_encoder_cudagraph,
             )
-            from vllm.v1.worker.encoder_cudagraph import (
+            from vllm.v1.worker.gpu.mm.encoder_cudagraph import (
                 EncoderCudaGraphManager,
             )
 
@@ -6110,7 +7083,6 @@ class GPUModelRunner(
                 skip_eplb=True,
                 remove_lora=False,
                 num_active_loras=desc.num_active_loras,
-                profile_seq_lens=profile_seq_lens,
             )
         self._dummy_run(
             desc.num_tokens,
@@ -6174,11 +7146,7 @@ class GPUModelRunner(
             torch.accelerator.synchronize()
         self.maybe_remove_all_loras(self.lora_config)
 
-    def initialize_attn_backend(
-        self,
-        kv_cache_config: KVCacheConfig,
-        is_profiling: bool = False,
-    ) -> None:
+    def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
         """
         Initialize the attention backends and attention metadata builders.
         """
@@ -6250,9 +7218,7 @@ class GPUModelRunner(
 
         # Resolve cudagraph_mode before actually initialize metadata_builders
         self._check_and_update_cudagraph_mode(
-            attention_backend_list,
-            kv_cache_config.kv_cache_groups,
-            is_profiling=is_profiling,
+            attention_backend_list, kv_cache_config.kv_cache_groups
         )
 
         # Check if attention backend supports PCP&DCP and related features.
@@ -6289,16 +7255,13 @@ class GPUModelRunner(
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
         ):
-            assert isinstance(
-                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
-            )
+            assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
     def _check_and_update_cudagraph_mode(
         self,
         attention_backends: list[set[type[AttentionBackend]]],
         kv_cache_groups: list[KVCacheGroupSpec],
-        is_profiling: bool = False,
     ) -> None:
         """
         Resolve the cudagraph_mode when there are multiple attention
@@ -6307,7 +7270,7 @@ class GPUModelRunner(
         cudagraph_mode.
         """
         min_cg_support = AttentionCGSupport.ALWAYS
-        min_cg_attn_backend = None
+        min_cg_backend_name = None
 
         for attn_backend_set, kv_cache_group in zip(
             attention_backends, kv_cache_groups
@@ -6320,18 +7283,144 @@ class GPUModelRunner(
                 )
                 if cg_support.value < min_cg_support.value:
                     min_cg_support = cg_support
-                    min_cg_attn_backend = attn_backend.__name__
-        cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
-            min_cg_support,
-            min_cg_attn_backend,
-            self.uniform_decode_query_len,
-            self.parallel_config.tensor_parallel_size,
-            self.kv_cache_config,
-            self.max_num_reqs,
-            is_profiling=is_profiling,
-        )
+                    min_cg_backend_name = attn_backend.__name__
+        # Flexible resolve the cudagraph mode
+        cudagraph_mode = self.compilation_config.cudagraph_mode
+        assert cudagraph_mode is not None
+        # check cudagraph for mixed batch is supported
+        if (
+            cudagraph_mode.mixed_mode() == CUDAGraphMode.FULL
+            and min_cg_support != AttentionCGSupport.ALWAYS
+        ):
+            msg = (
+                f"CUDAGraphMode.{cudagraph_mode.name} is not supported "
+                f"with {min_cg_backend_name} backend (support: "
+                f"{min_cg_support})"
+            )
+            if min_cg_support == AttentionCGSupport.NEVER:
+                # if not supported any full cudagraphs, just raise it.
+                msg += (
+                    "; please try cudagraph_mode=PIECEWISE, and "
+                    "make sure compilation mode is VLLM_COMPILE"
+                )
+                raise ValueError(msg)
+
+            # attempt to resolve the full cudagraph related mode
+            if self.compilation_config.splitting_ops_contain_attention():
+                msg += "; setting cudagraph_mode=FULL_AND_PIECEWISE"
+                cudagraph_mode = self.compilation_config.cudagraph_mode = (
+                    CUDAGraphMode.FULL_AND_PIECEWISE
+                )
+            else:
+                msg += "; setting cudagraph_mode=FULL_DECODE_ONLY"
+                cudagraph_mode = self.compilation_config.cudagraph_mode = (
+                    CUDAGraphMode.FULL_DECODE_ONLY
+                )
+            logger.warning(msg)
+
+        # check that if we are doing decode full-cudagraphs it is supported
+        if (
+            cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+            and min_cg_support == AttentionCGSupport.NEVER
+        ):
+            msg = (
+                f"CUDAGraphMode.{cudagraph_mode.name} is not supported "
+                f"with {min_cg_backend_name} backend (support: "
+                f"{min_cg_support})"
+            )
+            if self.compilation_config.mode == CompilationMode.VLLM_COMPILE and (
+                self.compilation_config.splitting_ops_contain_attention()
+                or self.compilation_config.use_inductor_graph_partition
+            ):
+                msg += (
+                    "; setting cudagraph_mode=PIECEWISE because "
+                    "attention is compiled piecewise"
+                )
+                cudagraph_mode = self.compilation_config.cudagraph_mode = (
+                    CUDAGraphMode.PIECEWISE
+                )
+            else:
+                msg += (
+                    "; setting cudagraph_mode=NONE because "
+                    "attention is not compiled piecewise"
+                )
+                cudagraph_mode = self.compilation_config.cudagraph_mode = (
+                    CUDAGraphMode.NONE
+                )
+            logger.warning(msg)
+
+        # check that if we are doing spec-decode + decode full-cudagraphs it is
+        # supported
+        if (
+            cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+            and self.uniform_decode_query_len > 1
+            and min_cg_support.value < AttentionCGSupport.UNIFORM_BATCH.value
+        ):
+            msg = (
+                f"CUDAGraphMode.{cudagraph_mode.name} is not supported"
+                f" with spec-decode for attention backend "
+                f"{min_cg_backend_name} (support: {min_cg_support})"
+            )
+            if self.compilation_config.splitting_ops_contain_attention():
+                msg += "; setting cudagraph_mode=PIECEWISE"
+                cudagraph_mode = self.compilation_config.cudagraph_mode = (
+                    CUDAGraphMode.PIECEWISE
+                )
+            else:
+                msg += "; setting cudagraph_mode=NONE"
+                cudagraph_mode = self.compilation_config.cudagraph_mode = (
+                    CUDAGraphMode.NONE
+                )
+            logger.warning(msg)
+
+        # double check that we can support full cudagraph if they are requested
+        # even after automatic downgrades
+        if (
+            cudagraph_mode.has_full_cudagraphs()
+            and min_cg_support == AttentionCGSupport.NEVER
+        ):
+            raise ValueError(
+                f"CUDAGraphMode.{cudagraph_mode.name} is not "
+                f"supported with {min_cg_backend_name} backend ("
+                f"support:{min_cg_support}) "
+                "; please try cudagraph_mode=PIECEWISE, "
+                "and make sure compilation mode is VLLM_COMPILE"
+            )
+
+        # if we have dedicated decode cudagraphs, and spec-decode is enabled,
+        # we need to adjust the cudagraph sizes to be a multiple of the uniform
+        # decode query length to avoid: https://github.com/vllm-project/vllm/issues/28207
+        # temp-fix: https://github.com/vllm-project/vllm/issues/28207#issuecomment-3504004536
+        # Will be removed in the near future when we have separate cudagraph capture
+        # sizes for decode and mixed prefill-decode.
+        if (
+            cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+            and cudagraph_mode.separate_routine()
+            and self.uniform_decode_query_len > 1
+        ):
+            self.compilation_config.adjust_cudagraph_sizes_for_spec_decode(
+                self.uniform_decode_query_len, self.parallel_config.tensor_parallel_size
+            )
+
+        # If the model has Mamba layers and cudagraph mode includes FULL
+        # decode, cap cudagraph capture sizes to the number of available
+        # Mamba cache blocks. Each decode request needs one conv_state
+        # cache line, so capture batch sizes cannot exceed num_blocks.
+        # Only FULL decode graphs are affected because PIECEWISE captures
+        # run GDN/Mamba ops eagerly (prefill path, no causal_conv1d_update).
+        # See: https://github.com/vllm-project/vllm/issues/34094
+        if cudagraph_mode.has_full_cudagraphs():
+            has_mamba = any(
+                isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_groups
+            )
+            if has_mamba and self.kv_cache_config is not None:
+                self.compilation_config.adjust_cudagraph_sizes_for_mamba_cache(
+                    self.kv_cache_config.num_blocks
+                )
+
         # Trigger cudagraph dispatching keys initialization after
         # resolved cudagraph mode.
+        self.compilation_config.cudagraph_mode = cudagraph_mode
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
             cudagraph_mode, self.uniform_decode_query_len
         )
@@ -6341,10 +7430,7 @@ class GPUModelRunner(
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_extract_hidden_states()
         ):
-            assert isinstance(
-                self.drafter,
-                EagleProposer | DFlashProposer | ExtractHiddenStatesProposer,
-            )
+            assert isinstance(self.drafter, EagleProposer | ExtractHiddenStatesProposer)
             self.drafter.initialize_cudagraph_keys(cudagraph_mode)
 
     def calculate_reorder_batch_threshold(self) -> None:
@@ -6366,46 +7452,6 @@ class GPUModelRunner(
             self.reorder_batch_threshold = None
             return
         self.reorder_batch_threshold = reduce(min_none_high, reorder_batch_thresholds)  # type: ignore[assignment]
-
-    def _set_mm_prefix_range_for_metadata(
-        self,
-        attn_metadata: Any,
-        req_doc_ranges: dict[int, list[tuple[int, int]]],
-    ) -> None:
-        """Set mm_prefix_range for all attention metadata objects.
-
-        This method handles both list and non-list attention metadata,
-        computing mm_prefix_range_tensor once and sharing it across all
-        metadata objects to avoid redundant host-to-device transfers.
-        """
-        from vllm.v1.attention.backends.triton_attn import (
-            TritonAttentionMetadata,
-        )
-
-        # Get all metadata objects from either list or dict structure
-        metadata_list = []
-        if isinstance(attn_metadata, list):
-            for ub_metadata in attn_metadata:
-                metadata_list.extend(ub_metadata.values())
-        else:
-            metadata_list.extend(attn_metadata.values())
-
-        # Set mm_prefix_range for all metadata and compute tensor once
-        shared_tensor = None
-        for metadata in metadata_list:
-            metadata.mm_prefix_range = req_doc_ranges  # type: ignore[attr-defined]
-
-            # Only compute tensor for TritonAttentionMetadata
-            if isinstance(metadata, TritonAttentionMetadata):
-                if shared_tensor is None:
-                    shared_tensor = (
-                        TritonAttentionMetadata.compute_mm_prefix_range_tensor(
-                            req_doc_ranges,
-                            metadata.seq_lens.shape[0],  # type: ignore[attr-defined]
-                            metadata.seq_lens.device,  # type: ignore[attr-defined]
-                        )
-                    )
-                metadata.mm_prefix_range_tensor = shared_tensor
 
     def may_reinitialize_input_batch(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
@@ -6444,6 +7490,11 @@ class GPUModelRunner(
             block_sizes != self._init_block_sizes
             or kernel_block_sizes != self._init_kernel_block_sizes
         ):
+            assert self.offload_config.uva.cpu_offload_gb == 0, (
+                "Cannot re-initialize the input batch when CPU weight "
+                "offloading is enabled. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501
+                "for more details."
+            )
             self._init_block_sizes = block_sizes
             self._init_kernel_block_sizes = kernel_block_sizes
             self.input_batch = InputBatch(
@@ -6612,12 +7663,12 @@ class GPUModelRunner(
                     raise NotImplementedError
 
         if has_attn and has_mamba:
-            self._update_hybrid_attention_mamba_layout(kv_caches, kernel_block_sizes)
+            self._update_hybrid_attention_mamba_layout(kv_caches)
 
         return kv_caches
 
     def _update_hybrid_attention_mamba_layout(
-        self, kv_caches: dict[str, torch.Tensor], kernel_block_sizes: list[int]
+        self, kv_caches: dict[str, torch.Tensor]
     ) -> None:
         """
         Update the layout of attention layers from (2, num_blocks, ...) to
@@ -6625,30 +7676,23 @@ class GPUModelRunner(
 
         Args:
             kv_caches: The KV cache buffer of each layer.
-            kernel_block_sizes: The kernel block sizes for each KV cache group.
         """
 
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
-            if not isinstance(kv_cache_spec, AttentionSpec):
-                continue
-            block_dim = group.backend.get_kv_cache_block_dim(
-                kernel_block_sizes[group.kv_cache_group_id],
-                kv_cache_spec.num_kv_heads,
-                kv_cache_spec.head_size,
-                cache_dtype_str=self.cache_config.cache_dtype,
-            )
-            # block_dim: 0 means (num_blocks, 2, ...); 1 means (2, num_blocks, ...).
-            if block_dim == 0:
-                continue
-            assert block_dim == 1
             for layer_name in group.layer_names:
                 kv_cache = kv_caches[layer_name]
-                hidden_size = kv_cache.shape[2:].numel()
-                kv_cache.as_strided_(
-                    size=kv_cache.shape,
-                    stride=(hidden_size, 2 * hidden_size, *kv_cache.stride()[2:]),
-                )
+                if isinstance(kv_cache_spec, AttentionSpec) and kv_cache.shape[0] == 2:
+                    assert kv_cache.shape[1] != 2, (
+                        "Fail to determine whether the layout is "
+                        "(2, num_blocks, ...) or (num_blocks, 2, ...) for "
+                        f"a tensor of shape {kv_cache.shape}"
+                    )
+                    hidden_size = kv_cache.shape[2:].numel()
+                    kv_cache.as_strided_(
+                        size=kv_cache.shape,
+                        stride=(hidden_size, 2 * hidden_size, *kv_cache.stride()[2:]),
+                    )
 
     def initialize_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
@@ -6736,7 +7780,8 @@ class GPUModelRunner(
     def initialize_kv_cache(
         self,
         kv_cache_config: KVCacheConfig,
-        is_profiling: bool = False,
+        *,
+        register_offload_workers: bool = True,
     ) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
@@ -6749,7 +7794,7 @@ class GPUModelRunner(
         self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
-        self.initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
+        self.initialize_attn_backend(kv_cache_config)
         # The kernel block size for all KV cache groups. For example, if
         # kv_cache_manager uses block_size 256 for a given group, but the attention
         # backends for that group only supports block_size 64, we will return
@@ -6768,6 +7813,21 @@ class GPUModelRunner(
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )
+        # register_offload_workers=False is used by the CUDA-graph memory
+        # profiler's minimal re-init (_init_minimal_kv_cache_for_profiling):
+        # registering there double-allocated and double-cudaHostRegister'ed the
+        # ~hundreds-of-GiB pinned CPU pool (never unregistered), and the second
+        # registration failed with cudaErrorHostMemoryAlreadyRegistered when
+        # mmap reused the freed VA range — the enforce_eager=False boot crash.
+        # The transfer worker is never exercised during profiling, so skipping
+        # is free (and avoids zeroing the huge pool twice at boot).
+        if (
+            self.managed_context_cpu_transfer_worker is not None
+            and register_offload_workers
+        ):
+            self.managed_context_cpu_transfer_worker.register_kv_caches(
+                kv_caches, kv_cache_config
+            )
 
         if (
             self.speculative_config
@@ -6778,7 +7838,7 @@ class GPUModelRunner(
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
 
-        if has_kv_transfer_group() and not is_profiling:
+        if has_kv_transfer_group():
             kv_transfer_group = get_kv_transfer_group()
             if self.cross_layers_kv_cache is not None:
                 assert self.cross_layers_attn_backend is not None

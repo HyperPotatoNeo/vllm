@@ -656,6 +656,30 @@ class AsyncLLM(EngineClient):
                     # 1) Pull EngineCoreOutputs from the EngineCore.
                     outputs = await engine_core.get_output_async()
                     num_outputs = len(outputs.outputs)
+                    if (
+                        os.environ.get("KVE_DIAG_OUTPUT_ORPHANS") == "1"
+                        and outputs.finished_requests
+                    ):
+                        output_req_ids = {
+                            output.request_id for output in outputs.outputs
+                        }
+                        finished_without_output = (
+                            set(outputs.finished_requests) - output_req_ids
+                        )
+                        still_live = (
+                            finished_without_output
+                            & output_processor.request_states.keys()
+                        )
+                        if finished_without_output:
+                            logger.warning(
+                                "[KVE-OUTPUT-ORPHAN-FRONTEND] "
+                                "finished_without_output=%s outputs=%s "
+                                "still_live=%s live_count=%d",
+                                sorted(finished_without_output),
+                                sorted(output_req_ids),
+                                sorted(still_live),
+                                output_processor.get_num_unfinished_requests(),
+                            )
 
                     iteration_stats = (
                         IterationStats() if (log_stats and num_outputs) else None

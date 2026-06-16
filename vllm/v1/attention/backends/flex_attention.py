@@ -372,6 +372,8 @@ class FlexAttentionMetadata:
     sliding_window: int | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     block_sparsity_hint: BlockSparsityHint | None = None
+    compact_replay_death_indices: torch.Tensor | None = None
+    compact_replay_active_reqs: torch.Tensor | None = None
 
     @cached_property
     def logical_block_ids(self):
@@ -415,6 +417,24 @@ class FlexAttentionMetadata:
 
         return is_valid, logical_q_idx, logical_kv_idx
 
+    def _apply_compact_replay_mask(
+        self,
+        q_req: torch.Tensor,
+        logical_q_idx: torch.Tensor,
+        logical_kv_idx: torch.Tensor,
+        base_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        death_indices = self.compact_replay_death_indices
+        active_reqs = self.compact_replay_active_reqs
+        if death_indices is None or active_reqs is None:
+            return base_mask
+        max_kv_idx = death_indices.shape[1] - 1
+        clamped_kv_idx = logical_kv_idx.clamp(min=0, max=max_kv_idx)
+        death_idx = death_indices[q_req, clamped_kv_idx]
+        active = active_reqs[q_req]
+        replay_mask = (~active) | (logical_q_idx < death_idx)
+        return base_mask & replay_mask
+
     def get_paged_mask_mod(self) -> _mask_mod_signature:
         """Creates the mask_mod function for FlexAttention.
 
@@ -438,10 +458,17 @@ class FlexAttentionMetadata:
             (is_valid, logical_q_idx, logical_kv_idx) = (
                 self._convert_physical_to_logical(self.doc_ids, q_idx, physical_kv_idx)
             )
+            base_mask = self.logical_mask_mod(b, h, logical_q_idx, logical_kv_idx)
+            base_mask = self._apply_compact_replay_mask(
+                self.doc_ids[q_idx],
+                logical_q_idx,
+                logical_kv_idx,
+                base_mask,
+            )
             # Apply mask modification only for valid indices
             return torch.where(
                 is_valid,
-                self.logical_mask_mod(b, h, logical_q_idx, logical_kv_idx),
+                base_mask,
                 False,
             )
 

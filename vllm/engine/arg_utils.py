@@ -635,6 +635,23 @@ class EngineArgs:
 
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
+
+    # KV cache compaction
+    compaction_window_size: int = CacheConfig.compaction_window_size
+    compaction_stride: int = CacheConfig.compaction_stride
+    compaction_protected_prefix_tokens: int = CacheConfig.compaction_protected_prefix_tokens
+    compaction_max_turns: int = CacheConfig.compaction_max_turns
+    compaction_eviction_turn_stride: int = CacheConfig.compaction_eviction_turn_stride
+    compaction_turn_end_token_id: int | None = CacheConfig.compaction_turn_end_token_id
+    compaction_assume_aligned_turn_boundaries: bool = (
+        CacheConfig.compaction_assume_aligned_turn_boundaries
+    )
+    compaction_block_aligned_finish: bool = (
+        CacheConfig.compaction_block_aligned_finish
+    )
+    compaction_filler_token_id: int = (
+        CacheConfig.compaction_filler_token_id
+    )
     tokens_only: bool = False
 
     shutdown_timeout: int = 0
@@ -1062,6 +1079,40 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
+        )
+        cache_group.add_argument(
+            "--compaction-window-size", **cache_kwargs["compaction_window_size"]
+        )
+        cache_group.add_argument(
+            "--compaction-stride", **cache_kwargs["compaction_stride"]
+        )
+        cache_group.add_argument(
+            "--compaction-protected-prefix-tokens",
+            **cache_kwargs["compaction_protected_prefix_tokens"],
+        )
+        cache_group.add_argument(
+            "--compaction-max-turns",
+            **cache_kwargs["compaction_max_turns"],
+        )
+        cache_group.add_argument(
+            "--compaction-eviction-turn-stride",
+            **cache_kwargs["compaction_eviction_turn_stride"],
+        )
+        cache_group.add_argument(
+            "--compaction-turn-end-token-id",
+            **cache_kwargs["compaction_turn_end_token_id"],
+        )
+        cache_group.add_argument(
+            "--compaction-assume-aligned-turn-boundaries",
+            **cache_kwargs["compaction_assume_aligned_turn_boundaries"],
+        )
+        cache_group.add_argument(
+            "--compaction-block-aligned-finish",
+            **cache_kwargs["compaction_block_aligned_finish"],
+        )
+        cache_group.add_argument(
+            "--compaction-filler-token-id",
+            **cache_kwargs["compaction_filler_token_id"],
         )
 
         # Model weight offload related configs
@@ -1629,7 +1680,73 @@ class EngineArgs:
             mamba_cache_philox_rounds=self.mamba_cache_philox_rounds,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            compaction_window_size=self.compaction_window_size,
+            compaction_stride=self.compaction_stride,
+            compaction_protected_prefix_tokens=self.compaction_protected_prefix_tokens,
+            compaction_max_turns=self.compaction_max_turns,
+            compaction_eviction_turn_stride=self.compaction_eviction_turn_stride,
+            compaction_turn_end_token_id=self.compaction_turn_end_token_id,
+            compaction_assume_aligned_turn_boundaries=(
+                self.compaction_assume_aligned_turn_boundaries
+            ),
+            compaction_block_aligned_finish=self.compaction_block_aligned_finish,
+            compaction_filler_token_id=self.compaction_filler_token_id,
         )
+
+        # Compaction incompatibility guards.
+        if self.compaction_window_size > 0:
+            assert self.compaction_max_turns == 0, (
+                "KV cache compaction modes are mutually exclusive: "
+                "set either compaction_window_size/compaction_stride for "
+                "token-window FIFO eviction, or compaction_max_turns for "
+                "turn-mode eviction, not both."
+            )
+            # NOTE: prefix caching + compaction is supported as of the
+            # Phase 2 hash-chain rebuild in scheduler._rehash_after_eviction
+            # (plans/prefix_caching_compaction.md). The historical
+            # "incompatible" assertion lived here because the kept blocks'
+            # pre-eviction hashes would otherwise reference now-evicted
+            # parent block hashes — a future request walking a fresh chain
+            # from NONE_HASH would miss every kept block. The rebuild
+            # re-keys surviving blocks under the post-eviction chain so
+            # the cache lookup succeeds again.
+            assert self.pipeline_parallel_size <= 1, (
+                "Pipeline parallelism is incompatible with KV cache compaction"
+            )
+            assert self.compaction_stride > 0, (
+                "compaction_stride must be > 0 when compaction_window_size is set"
+            )
+            assert self.compaction_window_size > self.compaction_stride, (
+                "compaction_window_size must exceed compaction_stride"
+            )
+            assert self.compaction_protected_prefix_tokens >= -1, (
+                "compaction_protected_prefix_tokens must be >= -1 "
+                "(-1 = auto-detect from system message)"
+            )
+        else:
+            assert self.compaction_stride == 0, (
+                "compaction_stride requires compaction_window_size > 0; "
+                "leave compaction_stride at 0 for turn-mode eviction"
+            )
+        # Turn-mode guards. Turn-count eviction computes explicit block ranges
+        # from message boundaries, so it does not require token-window FIFO
+        # compaction to be enabled.
+        if self.compaction_max_turns > 0:
+            assert self.compaction_window_size == 0, (
+                "KV cache compaction modes are mutually exclusive: "
+                "turn-mode eviction requires compaction_window_size=0"
+            )
+            assert self.compaction_stride == 0, (
+                "KV cache compaction modes are mutually exclusive: "
+                "turn-mode eviction requires compaction_stride=0"
+            )
+            assert self.compaction_eviction_turn_stride >= 1, (
+                "compaction_eviction_turn_stride must be >= 1"
+            )
+            assert self.compaction_protected_prefix_tokens in (0, -1), (
+                "compaction_max_turns implies system-prompt protection; "
+                "set compaction_protected_prefix_tokens to 0 or -1"
+            )
 
         ray_runtime_env = None
         if is_ray_initialized():

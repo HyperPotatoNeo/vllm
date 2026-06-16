@@ -15,6 +15,7 @@ reason about temporal order.
 """
 
 import math
+import sys
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Annotated, Any, Literal
 
@@ -64,12 +65,7 @@ from vllm.multimodal.processing.processor import (
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
-from .interfaces import (
-    MultiModalEmbeddings,
-    SupportsEagle3,
-    SupportsMultiModal,
-    SupportsPP,
-)
+from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -484,10 +480,12 @@ class Gemma4MultiModalProcessor(BaseMultiModalProcessor[Gemma4ProcessingInfo]):
             val = merged_kwargs.get("images_kwargs", {}).get("max_soft_tokens")
 
         if val is not None and val not in _SUPPORTED_SOFT_TOKENS:
-            raise ValueError(
-                f"Unsupported max_soft_tokens value: {val}. "
-                f"Valid values are {_SUPPORTED_SOFT_TOKENS}."
+            logger.error(
+                "Unsupported max_soft_tokens value: %d. Valid values are %s. Exiting.",
+                val,
+                _SUPPORTED_SOFT_TOKENS,
             )
+            sys.exit(1)
 
         mm_data = dict(mm_data)
 
@@ -850,12 +848,7 @@ class Gemma4MultimodalEmbedder(nn.Module):
     info=Gemma4ProcessingInfo,
     dummy_inputs=Gemma4DummyInputsBuilder,
 )
-class Gemma4ForConditionalGeneration(
-    nn.Module,
-    SupportsMultiModal,
-    SupportsPP,
-    SupportsEagle3,
-):
+class Gemma4ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",

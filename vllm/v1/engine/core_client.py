@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import contextlib
+import multiprocessing
 import queue
 import sys
 import uuid
@@ -35,7 +36,6 @@ from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
     EEPNotificationType,
     EngineCoreOutputs,
-    EngineCoreReadyResponse,
     EngineCoreRequest,
     EngineCoreRequestType,
     PauseMode,
@@ -590,9 +590,8 @@ class MPClient(EngineCoreClient):
                         f"timeout, set the environment variable: "
                         f"VLLM_ENGINE_READY_TIMEOUT_S=<seconds>"
                     )
-                identity, payload = sync_input_socket.recv_multipart()
+                identity, _ = sync_input_socket.recv_multipart()
                 identities.remove(identity)
-                self._apply_ready_response(payload)
 
             self.core_engine: EngineIdentity = self.core_engines[0]
             self.utility_results: dict[int, AnyFuture] = {}
@@ -641,20 +640,38 @@ class MPClient(EngineCoreClient):
     def start_engine_core_monitor(self):
         """Start a monitor thread for engine core processes."""
         engine_manager = self.resources.engine_manager
-        if engine_manager is None:
+        if (
+            engine_manager is None
+            or not hasattr(engine_manager, "processes")
+            or not engine_manager.processes
+        ):
             # No engine processes to monitor
             return
 
+        engine_processes = engine_manager.processes
         self_ref = weakref.ref(self)
 
         # Monitor engine core process liveness. If any die unexpectedly,
-        # marks the engine as dead, and shuts down the client.
+        # logs an error, shuts down the client and invokes the failure
+        # callback to inform the engine.
         def monitor_engine_cores():
-            engine_manager.monitor_engine_liveness()
+            sentinels = [proc.sentinel for proc in engine_processes]
+            died = multiprocessing.connection.wait(sentinels)
             _self = self_ref()
             if not _self or not _self._finalizer.alive or _self.resources.engine_dead:
                 return
             _self.resources.engine_dead = True
+            dead_proc = next(
+                proc for proc in engine_processes if proc.sentinel == died[0]
+            )
+            dead_proc.join(timeout=0)
+            logger.error(
+                "Engine core proc %s pid=%s exitcode=%s died unexpectedly, "
+                "shutting down client.",
+                dead_proc.name,
+                dead_proc.pid,
+                dead_proc.exitcode,
+            )
             _self.shutdown()
             # Note: For MPClient, we don't have a failure callback mechanism
             # like MultiprocExecutor, but we set engine_dead flag which will
@@ -663,32 +680,6 @@ class MPClient(EngineCoreClient):
         Thread(
             target=monitor_engine_cores, daemon=True, name="MPClientEngineMonitor"
         ).start()
-
-    def _apply_ready_response(self, payload: bytes) -> None:
-        """Decode an EngineCoreReadyResponse and sync any post-initialization
-        config changes (e.g. auto-fitted max_model_len) back to the frontend."""
-        if not payload:
-            return
-        vllm_config = self.vllm_config
-        response = msgspec.msgpack.decode(payload, type=EngineCoreReadyResponse)
-        vllm_config.model_config.max_model_len = min(
-            vllm_config.model_config.max_model_len, response.max_model_len
-        )
-
-        # Setup KV cache config with initialization state from
-        # engine core process. Sum values from all engines in DP case.
-        num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks or 0
-        num_gpu_blocks += response.num_gpu_blocks
-        vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
-
-        # In external DP LB mode, the coordinator address that the
-        # front-end procs connect to is obtained by each engine via it's
-        # initial handshake with the rank 0 front-end.
-        if response.dp_stats_address is not None:
-            if self.stats_update_address is None:
-                self.stats_update_address = response.dp_stats_address
-            else:
-                assert response.dp_stats_address == self.stats_update_address
 
 
 def _process_utility_output(
@@ -1610,9 +1601,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     f"timeout, set the environment variable: "
                     f"VLLM_ENGINE_READY_TIMEOUT_S=<seconds>"
                 )
-            identity, payload = sync_input_socket.recv_multipart()
+            identity, _ = sync_input_socket.recv_multipart()
             new_engine_identities.discard(identity)
-            self._apply_ready_response(payload)
 
         # NOTE(yongji): Before we schedule any requests on the new workers,
         # we should wait for them to switch to the new setup.
@@ -1648,9 +1638,6 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         parallel_config = self.vllm_config.parallel_config
         ip, coord_store_port = self._setup_elastic_ep_reconfig_bootstrap()
 
-        removed_dp_size = cur_data_parallel_size - new_data_parallel_size
-        assert isinstance(self.resources.engine_manager, CoreEngineActorManager)
-        self.resources.engine_manager.remove_run_refs_for_scale_down(removed_dp_size)
         reconfig_futures = []
         for cur_dp_rank, engine in enumerate(self.core_engines):
             reconfig_request = ReconfigureDistributedRequest(

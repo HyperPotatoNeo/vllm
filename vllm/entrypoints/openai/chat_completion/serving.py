@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -34,6 +35,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse,
     ChatMessage,
+    CompactionEventPayload,
 )
 from vllm.entrypoints.openai.chat_completion.stream_harmony import (
     TokenState,
@@ -1606,6 +1608,116 @@ class OpenAIServingChat(OpenAIServing):
 
         request_metadata.final_usage_info = usage
 
+        # KV cache compaction events (vLLM compaction extension). The output
+        # processor attached these to final_res; convert from the internal
+        # msgspec struct to the pydantic response model. None when compaction
+        # is disabled or no events fired for this request.
+        compaction_events_payload = None
+        compaction_events = getattr(final_res, "compaction_events", None)
+        if compaction_events:
+            replay_mode = os.environ.get(
+                "KVE_COMPACT_REPLAY_REFILL_MODE", ""
+            ).strip().lower()
+            include_evicted_token_ids = (
+                os.environ.get("KVE_OPENAI_INCLUDE_EVICTED_TOKEN_IDS", "0")
+                == "1"
+                or replay_mode not in ("", "0", "false", "no", "off")
+                or os.environ.get(
+                    "KVE_MANAGED_CONTEXT_REPLAY_ONLY_ARCHIVE", "0"
+                ).strip().lower()
+                in ("1", "true", "yes", "on")
+                or os.environ.get(
+                    "KVE_MANAGED_CONTEXT_SKIP_CPU_ARCHIVE_FOR_REPLAY", "0"
+                ).strip().lower()
+                in ("1", "true", "yes", "on")
+            )
+            compaction_events_payload = [
+                CompactionEventPayload(
+                    num_output_tokens_at_compaction=e.num_output_tokens_at_compaction,
+                    tokens_evicted=e.tokens_evicted,
+                    position_offset_after=e.position_offset_after,
+                    num_prompt_tokens=e.num_prompt_tokens,
+                    evict_start=e.evict_start,
+                    evicted_token_ids=(
+                        list(getattr(e, "evicted_token_ids", []) or [])
+                        if include_evicted_token_ids
+                        else []
+                    ),
+                    last_turn_evicted=int(
+                        getattr(e, "last_turn_evicted", -1)
+                    ),
+                    num_turns_evicted_after=int(
+                        getattr(e, "num_turns_evicted_after", 0)
+                    ),
+                    kept_indices=list(e.kept_indices),
+                    kept_token_ids=list(e.kept_token_ids),
+                    new_user_fragment_len=int(
+                        getattr(e, "new_user_fragment_len", 0) or 0
+                    ),
+                    archived_span_ids=[
+                        str(x) for x in getattr(e, "archived_span_ids", []) or []
+                    ],
+                    writer_len_at_compaction=int(
+                        getattr(e, "writer_len_at_compaction", 0) or 0
+                    ),
+                    archived_span_bounds=[
+                        int(x)
+                        for x in getattr(e, "archived_span_bounds", []) or []
+                    ],
+                    event_kind=int(getattr(e, "event_kind", 0) or 0),
+                    restored_span_ids=[
+                        str(x)
+                        for x in getattr(e, "restored_span_ids", []) or []
+                    ],
+                    visibility_boundary_computed=int(
+                        getattr(e, "visibility_boundary_computed", -1)
+                    ),
+                    restored_span_token_ids=[
+                        int(x)
+                        for x in getattr(e, "restored_span_token_ids", []) or []
+                    ],
+                    restored_span_pos_start=int(
+                        getattr(e, "restored_span_pos_start", -1)
+                    ),
+                    evicted_ranges=[
+                        int(x) for x in getattr(e, "evicted_ranges", []) or []
+                    ],
+                    selection_candidate_turn_indices=[
+                        int(x)
+                        for x in getattr(
+                            e, "selection_candidate_turn_indices", []
+                        )
+                        or []
+                    ],
+                    selection_kept_turn_indices=[
+                        int(x)
+                        for x in getattr(e, "selection_kept_turn_indices", [])
+                        or []
+                    ],
+                    selection_evicted_turn_indices=[
+                        int(x)
+                        for x in getattr(e, "selection_evicted_turn_indices", [])
+                        or []
+                    ],
+                )
+                for e in compaction_events
+            ]
+
+        # KV cache compaction auto-pad: filler token ids appended by vLLM
+        # at finish-time so the trailing block lands in the prefix cache.
+        # The orchestrator needs these for trainer K-cache layout alignment
+        # AND to include in the next call's submitted prompt (so vLLM's
+        # prefix cache hits the padded blocks).
+        padding_token_ids_payload = (
+            list(getattr(final_res, "padding_token_ids", None) or []) or None
+        )
+
+        # Managed-context recall movement verdict (vLLM extension). Already a
+        # plain dict (or None) on final_res; pass it straight through.
+        managed_context_restore_kind_payload = getattr(
+            final_res, "managed_context_restore_kind", None
+        )
+
         response = ChatCompletionResponse(
             id=request_id,
             created=created_time,
@@ -1617,6 +1729,9 @@ class OpenAIServingChat(OpenAIServing):
                 final_res.prompt_token_ids if request.return_token_ids else None
             ),
             kv_transfer_params=final_res.kv_transfer_params,
+            compaction_events=compaction_events_payload,
+            padding_token_ids=padding_token_ids_payload,
+            managed_context_restore_kind=managed_context_restore_kind_payload,
         )
 
         # Log complete response if output logging is enabled

@@ -392,6 +392,7 @@ class EngineCore:
             return {}, False
         scheduler_output = self.scheduler.schedule()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.log_error_detail(scheduler_output),
@@ -1037,6 +1038,18 @@ class EngineCoreProc(EngineCore):
     @staticmethod
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         """Launch EngineCore busy loop in background process."""
+
+        # On-demand stack dump for hang diagnosis: `kill -USR1 <engine pid>`
+        # writes all thread tracebacks to stderr without disturbing the
+        # process (ptrace is unavailable in restricted environments).
+        try:
+            import faulthandler
+
+            # chain=False: with no prior handler, chaining re-raises the
+            # default SIGUSR1 action and terminates the process post-dump.
+            faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+        except Exception:
+            pass
 
         # Ensure we can serialize transformer config after spawning
         maybe_register_config_serialize_by_value()

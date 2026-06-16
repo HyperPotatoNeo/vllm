@@ -94,6 +94,66 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     token_ids: list[int] | None = None
 
 
+class CompactionEventPayload(OpenAIBaseModel):
+    """JSON-serializable view of a vLLM KV cache compaction event.
+
+    Mirrors vllm.v1.core.compaction.types.CompactionEvent. Defined here as a
+    Pydantic model so the OpenAI HTTP response remains a pure pydantic tree.
+    """
+
+    num_output_tokens_at_compaction: int
+    tokens_evicted: int
+    position_offset_after: int
+    num_prompt_tokens: int = 0
+    evict_start: int = 0
+    evicted_token_ids: list[int] = Field(default_factory=list)
+    last_turn_evicted: int = -1
+    num_turns_evicted_after: int = 0
+    # Indices (pre-event coords) of tokens that physically survive this
+    # eviction. Length = pre-event token count - tokens_evicted. The
+    # orchestrator uses kept_token_ids (below) to assemble the next
+    # turn's prompt as [sys, kept, u_new] for prefix-cache hits; the
+    # trainer uses kept_indices to splice its KV without re-deriving
+    # the eviction range from scalar fields.
+    kept_indices: list[int] = Field(default_factory=list)
+    kept_token_ids: list[int] = Field(default_factory=list)
+    # Length of the new_user_fragment in this admission event — the
+    # tail of the prompt that lies AFTER the last completed turn.
+    # Used by the trainer's segmented_forward mirror to split each
+    # admission boundary into pre- and post-fragment segments.
+    new_user_fragment_len: int = 0
+    # Managed-context extension: scheduler-local IDs for archived KV spans
+    # captured during this eviction. Empty unless managed context is enabled.
+    archived_span_ids: list[str] = Field(default_factory=list)
+    # Length of the untrimmed writer timeline when this eviction fired.
+    # Used by full replay to reproduce the original compact attention mask.
+    writer_len_at_compaction: int = 0
+    # Per-span [start, end) bounds for archived_span_ids, flattened pairs in
+    # the same pre-event frame as evict_start/kept_indices. Length is
+    # 2 * len(archived_span_ids).
+    archived_span_bounds: list[int] = Field(default_factory=list)
+    # Managed-context restore lifecycle: 0 = eviction, 1 = restore attach,
+    # 2 = restore release. Kind 1/2 events carry restored_span_ids and
+    # visibility_boundary_computed; eviction fields are zeros/defaults.
+    event_kind: int = 0
+    restored_span_ids: list[str] = Field(default_factory=list)
+    # num_computed_tokens (current frame) at the visibility change; queries
+    # at positions >= this boundary see / stop seeing the restored spans.
+    # -1 on eviction events.
+    visibility_boundary_computed: int = -1
+    # kind 1 recall token-surfacing: the single restored span's token ids and
+    # the absolute position of its first token (rest contiguous). Lets a
+    # trainer reconstruct a recalled span whose birth turn is not in-sample.
+    restored_span_token_ids: list[int] = Field(default_factory=list)
+    restored_span_pos_start: int = -1
+    # KV-selection extension: explicit pre-event token ranges and turn ids for
+    # sparse complete-turn selection. Empty for legacy contiguous eviction.
+    evicted_ranges: list[int] = Field(default_factory=list)
+    selection_candidate_turn_indices: list[int] = Field(default_factory=list)
+    selection_kept_turn_indices: list[int] = Field(default_factory=list)
+    selection_evicted_turn_indices: list[int] = Field(default_factory=list)
+
+
 class ChatCompletionResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
     object: Literal["chat.completion"] = "chat.completion"
@@ -109,6 +169,35 @@ class ChatCompletionResponse(OpenAIBaseModel):
     prompt_token_ids: list[int] | None = None
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
+    )
+    # KV cache compaction events (vLLM extension). Populated only when the
+    # scheduler is running with --compaction-window-size > 0 and at least one
+    # eviction fired for this request. Consumed by the kv-eviction trainer
+    # to compute segment boundaries for segmented_forward.
+    compaction_events: list[CompactionEventPayload] | None = Field(
+        default=None,
+        description="KV cache compaction events (vLLM compaction extension).",
+    )
+    # Managed-context recall movement verdict (vLLM extension). Populated only
+    # when this request triggered a managed-context recall. Tells the client
+    # whether the recall pulled KV from CPU (H2D move) or found it GPU-resident.
+    managed_context_restore_kind: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Managed-context recall movement verdict: "
+            "{kind, spans, resident, h2d} (vLLM compaction extension)."
+        ),
+    )
+    # KV cache compaction auto-pad filler token ids appended by vLLM at
+    # finish-time. Empty/None when auto-pad did not fire. Consumed by the
+    # kv-eviction orchestrator/trainer for K-cache layout alignment and
+    # prefix-cache hit on the next call's submitted prompt.
+    padding_token_ids: list[int] | None = Field(
+        default=None,
+        description=(
+            "Auto-pad filler token ids appended to the KV cache at finish "
+            "(vLLM compaction extension)."
+        ),
     )
 
 
@@ -353,6 +442,24 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "token patterns, stopping only when they hit the maximum output length "
         "(e.g. 'abcdabcdabcd...' or '\\emoji \\emoji \\emoji ...'). This feature "
         "can detect such behavior and terminate early, saving time and tokens.",
+    )
+
+    # vLLM extension — kv-eviction block-aligned message padding. When set,
+    # the server SKIPS apply_chat_template and feeds these token ids directly
+    # to the engine. `messages` is still consulted for tool-call / reasoning
+    # metadata (conversation object) but is not re-rendered. Intended for
+    # clients that need byte-exact control over the prompt token stream
+    # (e.g. block-aligned padding for turn-based KV compaction, so that
+    # `<|im_end|>` lands on a block_size boundary and turn eviction is
+    # exact rather than inward-snapped).
+    prompt_token_ids: list[int] | None = Field(
+        default=None,
+        description=(
+            "If set, the server bypasses chat template rendering and uses "
+            "these token ids as the prompt verbatim. `messages` is still "
+            "read for tool-call parser metadata. vLLM extension for clients "
+            "requiring byte-exact prompt control."
+        ),
     )
 
     # --8<-- [end:chat-completion-extra-params]

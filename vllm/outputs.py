@@ -121,6 +121,9 @@ class RequestOutput:
         num_cached_tokens: int | None = None,
         *,
         kv_transfer_params: dict[str, Any] | None = None,
+        compaction_events: list[Any] | None = None,
+        padding_token_ids: list[int] | None = None,
+        managed_context_restore_kind: dict | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -141,12 +144,46 @@ class RequestOutput:
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.kv_transfer_params = kv_transfer_params
+        # KV cache compaction events from the scheduler, forwarded through the
+        # output processor. None when compaction is disabled or no events have
+        # fired for this request. Typed as list[Any] here to avoid importing
+        # the msgspec struct and creating a dependency cycle; callers cast to
+        # list[CompactionEvent] when needed.
+        self.compaction_events = compaction_events
+        # KV cache compaction auto-pad: filler token ids that vLLM appended to
+        # this request's KV cache at finish-time (so the trailing block lands
+        # in the prefix cache). These tokens were NOT sampled — exclude from
+        # the visible completion text. The orchestrator forwards them to the
+        # trainer so its persistent KV cache layout matches vLLM's, and to
+        # the next call's submitted prompt so vLLM's prefix cache hits the
+        # padded blocks.
+        self.padding_token_ids = padding_token_ids
+        # Managed-context recall movement verdict (or None). Pure metadata,
+        # echoed to the client for the [MANAGED-CONTEXT-CLIENT-RESTORE] log.
+        self.managed_context_restore_kind = managed_context_restore_kind
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
 
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
+        # Overwrite compaction_events: the scheduler sends the full cumulative
+        # list each step, so the newest output always has the most complete
+        # view. Only overwrite when the incoming has a value; otherwise keep
+        # whatever we already accumulated (avoids dropping events on a later
+        # delta that doesn't include them).
+        if next_output.compaction_events is not None:
+            self.compaction_events = next_output.compaction_events
+        if getattr(next_output, "managed_context_restore_kind", None) is not None:
+            self.managed_context_restore_kind = (
+                next_output.managed_context_restore_kind
+            )
+        # Same overwrite-on-non-None rule for auto-pad filler: the finalize
+        # output carries it, and losing it in a coalesced merge breaks the
+        # session client's stream-offset math (coalescing only happens under
+        # consumer lag — invisible at low concurrency, routine at 64c).
+        if next_output.padding_token_ids is not None:
+            self.padding_token_ids = next_output.padding_token_ids
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):

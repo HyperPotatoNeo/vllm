@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -116,6 +117,9 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        compaction_window_size: int = 0,
+        compaction_stride: int = 0,
+        compaction_max_turns: int = 0,
     ) -> None:
         self.max_model_len = max_model_len
 
@@ -138,6 +142,9 @@ class KVCacheManager:
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
+            compaction_window_size=compaction_window_size,
+            compaction_stride=compaction_stride,
+            compaction_max_turns=compaction_max_turns,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -173,7 +180,9 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
-    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
+    def get_computed_blocks(
+        self, request: Request
+    ) -> tuple[KVCacheBlocks, int, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
@@ -184,13 +193,19 @@ class KVCacheManager:
             A tuple containing:
                 - A list of blocks that are computed for the request.
                 - The number of computed tokens.
+                - The inherited position_offset (0 if no offset inheritance).
+                  When >0, this request inherited blocks from a post-admission
+                  writer; the request's position_offset has been seeded to
+                  this value so inference's piecewise rule rotates Q at the
+                  writer's frame. Caller (scheduler) should emit a synthetic
+                  CompactionEvent so the trainer mirror also uses this frame.
         """
         # We skip finding the prefix cache hit when prefix caching is
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
         if not self.enable_caching or request.skip_reading_prefix_cache:
-            return self.empty_kv_cache_blocks, 0
+            return self.empty_kv_cache_blocks, 0, 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
         # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
@@ -199,11 +214,40 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
-        computed_blocks, num_new_computed_tokens = (
+        computed_blocks, num_new_computed_tokens, inherited_offset = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
             )
         )
+
+        # Seed the inheritor's position_offset from the writer's frame
+        # (see plans/piecewise_position_offset.md / feedback-full-prefix-
+        # caching-required). When prefix cache returns blocks written
+        # post-admission (logical_start > block_idx * block_size), the
+        # inheritor's Q must rotate at the writer's offset frame so the
+        # cached K rotations align. The piecewise GPU formula
+        # (`physical + position_offset * is_post_sys`) then naturally
+        # rotates Q correctly without re-prefilling the inherited tail.
+        if inherited_offset > 0:
+            # A WAITING request can be deferred after this seed and later
+            # rediscover a different cached frame after pressure/load churn.
+            # Use the frame returned by the current prefix-cache hit.
+            if request.position_offset not in (0, inherited_offset):
+                logger.warning(
+                    "[DIAG-INHERIT-RESEED] req=%s position_offset=%d -> %d",
+                    request.request_id[:8],
+                    request.position_offset,
+                    inherited_offset,
+                )
+            request.position_offset = inherited_offset
+            if os.environ.get("KV_EVICTION_BUG_TRACE") == "1":
+                logger.warning(
+                    "[DIAG-INHERIT-SEED] req=%s seeded position_offset=%d "
+                    "from %d cached blocks (inheritor will reuse writer's "
+                    "frame; no re-prefill)",
+                    request.request_id[:8], inherited_offset,
+                    num_new_computed_tokens // (request.num_tokens // max(1, len(request.block_hashes))),
+                )
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -213,7 +257,28 @@ class KVCacheManager:
                 preempted=request.num_preemptions > 0,
             )
 
-        return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+        # Phase 2/4 verification log — shows cache hit count per request
+        # at admission. Gated on VLLM_COMPACTION_VERBOSE to avoid spam in
+        # production; compaction_debug.py sets this. The hit count is in
+        # POST-eviction frame (the request hasn't been admission-compacted
+        # yet on this call, so what we report is what the client's prompt
+        # actually matched against the existing cache map).
+        if os.environ.get("VLLM_COMPACTION_VERBOSE"):
+            logger.warning(
+                "[PREFIX-HIT] req=%s prompt=%d cached=%d (%.1f%%) "
+                "to_prefill=%d",
+                request.request_id[:8],
+                request.num_tokens,
+                num_new_computed_tokens,
+                100.0 * num_new_computed_tokens / max(1, request.num_tokens),
+                request.num_tokens - num_new_computed_tokens,
+            )
+
+        return (
+            self.create_kv_cache_blocks(computed_blocks),
+            num_new_computed_tokens,
+            inherited_offset,
+        )
 
     def can_fit_full_sequence(
         self,
@@ -406,6 +471,7 @@ class KVCacheManager:
             num_tokens_need_slot,
             num_tokens_main_model,
             num_encoder_tokens,
+            request_position_offset=request.position_offset,
         )
 
         # P/D: delay caching blocks if we have to recv from

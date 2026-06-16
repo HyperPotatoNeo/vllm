@@ -220,6 +220,12 @@ def build_app(
 
         elastic_ep_attach_router(app)
 
+        from vllm.entrypoints.openai.session.api_router import (
+            attach_router as attach_session_router,
+        )
+
+        attach_session_router(app)
+
     if "generate" in supported_tasks or "render" in supported_tasks:
         from vllm.entrypoints.serve.render.api_router import (
             attach_router as attach_render_router,
@@ -400,6 +406,10 @@ async def init_app_state(
         await init_generate_state(
             engine_client, state, args, request_logger, supported_tasks
         )
+
+        from vllm.entrypoints.openai.session.api_router import init_session_state
+
+        init_session_state(engine_client, state, args)
 
     if "transcription" in supported_tasks:
         from vllm.entrypoints.openai.speech_to_text.api_router import (
