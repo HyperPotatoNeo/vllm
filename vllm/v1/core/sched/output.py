@@ -36,9 +36,18 @@ class NewRequestData:
     pooling_params: PoolingParams | None
     block_ids: tuple[list[int], ...]
     num_computed_tokens: int
+    num_prefix_cached_tokens: int
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
     attention_matching_protected_prompt_len: int = 0
+    position_offset: int = 0
+    attention_matching_synthetic_prefix_len: int = 0
+    attention_matching_snapshot_version: int | None = None
+    attention_matching_prefix_cache_key: str | None = None
+    attention_matching_prefix_cache_key_start: int = 0
+    attention_matching_cow_src_block_ids: list[int] = field(default_factory=list)
+    attention_matching_cow_dst_block_ids: list[int] = field(default_factory=list)
+    cache_salt: str | None = None
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
@@ -58,11 +67,36 @@ class NewRequestData:
             pooling_params=request.pooling_params,
             block_ids=block_ids,
             num_computed_tokens=request.num_computed_tokens,
+            num_prefix_cached_tokens=(
+                0
+                if request.skip_reading_prefix_cache
+                else max(request.num_cached_tokens, 0)
+            ),
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             attention_matching_protected_prompt_len=(
                 request.attention_matching_protected_prompt_len
             ),
+            position_offset=request.position_offset,
+            attention_matching_synthetic_prefix_len=(
+                request.attention_matching_synthetic_prefix_len
+            ),
+            attention_matching_snapshot_version=(
+                request.attention_matching_snapshot_version
+            ),
+            attention_matching_prefix_cache_key=(
+                request.attention_matching_prefix_cache_key
+            ),
+            attention_matching_prefix_cache_key_start=(
+                request.attention_matching_prefix_cache_key_start
+            ),
+            attention_matching_cow_src_block_ids=list(
+                request.attention_matching_cow_src_block_ids
+            ),
+            attention_matching_cow_dst_block_ids=list(
+                request.attention_matching_cow_dst_block_ids
+            ),
+            cache_salt=request.cache_salt,
             prefill_token_ids=prefill_token_ids,
         )
 
@@ -79,6 +113,7 @@ class NewRequestData:
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
+            f"num_prefix_cached_tokens={self.num_prefix_cached_tokens},"
             f"lora_request={self.lora_request},"
             f"prompt_embeds_shape={prompt_embeds_shape}"
             ")"
@@ -104,6 +139,7 @@ class NewRequestData:
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
+            f"num_prefix_cached_tokens={self.num_prefix_cached_tokens},"
             f"lora_request={self.lora_request},"
             f"prompt_embeds_shape={prompt_embeds_shape}"
             ")"
@@ -137,6 +173,23 @@ class CachedRequestData:
     # replaying the logical prompt.
     attention_matching_restore_req_ids: set[str] = field(default_factory=set)
     attention_matching_snapshot_versions: dict[str, int] = field(
+        default_factory=dict
+    )
+    attention_matching_prefix_cache_keys: dict[str, str] = field(
+        default_factory=dict
+    )
+    attention_matching_prefix_cache_key_starts: dict[str, int] = field(
+        default_factory=dict
+    )
+    # Requests scheduled only to fill hidden AM prefix-cache tail blocks should
+    # not run another AM compaction during that filler-only worker step.
+    attention_matching_suppress_compaction_req_ids: set[str] = field(
+        default_factory=set
+    )
+    attention_matching_cow_src_block_ids: dict[str, list[int]] = field(
+        default_factory=dict
+    )
+    attention_matching_cow_dst_block_ids: dict[str, list[int]] = field(
         default_factory=dict
     )
 

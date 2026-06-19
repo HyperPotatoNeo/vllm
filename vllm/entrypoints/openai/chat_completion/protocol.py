@@ -104,6 +104,26 @@ class CompactionEventPayload(OpenAIBaseModel):
     num_output_tokens_at_compaction: int
     tokens_evicted: int
     position_offset_after: int
+    num_prompt_tokens: int = 0
+    evict_start: int = 0
+    compaction_strategy: str = "fifo"
+    source_len: int = 0
+    target_len: int = 0
+    protected_prefix_len: int = 0
+    synthetic_prefix_len: int = 0
+    exact_kept_tokens: int = 0
+    attention_matching_query_source: str = ""
+    attention_matching_max_queries_per_kv_head: int = 0
+    attention_matching_query_seed: int = 0
+    attention_matching_zerobeta: bool = False
+    attention_matching_pre_sample: bool = False
+    attention_matching_replay_steps: list[dict[str, Any]] | None = None
+    attention_matching_cache_hit_tokens: int = 0
+    attention_matching_selected_indices: list[list[list[int]]] | None = None
+    attention_matching_forget_gate_enabled: bool = False
+    attention_matching_forget_gate_alpha: float = 0.5
+    attention_matching_forget_gate_applied: bool = False
+    attention_matching_hidden_tail_token_ids: list[int] | None = None
 
 
 class ShuffleEventPayload(OpenAIBaseModel):
@@ -361,6 +381,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "only in the first chunk, and token_ids contains the delta tokens "
             "for each chunk. This is useful for debugging or when you "
             "need to map generated text back to input tokens."
+        ),
+    )
+    prompt_token_ids: list[int] | None = Field(
+        default=None,
+        description=(
+            "vLLM extension: when set, these token IDs are used as the exact "
+            "engine prompt instead of the chat-template-rendered token IDs. "
+            "This is used by kv-eviction to send block-aligned padded prompts "
+            "while retaining the original chat messages for response handling."
         ),
     )
 

@@ -247,6 +247,18 @@ class SingleTypeKVCacheManager(ABC):
         self.new_block_ids = []
         return ids
 
+    def finalize_attention_matching_compaction(
+        self,
+        request_id: str,
+        new_num_computed_tokens: int,
+    ) -> int:
+        """Synchronize non-AM cache groups after an AM sequence shrink.
+
+        Full-attention AM managers rewrite KV directly and override this via
+        their own finalize path. Other cache groups are unchanged by default.
+        """
+        return 0
+
     def cache_blocks(self, request: Request, num_tokens: int) -> None:
         """
         Cache the blocks for the request.
@@ -1001,6 +1013,73 @@ class MambaManager(SingleTypeKVCacheManager):
                 req_blocks.extend(new_blocks)
                 self._allocated_block_reqs.add(request_id)
                 return req_blocks[prev_block_len:]
+
+    def finalize_attention_matching_compaction(
+        self,
+        request_id: str,
+        new_num_computed_tokens: int,
+    ) -> int:
+        """Move the exact recurrent state to the compacted sequence tail.
+
+        Attention matching rewrites only full-attention KV. Hybrid recurrent
+        layers keep the exact old-context state; after the visible sequence is
+        shortened, the scheduler's Mamba block table must still point at that
+        exact state from the new final state slot.
+        """
+        if self.mamba_cache_mode != "align":
+            return 0
+        req_blocks = self.req_to_blocks.get(request_id)
+        if not req_blocks:
+            return 0
+
+        num_required_blocks = (
+            cdiv(new_num_computed_tokens, self.block_size)
+            + self.num_speculative_blocks
+        )
+        if num_required_blocks >= len(req_blocks):
+            return 0
+        if num_required_blocks <= self.num_speculative_blocks:
+            raise RuntimeError(
+                "attention_matching cannot compact a hybrid recurrent request "
+                f"to {new_num_computed_tokens} tokens with "
+                f"{self.num_speculative_blocks} speculative blocks"
+            )
+
+        dest_state_idx = num_required_blocks - 1 - self.num_speculative_blocks
+        src_state_idx = len(req_blocks) - 1 - self.num_speculative_blocks
+        if src_state_idx < 0 or src_state_idx >= len(req_blocks):
+            raise RuntimeError(
+                "attention_matching found invalid recurrent source state index "
+                f"{src_state_idx} for request {request_id}"
+            )
+        if dest_state_idx < 0 or dest_state_idx >= num_required_blocks:
+            raise RuntimeError(
+                "attention_matching found invalid recurrent destination state "
+                f"index {dest_state_idx} for request {request_id}"
+            )
+
+        state_block = req_blocks[src_state_idx]
+        blocks_to_free: list[KVCacheBlock] = []
+        for idx, block in enumerate(req_blocks):
+            if idx < num_required_blocks and idx != dest_state_idx:
+                continue
+            if block is state_block:
+                continue
+            if not block.is_null:
+                blocks_to_free.append(block)
+
+        req_blocks[dest_state_idx] = state_block
+        del req_blocks[num_required_blocks:]
+        if blocks_to_free:
+            self.block_pool.free_blocks(blocks_to_free)
+
+        self.last_state_block_idx[request_id] = dest_state_idx
+        self._allocated_block_reqs.add(request_id)
+        self.num_cached_block[request_id] = min(
+            self.num_cached_block.get(request_id, 0),
+            len(req_blocks),
+        )
+        return len(blocks_to_free) * self.block_size
 
     def free(self, request_id: str) -> None:
         if self.mamba_cache_mode == "align":

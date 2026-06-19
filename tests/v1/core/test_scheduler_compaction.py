@@ -13,7 +13,11 @@ import pytest
 import torch
 
 from vllm.v1.core.compaction.am_manager import AttentionMatchingKVCacheManager
-from vllm.v1.core.compaction.am_runtime import OMPCompaction, build_attention_matching_plan
+from vllm.v1.core.compaction.am_runtime import (
+    OMPCompaction,
+    build_attention_matching_plan,
+    build_attention_matching_turn_plan,
+)
 from vllm.v1.core.compaction.manager import CompactingKVCacheManager
 from vllm.v1.core.sched.utils import check_stop
 from vllm.v1.core.compaction.types import CompactionEvent
@@ -240,7 +244,7 @@ def test_attention_matching_compaction_result_rewrites_request_state():
 
     next_sampled = 10_000
     source_len = 0
-    for _ in range(64):
+    for _ in range(128):
         output = scheduler.schedule()
         assert request.request_id in output.num_scheduled_tokens
         source_len = request.num_computed_tokens
@@ -255,7 +259,13 @@ def test_attention_matching_compaction_result_rewrites_request_state():
                 pooler_output=[],
             ),
         )
-        if request.num_computed_tokens > window:
+        plan = build_attention_matching_plan(
+            num_computed_tokens=request.num_computed_tokens,
+            window_size=window,
+            stride=stride,
+            num_prompt_tokens=request.num_prompt_tokens,
+        )
+        if plan is not None:
             break
         if request.num_total_generated > (next_sampled - 10_000):
             next_sampled += 1
@@ -284,6 +294,8 @@ def test_attention_matching_compaction_result_rewrites_request_state():
             attention_matching_compactions={
                 request.request_id: AttentionMatchingCompactionResult(
                     request_id=request.request_id,
+                    source_len=plan.source_len,
+                    target_len=plan.target_len,
                     protected_prefix_len=plan.protected_prefix_len,
                     synthetic_prefix_len=plan.synthetic_prefix_len,
                     exact_kept_tokens=plan.exact_kept_tokens,
@@ -299,8 +311,39 @@ def test_attention_matching_compaction_result_rewrites_request_state():
     assert request.position_offset == plan.offset_delta
     assert request.needs_rebuild
     assert len(request.compaction_events) == 1
-    assert request.compaction_events[0].tokens_evicted == plan.offset_delta
+    event = request.compaction_events[0]
+    assert event.tokens_evicted == plan.offset_delta
+    assert event.source_len == plan.source_len
+    assert event.target_len == plan.target_len
+    assert event.num_output_tokens_at_compaction == request.num_total_generated
+    assert event.num_output_tokens_at_compaction > plan.source_len - prompt_len
     assert request.all_token_ids[:stride] == [0] * stride
+
+
+def test_attention_matching_plan_waits_for_stride_sized_eviction():
+    """AM should not run repeated one-token compactions."""
+    assert (
+        build_attention_matching_plan(
+            num_computed_tokens=65,
+            window_size=48,
+            stride=16,
+            num_prompt_tokens=32,
+            protected_prefix_len=32,
+        )
+        is None
+    )
+
+    plan = build_attention_matching_plan(
+        num_computed_tokens=80,
+        window_size=48,
+        stride=16,
+        num_prompt_tokens=32,
+        protected_prefix_len=32,
+    )
+
+    assert plan is not None
+    assert plan.compact_region_len == 32
+    assert plan.offset_delta == 16
 
 
 def test_attention_matching_plan_can_protect_prompt_prefix():
@@ -320,6 +363,271 @@ def test_attention_matching_plan_can_protect_prompt_prefix():
     assert plan.compact_region_len == 52
     assert plan.target_len == 64
     assert plan.offset_delta == 36
+
+
+def test_attention_matching_pre_sample_result_recomputes_boundary_token():
+    """Pre-sample AM should not append a token and should force one-token replay."""
+    block_size = 16
+    prompt_len = 32
+    window = 48
+    stride = 16
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        block_size=block_size,
+        num_blocks=64,
+        max_model_len=2048,
+        compaction_window_size=window,
+        compaction_stride=stride,
+        compaction_strategy="attention_matching",
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=prompt_len,
+        max_tokens=256,
+        ignore_eos=True,
+        block_size=block_size,
+    )
+    scheduler.add_request(request)
+
+    next_sampled = 10_000
+    plan = None
+    output = None
+    for _ in range(128):
+        output = scheduler.schedule()
+        source_len = request.num_computed_tokens
+        plan = build_attention_matching_plan(
+            num_computed_tokens=source_len,
+            window_size=window,
+            stride=stride,
+            num_prompt_tokens=request.num_prompt_tokens,
+        )
+        if plan is not None:
+            assert request.num_total_generated == source_len - prompt_len
+            break
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[[next_sampled]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        if request.num_total_generated > (next_sampled - 10_000):
+            next_sampled += 1
+
+    assert output is not None
+    assert plan is not None
+    old_generated = request.num_total_generated
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            attention_matching_compactions={
+                request.request_id: AttentionMatchingCompactionResult(
+                    request_id=request.request_id,
+                    source_len=plan.source_len,
+                    target_len=plan.target_len,
+                    protected_prefix_len=plan.protected_prefix_len,
+                    synthetic_prefix_len=plan.synthetic_prefix_len,
+                    exact_kept_tokens=plan.exact_kept_tokens,
+                    position_offset_delta=plan.offset_delta,
+                    query_source="random_queries",
+                    max_queries_per_kv_head=8,
+                    query_seed=123,
+                    zerobeta=True,
+                    pre_sample=True,
+                )
+            },
+        ),
+    )
+
+    assert request.num_total_generated == old_generated
+    assert request.num_computed_tokens == plan.target_len - 1
+    assert request.needs_rebuild
+    event = request.compaction_events[0]
+    assert event.attention_matching_pre_sample
+    assert event.num_output_tokens_at_compaction == old_generated
+
+
+def test_attention_matching_turn_plan_matches_mt_window_semantics():
+    """Turn-window AM should compact old turns and keep recent turns exact."""
+    end = 99
+    token_ids = [
+        1, end,  # system
+        10, end, 20, end,  # turn 0
+        11, end, 21, end,  # turn 1
+        12, end, 22, end,  # turn 2
+        13, end, 23, end,  # turn 3
+        14, end, 24, end,  # turn 4
+    ]
+
+    plan = build_attention_matching_turn_plan(
+        num_computed_tokens=len(token_ids),
+        synthetic_prefix_len=2,
+        token_ids=token_ids,
+        max_turns=4,
+        keep_recent_turns=2,
+        turn_end_token_id=end,
+        protect_first_user=True,
+    )
+
+    assert plan is not None
+    assert plan.protected_prefix_len == 4
+    assert plan.exact_region_start == 14
+    assert plan.exact_kept_tokens == 8
+    assert plan.compact_region_len == 10
+    assert plan.synthetic_prefix_len == 2
+    assert plan.target_len == 14
+    assert plan.offset_delta == 8
+
+
+def test_attention_matching_turn_plan_includes_padding_after_turn_end():
+    """Turn-window AM should cut after filler runs, not at raw im_end + 1."""
+    end = 99
+    pad = 0
+    token_ids = [
+        1, end, pad, pad,  # system boundary at 4
+        10, end, pad, pad, 20, end, pad, pad,  # turn 0 boundary at 12
+        11, end, pad, pad, 21, end, pad, pad,  # turn 1 boundary at 20
+        12, end, pad, pad, 22, end, pad, pad,  # turn 2 boundary at 28
+        13, end, pad, pad, 23, end, pad, pad,  # turn 3 boundary at 36
+        14, end, pad, pad, 24, end, pad, pad,  # turn 4 boundary at 44
+    ]
+
+    plan = build_attention_matching_turn_plan(
+        num_computed_tokens=len(token_ids),
+        synthetic_prefix_len=4,
+        token_ids=token_ids,
+        max_turns=4,
+        keep_recent_turns=2,
+        turn_end_token_id=end,
+        turn_padding_token_id=pad,
+        protect_first_user=True,
+    )
+
+    assert plan is not None
+    assert plan.protected_prefix_len == 8
+    assert plan.exact_region_start == 28
+    assert plan.exact_kept_tokens == 16
+    assert plan.compact_region_len == 20
+
+
+def test_attention_matching_tail_finalization_can_fill_to_max_model_len():
+    """Hidden tail finalization should not require a visible-sample slot."""
+    block_size = 16
+    turn_end = 99
+    pad = 0
+    scheduler = create_scheduler(
+        max_num_batched_tokens=64,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=True,
+        block_size=block_size,
+        num_blocks=16,
+        max_model_len=64,
+        compaction_window_size=32,
+        compaction_stride=16,
+        compaction_strategy="attention_matching",
+    )
+    scheduler.cache_config.prefix_caching_mode = "am_full"
+    scheduler.cache_config.attention_matching_cross_turn_cache = True
+    scheduler.cache_config.compaction_turn_end_token_id = turn_end
+    scheduler.cache_config.compaction_turn_padding_token_id = pad
+
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=48,
+        max_tokens=64,
+        ignore_eos=True,
+        block_size=block_size,
+    )
+    for i in range(15):
+        request.append_output_token_ids(1000 + i)
+    request.num_computed_tokens = request.num_tokens
+    request.status = RequestStatus.FINISHED_STOPPED
+    request.attention_matching_active = True
+    request.attention_matching_prefix_cache_key = "am-key"
+
+    assert request.num_tokens == 63
+    assert scheduler._maybe_start_am_prefix_cache_tail_finalization(request)
+
+    assert request.prefix_cache_tail_finalizing
+    assert request.prefix_cache_tail_hidden_tokens == 1
+    assert request.output_token_ids[-1] == turn_end
+    assert request.num_tokens == 64
+    assert request.num_total_generated == 15
+    assert request.status == RequestStatus.RUNNING
+
+
+def test_attention_matching_tail_finalization_requires_padding_token():
+    """Cross-turn AM cache must fail loudly without a shared filler token."""
+    scheduler = create_scheduler(
+        max_num_batched_tokens=64,
+        max_num_seqs=1,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=True,
+        block_size=16,
+        num_blocks=16,
+        max_model_len=64,
+        compaction_window_size=32,
+        compaction_stride=16,
+        compaction_strategy="attention_matching",
+    )
+    scheduler.cache_config.prefix_caching_mode = "am_full"
+    scheduler.cache_config.attention_matching_cross_turn_cache = True
+    scheduler.cache_config.compaction_turn_end_token_id = 99
+    scheduler.cache_config.compaction_turn_padding_token_id = None
+
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=48,
+        max_tokens=64,
+        ignore_eos=True,
+        block_size=16,
+    )
+    request.append_output_token_ids(1000)
+    request.num_computed_tokens = request.num_tokens
+    request.status = RequestStatus.FINISHED_STOPPED
+    request.attention_matching_active = True
+    request.attention_matching_prefix_cache_key = "am-key"
+
+    with pytest.raises(RuntimeError, match="compaction_turn_padding_token_id"):
+        scheduler._maybe_start_am_prefix_cache_tail_finalization(request)
+
+
+def test_attention_matching_turn_plan_waits_for_turn_trigger():
+    """AM turn-window mode must not compact before max_turns is exceeded."""
+    end = 99
+    token_ids = [
+        1, end,
+        10, end, 20, end,
+        11, end, 21, end,
+        12, end, 22, end,
+        13, end, 23, end,
+    ]
+
+    assert (
+        build_attention_matching_turn_plan(
+            num_computed_tokens=len(token_ids),
+            synthetic_prefix_len=2,
+            token_ids=token_ids,
+            max_turns=4,
+            keep_recent_turns=2,
+            turn_end_token_id=end,
+        )
+        is None
+    )
 
 
 def test_attention_matching_stop_uses_logical_prompt_len():

@@ -119,10 +119,12 @@ class KVCacheManager:
         compaction_window_size: int = 0,
         compaction_stride: int = 0,
         compaction_strategy: str = "fifo",
+        prefix_caching_mode: str = "full",
     ) -> None:
         self.max_model_len = max_model_len
 
         self.enable_caching = enable_caching
+        self.prefix_caching_mode = prefix_caching_mode
         self.use_eagle = use_eagle
         self.log_stats = log_stats
         self.metrics_collector = metrics_collector
@@ -196,6 +198,15 @@ class KVCacheManager:
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
         if not self.enable_caching or request.skip_reading_prefix_cache:
+            return self.empty_kv_cache_blocks, 0
+        if (
+            self.prefix_caching_mode == "am_full"
+            and request.attention_matching_prefix_cache_key is None
+        ):
+            # In AM-full mode, prefix-cache reads are only valid in the
+            # AM-specific compressed namespace. Without an AM key, a normal
+            # token-prefix hit would hide whether compressed-cache admission
+            # actually works and could bypass the intended AM-only path.
             return self.empty_kv_cache_blocks, 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
@@ -428,7 +439,7 @@ class KVCacheManager:
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
-        self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        self.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
 
@@ -529,6 +540,21 @@ class KVCacheManager:
         """Get the block ids of a request."""
         return self.get_blocks(request_id).get_block_ids()
 
+    def privatize_attention_matching_blocks(
+        self, request_id: str, num_tokens: int
+    ) -> tuple[list[int], list[int]]:
+        """Privatize shared AM prefix-cache blocks and return src/dst copies."""
+        src_block_ids: list[int] = []
+        dst_block_ids: list[int] = []
+        for manager in self.coordinator.single_type_managers:
+            privatize = getattr(manager, "privatize_shared_blocks", None)
+            if privatize is None:
+                continue
+            src, dst = privatize(request_id, num_tokens)
+            src_block_ids.extend(src)
+            dst_block_ids.extend(dst)
+        return src_block_ids, dst_block_ids
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled.
 
@@ -537,8 +563,47 @@ class KVCacheManager:
             num_computed_tokens: The number of computed tokens, including tokens
                 that are already cached and tokens to be cached.
         """
-        if self.enable_caching:
-            self.coordinator.cache_blocks(request, num_computed_tokens)
+        if not self.enable_caching:
+            return
+        if (
+            self.prefix_caching_mode == "am_full"
+            and request.attention_matching_prefix_cache_key is None
+        ):
+            if not request.prefix_cache_write_skip_logged:
+                logger.warning(
+                    "[PrefixCache][AM] skipping ordinary prefix-cache writes "
+                    "for request %s in am_full mode before an AM key exists",
+                    request.request_id,
+                )
+                request.prefix_cache_write_skip_logged = True
+            return
+        if request.skip_writing_prefix_cache:
+            if not request.prefix_cache_write_skip_logged:
+                logger.warning(
+                    "[PrefixCache] skipping writes for request %s "
+                    "(reason=%s, attention_matching_active=%s)",
+                    request.request_id,
+                    request.prefix_cache_skip_reason,
+                    request.attention_matching_active,
+                )
+                request.prefix_cache_write_skip_logged = True
+            return
+        if (
+            self.prefix_caching_mode == "prefill_only"
+            and num_computed_tokens > request.num_prompt_tokens
+        ):
+            if not request.prefix_cache_prefill_only_skip_logged:
+                logger.warning(
+                    "[PrefixCache] prefill_only skipped generated-token "
+                    "cache write for request %s "
+                    "(num_computed_tokens=%d, num_prompt_tokens=%d)",
+                    request.request_id,
+                    num_computed_tokens,
+                    request.num_prompt_tokens,
+                )
+                request.prefix_cache_prefill_only_skip_logged = True
+            return
+        self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]

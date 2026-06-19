@@ -521,9 +521,25 @@ def generate_block_hash_extra_keys(
     prompt_embeds_keys = _gen_prompt_embeds_extra_hash_keys(
         request, start_token_idx, end_token_idx
     )
+    am_prefix_cache_keys: list[Any] = []
+    am_prefix_cache_key = request.attention_matching_prefix_cache_key
+    if am_prefix_cache_key is not None:
+        am_key_start = getattr(
+            request,
+            "attention_matching_prefix_cache_hash_start",
+            request.attention_matching_prefix_cache_key_start,
+        )
+        if end_token_idx > am_key_start:
+            am_prefix_cache_keys.append(
+                ("attention_matching_prefix_cache", am_prefix_cache_key)
+            )
 
     extra_keys: list[Any] = (
-        lora_extra_keys + mm_extra_keys + cache_salt_keys + prompt_embeds_keys
+        lora_extra_keys
+        + mm_extra_keys
+        + cache_salt_keys
+        + prompt_embeds_keys
+        + am_prefix_cache_keys
     )
 
     if not extra_keys:

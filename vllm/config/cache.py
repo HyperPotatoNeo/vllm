@@ -24,6 +24,7 @@ CacheDType = Literal[
 MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
+PrefixCachingMode = Literal["full", "prefill_only", "am_full", "am_unsafe"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 CompactionStrategy = Literal["fifo", "attention_matching"]
 AttentionMatchingQuerySource = Literal[
@@ -75,6 +76,25 @@ class CacheConfig:
     `ModelConfig` and that value should be manually duplicated here."""
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
+    prefix_caching_mode: PrefixCachingMode = "full"
+    """Prefix caching safety mode.
+
+    - "full": normal vLLM prefix-cache behavior.
+    - "prefill_only": requests may read/write the prefix cache only before
+      attention matching has rewritten their KV state. AM-active requests are
+      excluded from prefix-cache reads and writes so synthetic KV is never
+      cached under ordinary token hashes.
+    - "am_full": experimental attention-matching mode. Before a request has
+      compacted, ordinary prefix-cache hits are capped to the protected prompt
+      prefix. After AM compaction, compacted blocks are cached under an
+      AM-specific namespace derived from the compacted source tokens and AM
+      parameters, so synthetic KV is not keyed as ordinary placeholder tokens.
+    - "am_unsafe": experimental negative-control mode. It keeps AM-active
+      requests readable/writable in the prefix cache but does not add the
+      AM-specific namespace, so synthetic placeholder-token blocks can collide
+      across different compacted source histories. Use only to demonstrate the
+      failure mode; it is not scientifically faithful.
+    """
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:
 
@@ -176,6 +196,34 @@ class CacheConfig:
     - "attention_matching" is a separate opt-in codepath reserved for the
       attention-matching baseline.
     """
+    compaction_max_turns: int = Field(default=0, ge=0)
+    """Turn-window compaction trigger.
+
+    0 disables turn-window compaction. When positive with
+    compaction_strategy="attention_matching", AM compacts old completed chat
+    turns and keeps a recent turn suffix exact.
+    """
+    compaction_eviction_turn_stride: int = Field(default=1, ge=1)
+    """Recent completed turns to keep exact in turn-window AM mode.
+
+    This mirrors the Markovian Thinker `stride` setting for TextWorld-style
+    comparisons: after the max-turn trigger, keep this many recent completed
+    turn groups plus the in-flight tail.
+    """
+    compaction_turn_end_token_id: int | None = Field(default=None, ge=0)
+    """Token id marking chat-message end, e.g. Qwen `<|im_end|>`.
+
+    If unset, the AM worker falls back to the model EOS id. Explicitly setting
+    this is preferred for scientific TextWorld runs.
+    """
+    compaction_turn_padding_token_id: int | None = Field(default=None, ge=0)
+    """Optional filler token id inserted after chat-message end tokens.
+
+    When set, turn-window AM treats a run of these filler tokens immediately
+    following each `compaction_turn_end_token_id` as part of the turn boundary.
+    This lets block-aligned message padding move the effective boundary to the
+    next block edge instead of cutting at `<|im_end|> + 1`.
+    """
     attention_matching_max_queries_per_kv_head: int = Field(default=128, gt=0)
     """Maximum cache-key probe queries per KV head for attention matching."""
     attention_matching_query_source: AttentionMatchingQuerySource = "random_queries"
@@ -184,6 +232,13 @@ class CacheConfig:
     - "random_queries": use random normal vectors in query/key head space.
     - "recent_cache_keys": use the exact kept suffix after compaction.
     - "prefix_cache_keys": use the compacted prefix region itself.
+    """
+    attention_matching_zerobeta: bool = False
+    """Set AM beta score biases to zero.
+
+    This is a distinct AM variant used when a downstream trainer cannot replay
+    vLLM's per-layer score_mod beta terms. It remains faithful only if the
+    trainer is configured with the same flag.
     """
     attention_matching_protect_user_prompts: AttentionMatchingPromptProtection = (
         "first_user"
@@ -194,6 +249,40 @@ class CacheConfig:
     spans. "first_user" protects the initial rendered prompt prefix. "all_user"
     also extends that protected prefix when streaming/multi-turn prompt updates
     add more prompt tokens. "none" restores the older behavior.
+    """
+    attention_matching_cross_turn_cache: bool = False
+    """Enable cross-turn compressed-cache admission for AM + prefix caching.
+
+    When enabled with prefix_caching_mode="am_full", vLLM may admit a new
+    turn-window request directly as [protected prompt, AM synthetic memory,
+    exact recent tail] if the corresponding compressed prefix is already in the
+    prefix cache. If the compressed cache is missing, the scheduler restores the
+    full prompt and runs ordinary AM, so correctness does not depend on a hit.
+    """
+    attention_matching_allow_partial_cross_turn_cache_hits: bool = True
+    """Allow AM cross-turn cache hits that cover only protected+synthetic KV.
+
+    The default is true for AM-full cross-turn caching because TextWorld-style
+    turns usually extend the exact tail, so requiring a full block-aligned
+    compressed-prefix hit collapses practical hit rate. Trainer replay must
+    preserve the cached-prefix plus warmed-suffix semantics for RL faithfulness.
+    """
+    attention_matching_forget_gate_enabled: bool = False
+    """Enable recurrent forget-gate blending for repeated AM compactions.
+
+    When enabled, compactions after the first aligned AM state blend the previous
+    synthetic KV memory with the newly computed AM synthetic KV candidate.
+    """
+    attention_matching_forget_gate_alpha: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+    )
+    """Retention weight for the optional AM forget gate.
+
+    The gated synthetic KV is alpha * previous_synthetic + (1 - alpha) *
+    current_candidate. The field defaults to 0.5 but is ignored unless
+    attention_matching_forget_gate_enabled is true.
     """
     shuffle_control_chunk_size: int = 0
     """Chunk size for the online shuffle-control robustness experiment.
@@ -259,6 +348,7 @@ class CacheConfig:
             "is_attention_free",
             "num_gpu_blocks_override",
             "enable_prefix_caching",
+            "prefix_caching_mode",
             "prefix_caching_hash_algo",
             "cpu_kvcache_space_bytes",
             "mamba_page_size_padded",
@@ -273,9 +363,18 @@ class CacheConfig:
             "compaction_window_size",
             "compaction_stride",
             "compaction_strategy",
+            "compaction_max_turns",
+            "compaction_eviction_turn_stride",
+            "compaction_turn_end_token_id",
+            "compaction_turn_padding_token_id",
             "attention_matching_max_queries_per_kv_head",
             "attention_matching_query_source",
+            "attention_matching_zerobeta",
             "attention_matching_protect_user_prompts",
+            "attention_matching_cross_turn_cache",
+            "attention_matching_allow_partial_cross_turn_cache_hits",
+            "attention_matching_forget_gate_enabled",
+            "attention_matching_forget_gate_alpha",
             "shuffle_control_chunk_size",
             "shuffle_control_probability",
             "shuffle_control_seed",

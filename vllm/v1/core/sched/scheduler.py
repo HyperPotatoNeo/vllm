@@ -64,6 +64,16 @@ from vllm.v1.outputs import (
     ShuffleControlResult,
 )
 from vllm.v1.core.compaction.am_manager import AttentionMatchingKVCacheManager
+from vllm.v1.core.compaction.am_runtime import (
+    DEFAULT_TURN_SEPARATOR_TOKEN_ID_SEQUENCE,
+    advance_attention_matching_turn_boundary,
+)
+from vllm.v1.core.compaction.am_prefix_cache import (
+    AttentionMatchingPrefixCacheReplay,
+    build_attention_matching_prefix_cache_key,
+    build_attention_matching_turn_prefix_cache_replay,
+    hash_attention_matching_tokens,
+)
 from vllm.v1.core.compaction.manager import CompactingKVCacheManager
 from vllm.v1.core.compaction.shuffle_control import (
     NoiseEvent,
@@ -190,6 +200,12 @@ class Scheduler(SchedulerInterface):
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
+        # AM compressed-prefix cache metadata needed for faithful trainer
+        # replay. Prefix-cache blocks only store KV; the trainer also needs
+        # the discrete OMP atom choices that produced synthetic KV.
+        self.attention_matching_prefix_cache_selected_indices: dict[
+            str, list[list[list[int]]]
+        ] = {}
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -271,6 +287,7 @@ class Scheduler(SchedulerInterface):
             compaction_window_size=self.cache_config.compaction_window_size,
             compaction_stride=self.cache_config.compaction_stride,
             compaction_strategy=self.cache_config.compaction_strategy,
+            prefix_caching_mode=self.cache_config.prefix_caching_mode,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -474,9 +491,18 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
-            # This is necessary when using spec decoding.
+            # This is necessary when using spec decoding. Hidden AM tail
+            # finalization is filler-only prefill whose sampled token is
+            # discarded by the worker, so it may safely compute the final
+            # position at max_model_len - 1 instead of reserving one more slot
+            # for a visible sampled token.
+            max_input_tokens = (
+                self.max_model_len
+                if request.prefix_cache_tail_finalizing
+                else self.max_model_len - 1
+            )
             num_new_tokens = min(
-                num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
+                num_new_tokens, max_input_tokens - request.num_computed_tokens
             )
 
             # Schedule encoder inputs.
@@ -671,10 +697,23 @@ class Scheduler(SchedulerInterface):
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
-                    # Get locally-cached tokens.
-                    new_computed_blocks, num_new_local_computed_tokens = (
-                        self.kv_cache_manager.get_computed_blocks(request)
+                    self._refresh_attention_matching_protected_prompt_len(request)
+                    self._maybe_prepare_attention_matching_cross_turn_candidate(
+                        request
                     )
+                    while True:
+                        # Get locally-cached tokens. AM-full cross-turn
+                        # admission may retry progressively shallower replay
+                        # states until it finds the deepest cached AM state.
+                        new_computed_blocks, num_new_local_computed_tokens = (
+                            self.kv_cache_manager.get_computed_blocks(request)
+                        )
+                        if not (
+                            self._maybe_finalize_attention_matching_cross_turn_candidate(
+                                request, num_new_local_computed_tokens
+                            )
+                        ):
+                            break
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -826,6 +865,10 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.free(request)
                     break
 
+                self._maybe_privatize_attention_matching_blocks(
+                    request, num_computed_tokens
+                )
+
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
                 # This information is used to determine if a load is
@@ -892,6 +935,25 @@ class Scheduler(SchedulerInterface):
                 # Count the number of prefix cached tokens.
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = num_computed_tokens
+                if (
+                    self.cache_config.enable_prefix_caching
+                    and request.num_cached_tokens > 0
+                    and not request.skip_reading_prefix_cache
+                    and not request.prefix_cache_read_hit_logged
+                ):
+                    logger.warning(
+                        "[PrefixCache] read hit request %s cached_tokens=%d "
+                        "prompt_tokens=%d mode=%s "
+                        "attention_matching_enabled=%s am_keyed=%s key=%s",
+                        request.request_id,
+                        request.num_cached_tokens,
+                        request.num_prompt_tokens,
+                        self.cache_config.prefix_caching_mode,
+                        self._attention_matching_enabled,
+                        request.attention_matching_prefix_cache_key is not None,
+                        (request.attention_matching_prefix_cache_key or "")[:16],
+                    )
+                    request.prefix_cache_read_hit_logged = True
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
@@ -1115,6 +1177,8 @@ class Scheduler(SchedulerInterface):
             num_output_tokens_at_compaction=request.num_total_generated,
             tokens_evicted=total_evicted,
             position_offset_after=request.position_offset + total_evicted,
+            num_prompt_tokens=request.num_prompt_tokens,
+            compaction_strategy="fifo",
         )
         request.compaction_events.append(event)
 
@@ -1170,6 +1234,138 @@ class Scheduler(SchedulerInterface):
 
         return total_evicted
 
+    @staticmethod
+    def _hash_attention_matching_tokens(token_ids: list[int]) -> str:
+        """Stable compact hash for token regions summarized by AM."""
+        return hash_attention_matching_tokens(token_ids)
+
+    @classmethod
+    def _attention_matching_compacted_tokens_hash(
+        cls,
+        request: Request,
+        *,
+        protected_prefix_len: int,
+        source_len: int,
+        exact_kept_tokens: int,
+    ) -> str:
+        compact_start = protected_prefix_len
+        compact_end = source_len - exact_kept_tokens
+        return cls._hash_attention_matching_tokens(
+            request._all_token_ids[compact_start:compact_end]
+        )
+
+    @classmethod
+    def _build_attention_matching_prefix_cache_key(
+        cls,
+        request: Request,
+        result: AttentionMatchingCompactionResult,
+        *,
+        source_len: int,
+        target_len: int,
+        position_offset_after: int,
+        snapshot_version: int,
+    ) -> str:
+        """Build an AM-specific prefix-cache namespace for compacted KV.
+
+        The visible synthetic prompt IDs are placeholders, so the hash must
+        include the source history and AM parameters that produced the KV.
+        """
+        compacted_tokens_hash = cls._attention_matching_compacted_tokens_hash(
+            request,
+            protected_prefix_len=result.protected_prefix_len,
+            source_len=source_len,
+            exact_kept_tokens=result.exact_kept_tokens,
+        )
+        tail_signature = None
+        if result.query_source != "random_queries":
+            tail_signature = (
+                snapshot_version,
+                source_len,
+                target_len,
+            )
+        return build_attention_matching_prefix_cache_key(
+            cache_salt=request.cache_salt,
+            protected_prefix_len=result.protected_prefix_len,
+            synthetic_prefix_len=result.synthetic_prefix_len,
+            compacted_tokens_hash=compacted_tokens_hash,
+            query_source=result.query_source,
+            max_queries_per_kv_head=result.max_queries_per_kv_head,
+            query_seed=result.query_seed,
+            zerobeta=result.zerobeta,
+            parent_key=request.attention_matching_prefix_cache_key,
+            parent_key_start=request.attention_matching_prefix_cache_key_start,
+            position_offset_before=request.position_offset,
+            position_offset_after=position_offset_after,
+            tail_signature=tail_signature,
+            forget_gate_enabled=result.forget_gate_enabled,
+            forget_gate_alpha=result.forget_gate_alpha,
+        )
+
+    def _remember_attention_matching_selected_indices(
+        self, result: AttentionMatchingCompactionResult
+    ) -> None:
+        if result.prefix_cache_key is not None and result.selected_indices is not None:
+            self.attention_matching_prefix_cache_selected_indices[
+                result.prefix_cache_key
+            ] = result.selected_indices
+        for replay_step in result.replay_steps or ():
+            if not isinstance(replay_step, dict):
+                continue
+            key = replay_step.get("attention_matching_prefix_cache_key")
+            selected = replay_step.get("attention_matching_selected_indices")
+            if isinstance(key, str) and selected is not None:
+                self.attention_matching_prefix_cache_selected_indices[key] = selected
+
+    def _attention_matching_step_payload(
+        self,
+        *,
+        source_len: int,
+        target_len: int,
+        protected_prefix_len: int,
+        synthetic_prefix_len: int,
+        exact_kept_tokens: int,
+        query_seed: int,
+        prefix_cache_key: str | None = None,
+        selected_indices: list[list[list[int]]] | None = None,
+        forget_gate_enabled: bool = False,
+        forget_gate_alpha: float = 0.5,
+        forget_gate_applied: bool = False,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "source_len": source_len,
+            "target_len": target_len,
+            "protected_prefix_len": protected_prefix_len,
+            "synthetic_prefix_len": synthetic_prefix_len,
+            "exact_kept_tokens": exact_kept_tokens,
+            "attention_matching_query_seed": query_seed,
+        }
+        if forget_gate_enabled:
+            payload["attention_matching_forget_gate_enabled"] = True
+            payload["attention_matching_forget_gate_alpha"] = float(
+                forget_gate_alpha
+            )
+            payload["attention_matching_forget_gate_applied"] = bool(
+                forget_gate_applied
+            )
+        if prefix_cache_key is not None:
+            payload["attention_matching_prefix_cache_key"] = prefix_cache_key
+        if selected_indices is not None:
+            payload["attention_matching_selected_indices"] = selected_indices
+        return payload
+
+    @staticmethod
+    def _attention_matching_event_has_selected_indices(
+        event: CompactionEvent,
+    ) -> bool:
+        replay_steps = event.attention_matching_replay_steps or []
+        if replay_steps:
+            return all(
+                isinstance(step, dict)
+                and bool(step.get("attention_matching_selected_indices"))
+                for step in replay_steps
+            )
+        return bool(event.attention_matching_selected_indices)
+
     def _apply_attention_matching_compaction(
         self,
         request: Request,
@@ -1182,29 +1378,200 @@ class Scheduler(SchedulerInterface):
             + result.synthetic_prefix_len
             + result.exact_kept_tokens
         )
-        source_len = request.num_computed_tokens
+        # Pre-sample AM reports the current computed boundary and returns no
+        # sampled token. Legacy post-sample AM may report the KV cache that
+        # existed before the sampled next token was appended, so scheduler state
+        # can be one token ahead. Always use worker-reported source_len for
+        # event semantics and exact-token slicing.
+        source_len = result.source_len
+        scheduler_source_len = request.num_computed_tokens
+        if source_len > scheduler_source_len:
+            raise RuntimeError(
+                f"AM source_len exceeds scheduler num_computed for request "
+                f"{request.request_id}: result.source_len={source_len}, "
+                f"num_computed={scheduler_source_len}"
+            )
         if total_evicted <= 0 or target_len >= source_len:
             return 0
 
-        compaction_mgr: AttentionMatchingKVCacheManager | None = None
+        if result.selected_indices is None:
+            raise RuntimeError(
+                "AM compaction result is missing selected OMP indices for "
+                f"request {request.request_id}; refusing to emit a "
+                "non-faithful replay event."
+            )
+        replay_steps = result.replay_steps
+        if replay_steps is None:
+            replay_steps = [
+                self._attention_matching_step_payload(
+                    source_len=result.source_len,
+                    target_len=result.target_len,
+                    protected_prefix_len=result.protected_prefix_len,
+                    synthetic_prefix_len=result.synthetic_prefix_len,
+                    exact_kept_tokens=result.exact_kept_tokens,
+                    query_seed=result.query_seed,
+                    prefix_cache_key=result.prefix_cache_key,
+                    selected_indices=result.selected_indices,
+                    forget_gate_enabled=result.forget_gate_enabled,
+                    forget_gate_alpha=result.forget_gate_alpha,
+                    forget_gate_applied=result.forget_gate_applied,
+                )
+            ]
+
+        self._remember_attention_matching_selected_indices(result)
+
+        compaction_mgrs: list[AttentionMatchingKVCacheManager] = []
         for mgr in self.kv_cache_manager.coordinator.single_type_managers:
             if isinstance(mgr, AttentionMatchingKVCacheManager):
-                mgr.finalize_compaction(request.request_id, target_len)
-                compaction_mgr = mgr
-                break
+                compaction_mgrs.append(mgr)
 
-        assert compaction_mgr is not None
+        assert compaction_mgrs
+        if self.cache_config.enable_prefix_caching:
+            if self.cache_config.prefix_caching_mode == "am_unsafe":
+                logger.warning(
+                    "[PrefixCache][AM][UNSAFE] preserving existing prefix-cache "
+                    "hash mappings before AM overwrite for request %s",
+                    request.request_id,
+                )
+            else:
+                request_block_ids_by_group = self.kv_cache_manager.get_block_ids(
+                    request.request_id
+                )
+                request_block_ids = {
+                    block_id
+                    for group_block_ids in request_block_ids_by_group
+                    for block_id in group_block_ids
+                }
+                if request_block_ids:
+                    self.kv_cache_manager.evict_blocks(request_block_ids)
+                    cleared_hashes = sum(
+                        compaction_mgr.clear_request_block_hashes(
+                            request.request_id
+                        )
+                        for compaction_mgr in compaction_mgrs
+                    )
+                    logger.warning(
+                        "[PrefixCache][AM] evicted %d request block ids and "
+                        "cleared %d block hashes from prefix cache before AM "
+                        "finalize for request %s",
+                        len(request_block_ids),
+                        cleared_hashes,
+                        request.request_id,
+                    )
+        for compaction_mgr in compaction_mgrs:
+            compaction_mgr.finalize_compaction(request.request_id, target_len)
+        for mgr in self.kv_cache_manager.coordinator.single_type_managers:
+            if isinstance(mgr, AttentionMatchingKVCacheManager):
+                continue
+            mgr.finalize_attention_matching_compaction(
+                request.request_id,
+                target_len,
+            )
+        if self.cache_config.prefix_caching_mode == "am_unsafe":
+            logger.warning(
+                "[PrefixCache][AM][UNSAFE] preserving cached-block bookkeeping "
+                "after AM overwrite for request %s",
+                request.request_id,
+            )
+        else:
+            for compaction_mgr in compaction_mgrs:
+                compaction_mgr.set_cached_prefix_blocks(request.request_id, 0)
+
+        source_logical_boundary = (
+            source_len + request.position_offset - request.logical_prompt_len
+        )
+        if source_logical_boundary < 0:
+            raise RuntimeError(
+                f"AM logical compaction boundary is negative for request "
+                f"{request.request_id}: source_len={source_len}, "
+                f"position_offset={request.position_offset}, "
+                f"logical_prompt_len={request.logical_prompt_len}"
+            )
+        if result.pre_sample:
+            logprob_boundary = source_logical_boundary
+            if request.num_total_generated != source_logical_boundary:
+                raise RuntimeError(
+                    f"Pre-sample AM must compact exactly at the current "
+                    f"generated-token boundary for request {request.request_id}: "
+                    f"num_generated={request.num_total_generated}, "
+                    f"source_boundary={source_logical_boundary}, "
+                    f"source_len={source_len}."
+                )
+        else:
+            logprob_boundary = request.num_total_generated
+
+        if (not result.pre_sample) and logprob_boundary <= source_logical_boundary:
+            raise RuntimeError(
+                f"AM logprob boundary must be after the compacted source "
+                f"boundary for request {request.request_id}: "
+                f"logprob_boundary={logprob_boundary}, "
+                f"source_boundary={source_logical_boundary}, "
+                f"source_len={source_len}, num_generated="
+                f"{request.num_total_generated}."
+            )
+
+        version_delta = max(len(result.replay_steps or ()), 1)
+        next_version = (
+            version_delta
+            if request.attention_matching_snapshot_version is None
+            else request.attention_matching_snapshot_version + version_delta
+        )
+        am_prefix_cache_key: str | None = None
+        if (
+            self.cache_config.enable_prefix_caching
+            and self.cache_config.prefix_caching_mode == "am_full"
+        ):
+            am_prefix_cache_key = result.prefix_cache_key
+            if am_prefix_cache_key is None:
+                am_prefix_cache_key = self._build_attention_matching_prefix_cache_key(
+                    request,
+                    result,
+                    source_len=source_len,
+                    target_len=target_len,
+                    position_offset_after=request.position_offset + total_evicted,
+                    snapshot_version=next_version,
+                )
 
         event = CompactionEvent(
-            num_output_tokens_at_compaction=request.num_total_generated,
+            # New AM events are pre-sample: vLLM discards the provisional
+            # sample and recomputes the boundary token under the compacted KV.
+            # Older post-sample events remain supported for compatibility.
+            num_output_tokens_at_compaction=logprob_boundary,
             tokens_evicted=total_evicted,
             position_offset_after=request.position_offset + total_evicted,
+            num_prompt_tokens=request.logical_prompt_len,
+            compaction_strategy="attention_matching",
+            source_len=result.source_len,
+            target_len=result.target_len,
+            protected_prefix_len=result.protected_prefix_len,
+            synthetic_prefix_len=result.synthetic_prefix_len,
+            exact_kept_tokens=result.exact_kept_tokens,
+            attention_matching_query_source=result.query_source,
+            attention_matching_max_queries_per_kv_head=(
+                result.max_queries_per_kv_head
+            ),
+            attention_matching_query_seed=result.query_seed,
+            attention_matching_zerobeta=result.zerobeta,
+            attention_matching_pre_sample=result.pre_sample,
+            attention_matching_replay_steps=replay_steps,
+            attention_matching_selected_indices=result.selected_indices,
+            attention_matching_forget_gate_enabled=result.forget_gate_enabled,
+            attention_matching_forget_gate_alpha=result.forget_gate_alpha,
+            attention_matching_forget_gate_applied=result.forget_gate_applied,
         )
         request.compaction_events.append(event)
 
         kept_exact_start = source_len - result.exact_kept_tokens
-        protected_prompt_token_ids = request._all_token_ids[: result.protected_prefix_len]
-        kept_exact_token_ids = request._all_token_ids[kept_exact_start:source_len]
+        if result.physical_token_ids is not None:
+            retained_token_ids = list(result.physical_token_ids)
+            prompt_cut = result.protected_prefix_len + result.synthetic_prefix_len
+            protected_prompt_token_ids = retained_token_ids[: result.protected_prefix_len]
+            kept_exact_token_ids = retained_token_ids[prompt_cut:]
+        else:
+            protected_prompt_token_ids = request._all_token_ids[
+                : result.protected_prefix_len
+            ]
+            kept_exact_token_ids = request._all_token_ids[kept_exact_start:source_len]
         uncomputed_suffix = request._all_token_ids[source_len:]
         synthetic_prompt = [0] * result.synthetic_prefix_len
         prompt_token_ids = list(protected_prompt_token_ids) + synthetic_prompt
@@ -1216,27 +1583,84 @@ class Scheduler(SchedulerInterface):
         request.output_token_ids = ConstantList(request._output_token_ids)
         request._all_token_ids = prompt_token_ids + request._output_token_ids
         request.all_token_ids = ConstantList(request._all_token_ids)
-        request.num_computed_tokens = target_len
+        request.num_computed_tokens = (
+            max(target_len - 1, 0) if result.pre_sample else target_len
+        )
         request.position_offset += total_evicted
         request.needs_rebuild = True
         request.attention_matching_active = True
+        if am_prefix_cache_key is not None:
+            request.attention_matching_prefix_cache_key = am_prefix_cache_key
+            request.attention_matching_prefix_cache_key_start = (
+                result.prefix_cache_key_start or result.protected_prefix_len
+            )
+            request.attention_matching_prefix_cache_hash_start = 0
+            request.attention_matching_synthetic_prefix_len = (
+                result.synthetic_prefix_len
+            )
+            request.skip_reading_prefix_cache = False
+            request.skip_writing_prefix_cache = False
+            request.prefix_cache_skip_reason = ""
+            request.prefix_cache_write_skip_logged = False
+            request._prompt_embeds_per_block_hashes.clear()
+            request.block_hashes = []
+            request.update_block_hashes()
+            logger.warning(
+                "[PrefixCache][AM] assigned AM prefix-cache key %s for "
+                "request %s over compacted prefix from token 0 "
+                "(protected_prefix=%d)",
+                am_prefix_cache_key[:16],
+                request.request_id,
+                result.protected_prefix_len,
+            )
+        else:
+            request.attention_matching_prefix_cache_key = None
+            request.attention_matching_prefix_cache_key_start = 0
+            request.attention_matching_prefix_cache_hash_start = 0
+            request.attention_matching_synthetic_prefix_len = 0
+            if (
+                self.cache_config.enable_prefix_caching
+                and self.cache_config.prefix_caching_mode == "am_unsafe"
+            ):
+                request._prompt_embeds_per_block_hashes.clear()
+                request.block_hashes = []
+                request.update_block_hashes()
+                logger.warning(
+                    "[PrefixCache][AM][UNSAFE] request %s will cache post-AM "
+                    "synthetic blocks under ordinary visible-token hashes",
+                    request.request_id,
+                )
+        if (
+            self.cache_config.enable_prefix_caching
+            and self.cache_config.prefix_caching_mode
+            not in ("am_full", "am_unsafe")
+        ):
+            request.skip_reading_prefix_cache = True
+            request.skip_writing_prefix_cache = True
+            request.prefix_cache_skip_reason = "attention_matching_active"
+            logger.warning(
+                "[PrefixCache][AM] disabled prefix-cache reads/writes for "
+                "request %s after AM activation",
+                request.request_id,
+            )
         request.attention_matching_target_len = target_len
         request.attention_matching_restore_pending = False
-        next_version = (
-            1
-            if request.attention_matching_snapshot_version is None
-            else request.attention_matching_snapshot_version + 1
-        )
         request.attention_matching_snapshot_version = next_version
         logger.warning(
             "[AM] compacted request %s source_len=%d target_len=%d evicted=%d "
-            "(protected_prefix=%d synthetic_prefix=%d version=%d offset=%d)",
+            "(scheduler_source_len=%d source_boundary=%d logprob_boundary=%d "
+            "protected_prefix=%d "
+            "synthetic_prefix=%d pre_sample=%s version=%d offset=%d)",
             request.request_id,
             source_len,
             target_len,
             total_evicted,
+            scheduler_source_len,
+            source_logical_boundary,
+            logprob_boundary,
             result.protected_prefix_len,
             result.synthetic_prefix_len,
+            result.pre_sample,
             next_version,
             request.position_offset,
         )
@@ -1438,8 +1862,7 @@ class Scheduler(SchedulerInterface):
         session.update_block_hashes()
         session.num_prompt_tokens = len(session.prompt_token_ids)
         session.logical_prompt_len = session.num_prompt_tokens
-        if self.cache_config.attention_matching_protect_user_prompts == "all_user":
-            session.attention_matching_protected_prompt_len = session.num_prompt_tokens
+        self._refresh_attention_matching_protected_prompt_len(session)
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
@@ -1448,6 +1871,571 @@ class Scheduler(SchedulerInterface):
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
+
+    def _refresh_attention_matching_protected_prompt_len(
+        self, request: Request
+    ) -> None:
+        """Compute the immutable prompt prefix AM must not overwrite.
+
+        In ``am_full`` prefix-caching mode this also bounds pre-AM prefix-cache
+        hits to the same immutable region. Once AM has rewritten the request,
+        post-AM blocks get AM-specific prefix-cache hashes.
+        """
+        if not self._attention_matching_enabled:
+            return
+
+        protect_mode = self.cache_config.attention_matching_protect_user_prompts
+        if protect_mode == "none":
+            protected_len = 0
+        elif protect_mode == "all_user" or self.cache_config.compaction_max_turns <= 0:
+            protected_len = request.num_prompt_tokens
+        else:
+            turn_end_token_id = self.cache_config.compaction_turn_end_token_id
+            turn_padding_token_id = self.cache_config.compaction_turn_padding_token_id
+            token_ids = request.prompt_token_ids or request._all_token_ids[
+                : request.num_prompt_tokens
+            ]
+            protected_len = request.num_prompt_tokens
+            if turn_end_token_id is not None:
+                turn_ends: list[int] = []
+                pos = 0
+                source_len = min(request.num_prompt_tokens, len(token_ids))
+                while pos < source_len:
+                    if token_ids[pos] != turn_end_token_id:
+                        pos += 1
+                        continue
+                    boundary = advance_attention_matching_turn_boundary(
+                        token_ids,
+                        pos + 1,
+                        source_len,
+                        turn_padding_token_id,
+                    )
+                    turn_ends.append(boundary)
+                    pos = boundary
+                if len(turn_ends) >= 2:
+                    # Rendered chat shape is system, user, assistant, ...
+                    # Keep system + first user prompt immutable by default.
+                    protected_len = turn_ends[1]
+
+        request.attention_matching_protected_prompt_len = min(
+            max(protected_len, 0), request.num_prompt_tokens
+        )
+
+    def _get_attention_matching_turn_end_token_id(self) -> int:
+        token_id = self.cache_config.compaction_turn_end_token_id
+        if token_id is not None:
+            return token_id
+        eos_token_id = getattr(
+            self.vllm_config.model_config.hf_config, "eos_token_id", None
+        )
+        if isinstance(eos_token_id, int):
+            return eos_token_id
+        if isinstance(eos_token_id, list) and len(eos_token_id) == 1:
+            return int(eos_token_id[0])
+        raise RuntimeError(
+            "AM turn-window compaction requires compaction_turn_end_token_id "
+            "or a single integer model eos_token_id"
+        )
+
+    def _build_attention_matching_cross_turn_replay(
+        self, request: Request
+    ) -> AttentionMatchingPrefixCacheReplay | None:
+        if (
+            not self.cache_config.attention_matching_cross_turn_cache
+            or not self._attention_matching_enabled
+            or self.cache_config.prefix_caching_mode != "am_full"
+            or self.cache_config.compaction_max_turns <= 0
+            or request.prompt_token_ids is None
+            or request.prompt_embeds is not None
+            or request.mm_features
+            or request.num_output_tokens > 0
+            or request.num_computed_tokens > 0
+        ):
+            return None
+        replay = build_attention_matching_turn_prefix_cache_replay(
+            token_ids=request.prompt_token_ids,
+            base_seed=int(getattr(self.vllm_config.model_config, "seed", 0) or 0),
+            cache_salt=request.cache_salt,
+            synthetic_prefix_len=self.cache_config.compaction_stride,
+            max_turns=self.cache_config.compaction_max_turns,
+            keep_recent_turns=self.cache_config.compaction_eviction_turn_stride,
+            turn_end_token_id=self._get_attention_matching_turn_end_token_id(),
+            turn_padding_token_id=self.cache_config.compaction_turn_padding_token_id,
+            protect_first_user=(
+                self.cache_config.attention_matching_protect_user_prompts
+                == "first_user"
+            ),
+            query_source=self.cache_config.attention_matching_query_source,
+            max_queries_per_kv_head=(
+                self.cache_config.attention_matching_max_queries_per_kv_head
+            ),
+            zerobeta=self.cache_config.attention_matching_zerobeta,
+            forget_gate_enabled=(
+                self.cache_config.attention_matching_forget_gate_enabled
+            ),
+            forget_gate_alpha=self.cache_config.attention_matching_forget_gate_alpha,
+            min_protected_prefix_len=0,
+        )
+        if replay is None or replay.final_step is None:
+            return None
+        return replay
+
+    def _activate_attention_matching_cross_turn_candidate(
+        self,
+        request: Request,
+        replay: AttentionMatchingPrefixCacheReplay,
+        step_index: int,
+        original_prompt: list[int],
+    ) -> None:
+        step = replay.steps[step_index]
+        plan = step.plan
+
+        physical_prompt = list(step.physical_token_ids_after)
+        exact_kept_tokens = (
+            len(physical_prompt)
+            - plan.protected_prefix_len
+            - plan.synthetic_prefix_len
+        )
+
+        event = CompactionEvent(
+            num_output_tokens_at_compaction=0,
+            tokens_evicted=step.position_offset_after,
+            position_offset_after=step.position_offset_after,
+            num_prompt_tokens=len(original_prompt),
+            compaction_strategy="attention_matching",
+            source_len=len(original_prompt),
+            target_len=len(physical_prompt),
+            protected_prefix_len=plan.protected_prefix_len,
+            synthetic_prefix_len=plan.synthetic_prefix_len,
+            exact_kept_tokens=exact_kept_tokens,
+            attention_matching_query_source=(
+                self.cache_config.attention_matching_query_source
+            ),
+            attention_matching_max_queries_per_kv_head=(
+                self.cache_config.attention_matching_max_queries_per_kv_head
+            ),
+            attention_matching_query_seed=step.query_seed,
+            attention_matching_zerobeta=self.cache_config.attention_matching_zerobeta,
+            attention_matching_pre_sample=True,
+            attention_matching_replay_steps=[
+                self._attention_matching_step_payload(
+                    source_len=replay_step.plan.source_len,
+                    target_len=replay_step.plan.target_len,
+                    protected_prefix_len=replay_step.plan.protected_prefix_len,
+                    synthetic_prefix_len=replay_step.plan.synthetic_prefix_len,
+                    exact_kept_tokens=replay_step.plan.exact_kept_tokens,
+                    query_seed=replay_step.query_seed,
+                    prefix_cache_key=replay_step.prefix_cache_key,
+                    selected_indices=(
+                        self.attention_matching_prefix_cache_selected_indices.get(
+                            replay_step.prefix_cache_key
+                        )
+                    ),
+                    forget_gate_enabled=(
+                        self.cache_config.attention_matching_forget_gate_enabled
+                    ),
+                    forget_gate_alpha=(
+                        self.cache_config.attention_matching_forget_gate_alpha
+                    ),
+                    forget_gate_applied=(
+                        self.cache_config.attention_matching_forget_gate_enabled
+                        and replay_step_idx > 0
+                    ),
+                )
+                for replay_step_idx, replay_step in enumerate(
+                    replay.steps[: step_index + 1]
+                )
+            ],
+            attention_matching_selected_indices=(
+                self.attention_matching_prefix_cache_selected_indices.get(
+                    step.prefix_cache_key
+                )
+            ),
+            attention_matching_forget_gate_enabled=(
+                self.cache_config.attention_matching_forget_gate_enabled
+            ),
+            attention_matching_forget_gate_alpha=(
+                self.cache_config.attention_matching_forget_gate_alpha
+            ),
+            attention_matching_forget_gate_applied=(
+                self.cache_config.attention_matching_forget_gate_enabled
+                and step_index > 0
+            ),
+        )
+
+        request.attention_matching_original_prompt_token_ids = original_prompt
+        request.attention_matching_cross_turn_candidate = True
+        request.attention_matching_cross_turn_event = event
+        request.attention_matching_cross_turn_replay = replay
+        request.attention_matching_cross_turn_replay_index = step_index
+        request.prompt_token_ids = physical_prompt
+        request.prompt_embeds = None
+        request.num_prompt_tokens = len(physical_prompt)
+        request.logical_prompt_len = len(original_prompt)
+        request._output_token_ids = []
+        request.output_token_ids = ConstantList(request._output_token_ids)
+        request._all_token_ids = list(physical_prompt)
+        request.all_token_ids = ConstantList(request._all_token_ids)
+        request.position_offset = step.position_offset_after
+        request.attention_matching_active = True
+        request.attention_matching_snapshot_version = step_index + 1
+        request.attention_matching_target_len = len(physical_prompt)
+        request.attention_matching_prefix_cache_key = step.prefix_cache_key
+        request.attention_matching_prefix_cache_key_start = plan.protected_prefix_len
+        request.attention_matching_prefix_cache_hash_start = 0
+        request.attention_matching_synthetic_prefix_len = plan.synthetic_prefix_len
+        request.skip_reading_prefix_cache = False
+        request.skip_writing_prefix_cache = False
+        request.prefix_cache_skip_reason = ""
+        request.prefix_cache_write_skip_logged = False
+        request.prefix_cache_read_hit_logged = False
+        request.num_cached_tokens = -1
+        request._prompt_embeds_per_block_hashes.clear()
+        request.block_hashes = []
+        request.update_block_hashes()
+        logger.warning(
+            "[PrefixCache][AM][cross-turn] prepared compressed admission "
+            "candidate for request %s source_len=%d target_len=%d "
+            "protected=%d synthetic=%d exact_tail=%d offset=%d "
+            "step=%d/%d key=%s",
+            request.request_id,
+            len(original_prompt),
+            len(physical_prompt),
+            plan.protected_prefix_len,
+            plan.synthetic_prefix_len,
+            exact_kept_tokens,
+            step.position_offset_after,
+            step_index + 1,
+            len(replay.steps),
+            step.prefix_cache_key[:16],
+        )
+
+    def _maybe_prepare_attention_matching_cross_turn_candidate(
+        self, request: Request
+    ) -> None:
+        replay = self._build_attention_matching_cross_turn_replay(request)
+        if replay is None:
+            return
+        assert request.prompt_token_ids is not None
+        self._activate_attention_matching_cross_turn_candidate(
+            request,
+            replay,
+            len(replay.steps) - 1,
+            list(request.prompt_token_ids),
+        )
+
+    def _restore_attention_matching_cross_turn_candidate(
+        self, request: Request
+    ) -> None:
+        original_prompt = request.attention_matching_original_prompt_token_ids
+        if original_prompt is None:
+            return
+        request.prompt_token_ids = list(original_prompt)
+        request.prompt_embeds = None
+        request.num_prompt_tokens = len(original_prompt)
+        request.logical_prompt_len = request.num_prompt_tokens
+        request._output_token_ids = []
+        request.output_token_ids = ConstantList(request._output_token_ids)
+        request._all_token_ids = list(original_prompt)
+        request.all_token_ids = ConstantList(request._all_token_ids)
+        request.position_offset = 0
+        request.attention_matching_active = False
+        request.attention_matching_snapshot_version = None
+        request.attention_matching_target_len = None
+        request.attention_matching_prefix_cache_key = None
+        request.attention_matching_prefix_cache_key_start = 0
+        request.attention_matching_prefix_cache_hash_start = 0
+        request.attention_matching_synthetic_prefix_len = 0
+        request.attention_matching_original_prompt_token_ids = None
+        request.attention_matching_cross_turn_candidate = False
+        request.attention_matching_cross_turn_event = None
+        request.attention_matching_cross_turn_replay = None
+        request.attention_matching_cross_turn_replay_index = -1
+        request.num_cached_tokens = -1
+        request.prefix_cache_read_hit_logged = False
+        if (
+            self.cache_config.enable_prefix_caching
+            and self.cache_config.prefix_caching_mode == "am_full"
+        ):
+            request.skip_reading_prefix_cache = True
+            request.skip_writing_prefix_cache = True
+            request.prefix_cache_skip_reason = (
+                "attention_matching_compressed_admission_miss"
+            )
+            request.prefix_cache_write_skip_logged = False
+        request._prompt_embeds_per_block_hashes.clear()
+        request.block_hashes = []
+        request.update_block_hashes()
+        self._refresh_attention_matching_protected_prompt_len(request)
+
+    def _maybe_finalize_attention_matching_cross_turn_candidate(
+        self,
+        request: Request,
+        num_local_computed_tokens: int,
+    ) -> bool:
+        """Return True when the caller must redo prefix lookup after fallback."""
+        if not request.attention_matching_cross_turn_candidate:
+            return False
+
+        event = request.attention_matching_cross_turn_event
+        min_replayable_hit_tokens = 0
+        if event is not None:
+            # A compressed hit is replayable once it covers the immutable
+            # protected prefix plus the synthetic AM prefix. Any missing exact
+            # tail remains ordinary physical prompt tokens and is prefilling
+            # under the compacted cache. This partial-hit mode is intentionally
+            # opt-in because trainer replay needs richer metadata to represent
+            # a shallow cached state followed by private deeper AM replay.
+            min_replayable_hit_tokens = (
+                event.protected_prefix_len + event.synthetic_prefix_len
+            )
+
+        max_safe_hit = max(request.num_tokens - 1, 0)
+        full_reusable_hit_tokens = (
+            max_safe_hit // self.block_size
+        ) * self.block_size
+        allow_partial_cross_turn_hits = bool(
+            getattr(
+                getattr(self, "cache_config", None),
+                "attention_matching_allow_partial_cross_turn_cache_hits",
+                False,
+            )
+        )
+        required_hit_tokens = (
+            min_replayable_hit_tokens
+            if allow_partial_cross_turn_hits
+            else full_reusable_hit_tokens
+        )
+
+        def retry_shallower_or_restore(reason: str) -> bool:
+            replay = request.attention_matching_cross_turn_replay
+            replay_index = request.attention_matching_cross_turn_replay_index
+            original_prompt = request.attention_matching_original_prompt_token_ids
+            key = (request.attention_matching_prefix_cache_key or "")[:16]
+
+            if (
+                replay is not None
+                and original_prompt is not None
+                and replay_index > 0
+            ):
+                logger.warning(
+                    "[PrefixCache][AM][cross-turn] compressed admission miss "
+                    "for request %s hit=%d required=%d min_required=%d "
+                    "full_reusable=%d allow_partial=%s step=%d/%d key=%s; "
+                    "retrying shallower",
+                    request.request_id,
+                    num_local_computed_tokens,
+                    required_hit_tokens,
+                    min_replayable_hit_tokens,
+                    full_reusable_hit_tokens,
+                    allow_partial_cross_turn_hits,
+                    replay_index + 1,
+                    len(replay.steps),
+                    key,
+                )
+                logger.warning(
+                    "[PrefixCache][AM][cross-turn] retrying request %s with "
+                    "shallower compressed AM state step=%d/%d after %s",
+                    request.request_id,
+                    replay_index,
+                    len(replay.steps),
+                    reason,
+                )
+                self._activate_attention_matching_cross_turn_candidate(
+                    request,
+                    replay,
+                    replay_index - 1,
+                    list(original_prompt),
+                )
+                return True
+
+            logger.warning(
+                "[PrefixCache][AM][cross-turn] compressed admission miss for "
+                "request %s hit=%d required=%d min_required=%d "
+                "full_reusable=%d allow_partial=%s step=%d/%d key=%s; "
+                "restoring full prompt for private AM replay",
+                request.request_id,
+                num_local_computed_tokens,
+                required_hit_tokens,
+                min_replayable_hit_tokens,
+                full_reusable_hit_tokens,
+                allow_partial_cross_turn_hits,
+                max(replay_index + 1, 0),
+                len(replay.steps) if replay is not None else 0,
+                key,
+            )
+            if reason != "cache_miss":
+                logger.warning(
+                    "[PrefixCache][AM][cross-turn] restoring request %s after "
+                    "compressed AM admission failed reason=%s",
+                    request.request_id,
+                    reason,
+                )
+            self._restore_attention_matching_cross_turn_candidate(request)
+            return True
+
+        if (
+            required_hit_tokens <= 0
+            or num_local_computed_tokens < required_hit_tokens
+        ):
+            return retry_shallower_or_restore("cache_miss")
+
+        if event is not None and not self._attention_matching_event_has_selected_indices(
+            event
+        ):
+            return retry_shallower_or_restore("missing_selected_indices")
+        if event is not None:
+            event.attention_matching_cache_hit_tokens = num_local_computed_tokens
+            request.compaction_events.append(event)
+        request.attention_matching_cross_turn_candidate = False
+        request.attention_matching_cross_turn_event = None
+        request.attention_matching_original_prompt_token_ids = None
+        replay = request.attention_matching_cross_turn_replay
+        replay_index = request.attention_matching_cross_turn_replay_index
+        request.attention_matching_cross_turn_replay = None
+        request.attention_matching_cross_turn_replay_index = -1
+        logger.warning(
+            "[PrefixCache][AM][cross-turn] compressed admission hit for "
+            "request %s hit=%d required=%d min_required=%d full_reusable=%d "
+            "allow_partial=%s step=%d/%d key=%s",
+            request.request_id,
+            num_local_computed_tokens,
+            required_hit_tokens,
+            min_replayable_hit_tokens,
+            full_reusable_hit_tokens,
+            allow_partial_cross_turn_hits,
+            max(replay_index + 1, 0),
+            len(replay.steps) if replay is not None else 0,
+            (request.attention_matching_prefix_cache_key or "")[:16],
+        )
+        return False
+
+    def _maybe_start_am_prefix_cache_tail_finalization(
+        self, request: Request
+    ) -> bool:
+        """Compute hidden filler KV so stopped AM turns end on full blocks."""
+        if (
+            not self.cache_config.enable_prefix_caching
+            or self.cache_config.prefix_caching_mode != "am_full"
+            or not self.cache_config.attention_matching_cross_turn_cache
+            or not self._attention_matching_enabled
+            or request.prefix_cache_tail_finalizing
+            or not request.attention_matching_active
+            or request.attention_matching_prefix_cache_key is None
+        ):
+            return False
+
+        padding_token_id = self.cache_config.compaction_turn_padding_token_id
+        if padding_token_id is None:
+            raise RuntimeError(
+                "AM cross-turn prefix caching requires "
+                "compaction_turn_padding_token_id so hidden tail "
+                "finalization uses the same block-alignment filler as the "
+                "orchestrator-rendered next turn."
+            )
+        if (
+            request.prompt_token_ids is None
+            or request.prompt_embeds is not None
+            or request.mm_features
+        ):
+            raise RuntimeError(
+                "AM prefix-cache tail finalization only supports token-id "
+                "text requests; prompt_embeds and multimodal features cannot "
+                "be finalized faithfully."
+            )
+
+        turn_end_token_id = self._get_attention_matching_turn_end_token_id()
+        hidden_token_ids: list[int] = []
+        needs_hidden_turn_end = (
+            not request.output_token_ids
+            or request.output_token_ids[-1] != turn_end_token_id
+        )
+        if needs_hidden_turn_end:
+            hidden_token_ids.append(turn_end_token_id)
+        hidden_token_ids.extend(DEFAULT_TURN_SEPARATOR_TOKEN_ID_SEQUENCE)
+
+        remainder = (request.num_tokens + len(hidden_token_ids)) % self.block_size
+        if remainder != 0:
+            hidden_token_ids.extend(
+                [padding_token_id] * (self.block_size - remainder)
+            )
+        if not hidden_token_ids:
+            return False
+
+        # The worker discards the dummy sample from hidden filler prefill, so
+        # the hidden tokens only need to fit in the actual model context.
+        if request.num_tokens + len(hidden_token_ids) > self.max_model_len:
+            logger.warning(
+                "[PrefixCache][AM] skipping tail block finalization for "
+                "request %s: tokens=%d hidden=%d max_model_len=%d",
+                request.request_id,
+                request.num_tokens,
+                len(hidden_token_ids),
+                self.max_model_len,
+            )
+            return False
+
+        if not request.compaction_events:
+            raise RuntimeError(
+                "AM prefix-cache tail finalization requires a compaction "
+                f"event to carry hidden tail tokens for request {request.request_id}."
+            )
+        last_event = request.compaction_events[-1]
+        if getattr(last_event, "compaction_strategy", "") != "attention_matching":
+            raise RuntimeError(
+                "AM prefix-cache tail finalization found a non-AM final "
+                f"compaction event for request {request.request_id}."
+            )
+        last_event.attention_matching_hidden_tail_token_ids = list(hidden_token_ids)
+
+        request.prefix_cache_tail_final_status = request.status
+        request.prefix_cache_tail_hidden_tokens = 0
+        request.append_hidden_output_token_ids(hidden_token_ids)
+        request.prefix_cache_tail_finalizing = True
+        request.status = RequestStatus.RUNNING
+        request.needs_rebuild = True
+        self.prev_step_scheduled_req_ids.discard(request.request_id)
+        request._prompt_embeds_per_block_hashes.clear()
+        request.block_hashes = []
+        request.update_block_hashes()
+        logger.warning(
+            "[PrefixCache][AM] finalizing stopped request %s with %d hidden "
+            "tokens to close a cache block (hidden_turn_end=%s tokens=%d key=%s)",
+            request.request_id,
+            len(hidden_token_ids),
+            needs_hidden_turn_end,
+            request.num_tokens,
+            (request.attention_matching_prefix_cache_key or "")[:16],
+        )
+        return True
+
+    def _maybe_privatize_attention_matching_blocks(
+        self, request: Request, num_tokens: int
+    ) -> None:
+        """Fork shared AM prefix-cache blocks before the request can mutate KV."""
+        if (
+            not self.cache_config.enable_prefix_caching
+            or self.cache_config.prefix_caching_mode != "am_full"
+            or not self.cache_config.attention_matching_cross_turn_cache
+            or not self._attention_matching_enabled
+            or request.attention_matching_prefix_cache_key is None
+            or num_tokens <= 0
+        ):
+            return
+        src, dst = self.kv_cache_manager.privatize_attention_matching_blocks(
+            request.request_id, num_tokens
+        )
+        if not src:
+            return
+        request.attention_matching_cow_src_block_ids.extend(src)
+        request.attention_matching_cow_dst_block_ids.extend(dst)
+        logger.warning(
+            "[PrefixCache][AM][COW] privatized %d shared cached blocks for "
+            "request %s before mutable AM continuation key=%s",
+            len(src),
+            request.request_id,
+            (request.attention_matching_prefix_cache_key or "")[:16],
+        )
 
     def _make_cached_request_data(
         self,
@@ -1469,11 +2457,32 @@ class Scheduler(SchedulerInterface):
         prompt_lengths: dict[str, int] = {}
         attention_matching_restore_req_ids: set[str] = set()
         attention_matching_snapshot_versions: dict[str, int] = {}
+        attention_matching_prefix_cache_keys: dict[str, str] = {}
+        attention_matching_prefix_cache_key_starts: dict[str, int] = {}
+        attention_matching_suppress_compaction_req_ids: set[str] = set()
+        attention_matching_cow_src_block_ids: dict[str, list[int]] = {}
+        attention_matching_cow_dst_block_ids: dict[str, list[int]] = {}
 
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
             req_id = req.request_id
             req_ids.append(req_id)
+            if req.attention_matching_prefix_cache_key is not None:
+                attention_matching_prefix_cache_keys[req_id] = (
+                    req.attention_matching_prefix_cache_key
+                )
+                attention_matching_prefix_cache_key_starts[req_id] = (
+                    req.attention_matching_prefix_cache_key_start
+                )
+            if req.prefix_cache_tail_finalizing:
+                attention_matching_suppress_compaction_req_ids.add(req_id)
+            if req.attention_matching_cow_src_block_ids:
+                attention_matching_cow_src_block_ids[req_id] = list(
+                    req.attention_matching_cow_src_block_ids
+                )
+                attention_matching_cow_dst_block_ids[req_id] = list(
+                    req.attention_matching_cow_dst_block_ids
+                )
             # NOTE: In PP+async scheduling, we consume token ids via a direct GPU
             # broadcast path (`input_batch.prev_sampled_token_ids`), so we can
             # omit this payload.
@@ -1551,6 +2560,15 @@ class Scheduler(SchedulerInterface):
             prompt_lengths=prompt_lengths,
             attention_matching_restore_req_ids=attention_matching_restore_req_ids,
             attention_matching_snapshot_versions=attention_matching_snapshot_versions,
+            attention_matching_prefix_cache_keys=attention_matching_prefix_cache_keys,
+            attention_matching_prefix_cache_key_starts=(
+                attention_matching_prefix_cache_key_starts
+            ),
+            attention_matching_suppress_compaction_req_ids=(
+                attention_matching_suppress_compaction_req_ids
+            ),
+            attention_matching_cow_src_block_ids=attention_matching_cow_src_block_ids,
+            attention_matching_cow_dst_block_ids=attention_matching_cow_dst_block_ids,
         )
 
     def _try_schedule_encoder_inputs(
@@ -1841,9 +2859,43 @@ class Scheduler(SchedulerInterface):
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             kv_transfer_params = None
             status_before_stop = request.status
+            hidden_tail_finalized = False
 
             # Check for stop and update request status.
-            if new_token_ids:
+            if request.prefix_cache_tail_finalizing:
+                # The previous visible step stopped the request but left a
+                # partial generated block. Hidden filler may be chunked by
+                # token budget, so finish only after all hidden filler KV has
+                # actually been computed. Sampled tokens from these filler
+                # steps are always discarded.
+                new_token_ids = []
+                if request.num_computed_tokens < request.num_tokens:
+                    logger.warning(
+                        "[PrefixCache][AM] continuing hidden tail finalization "
+                        "for request %s computed=%d tokens=%d hidden_tokens=%d",
+                        request.request_id,
+                        request.num_computed_tokens,
+                        request.num_tokens,
+                        request.prefix_cache_tail_hidden_tokens,
+                    )
+                else:
+                    stopped = True
+                    hidden_tail_finalized = True
+                    final_status = request.prefix_cache_tail_final_status
+                    request.prefix_cache_tail_finalizing = False
+                    request.prefix_cache_tail_final_status = None
+                    request.status = (
+                        final_status
+                        if final_status is not None
+                        else RequestStatus.FINISHED_STOPPED
+                    )
+                    logger.warning(
+                        "[PrefixCache][AM] completed hidden tail finalization for "
+                        "request %s hidden_tokens=%d",
+                        request.request_id,
+                        request.prefix_cache_tail_hidden_tokens,
+                    )
+            elif new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
@@ -1855,19 +2907,26 @@ class Scheduler(SchedulerInterface):
             routed_experts = None
             finish_reason = None
             if stopped:
-                routed_experts = self._get_routed_experts(request)
-
-                # Capture finish_reason BEFORE _handle_stopped_request, which may
-                # reset the status to WAITING for streaming requests that continue.
-                finish_reason = request.get_finished_reason()
-                finished = self._handle_stopped_request(request)
-                if finished:
-                    kv_transfer_params = self._free_request(request)
-
-                if status_before_stop == RequestStatus.RUNNING:
-                    stopped_running_reqs.add(request)
+                if (
+                    not hidden_tail_finalized
+                    and self._maybe_start_am_prefix_cache_tail_finalization(request)
+                ):
+                    stopped = False
                 else:
-                    stopped_preempted_reqs.add(request)
+                    if not hidden_tail_finalized:
+                        routed_experts = self._get_routed_experts(request)
+
+                    # Capture finish_reason BEFORE _handle_stopped_request, which may
+                    # reset the status to WAITING for streaming requests that continue.
+                    finish_reason = request.get_finished_reason()
+                    finished = self._handle_stopped_request(request)
+                    if finished:
+                        kv_transfer_params = self._free_request(request)
+
+                    if status_before_stop == RequestStatus.RUNNING:
+                        stopped_running_reqs.add(request)
+                    else:
+                        stopped_preempted_reqs.add(request)
 
             # Extract sample logprobs if needed.
             if (
@@ -1926,6 +2985,7 @@ class Scheduler(SchedulerInterface):
             if (
                 not stopped
                 and self._compaction_enabled
+                and not request.prefix_cache_tail_finalizing
                 and request.num_output_placeholders == 0
             ):
                 while self._should_compact(request):

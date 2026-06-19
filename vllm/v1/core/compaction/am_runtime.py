@@ -13,6 +13,7 @@ semantics while making the compaction step tractable online.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections.abc import Sequence
 from typing import Optional
 
 import torch
@@ -26,6 +27,13 @@ DEFAULT_PROGRESSIVE_SCHEDULE = [
     (160, 8, 8),
     (None, 16, 8),
 ]
+
+# Qwen-family chat templates separate messages with a single newline after
+# ``<|im_end|>``. Turn-window AM treats that separator as part of the completed
+# turn boundary so compaction never cuts between ``<|im_end|>`` and the next
+# ``<|im_start|>``.
+DEFAULT_TURN_SEPARATOR_TOKEN_ID_SEQUENCE = (198,)
+DEFAULT_TURN_SEPARATOR_TOKEN_IDS = frozenset(DEFAULT_TURN_SEPARATOR_TOKEN_ID_SEQUENCE)
 
 
 @dataclass(frozen=True)
@@ -60,6 +68,39 @@ class AttentionMatchingSnapshot:
     layer_keys: dict[str, torch.Tensor] = field(default_factory=dict)
     layer_values: dict[str, torch.Tensor] = field(default_factory=dict)
     layer_betas: dict[str, torch.Tensor] = field(default_factory=dict)
+
+
+def advance_attention_matching_turn_boundary(
+    token_ids: Sequence[int],
+    boundary: int,
+    source_len: int,
+    turn_padding_token_id: int | None,
+) -> int:
+    """Advance past inter-turn padding/separators after ``<|im_end|>``.
+
+    Historical runs padded immediately after ``<|im_end|>`` even though Qwen's
+    chat template then emits a newline. New runs pad after the newline. This
+    scanner intentionally accepts both layouts:
+
+    ``<|im_end|> filler* newline* filler*`` and
+    ``<|im_end|> newline* filler*``.
+    """
+
+    def consume_padding(pos: int) -> int:
+        if turn_padding_token_id is None:
+            return pos
+        while pos < source_len and int(token_ids[pos]) == turn_padding_token_id:
+            pos += 1
+        return pos
+
+    boundary = consume_padding(boundary)
+    while (
+        boundary < source_len
+        and int(token_ids[boundary]) in DEFAULT_TURN_SEPARATOR_TOKEN_IDS
+    ):
+        boundary += 1
+        boundary = consume_padding(boundary)
+    return boundary
 
 
 def build_attention_matching_plan(
@@ -99,6 +140,11 @@ def build_attention_matching_plan(
 
     target_len = protected_prefix_len + stride + exact_kept_tokens
     offset_delta = num_computed_tokens - target_len
+    # Avoid pathological one-token AM waves. The AM objective is unchanged:
+    # we still summarize compact_region_len tokens into stride synthetic
+    # tokens, but we wait until doing so removes at least one full stride.
+    if offset_delta < stride:
+        return None
     exact_region_start = num_computed_tokens - exact_kept_tokens
     if exact_kept_tokens > 0:
         query_region_start = exact_region_start
@@ -111,6 +157,107 @@ def build_attention_matching_plan(
         source_len=num_computed_tokens,
         protected_prefix_len=protected_prefix_len,
         synthetic_prefix_len=stride,
+        exact_kept_tokens=exact_kept_tokens,
+        target_len=target_len,
+        offset_delta=offset_delta,
+        compact_region_len=compact_region_len,
+        exact_region_start=exact_region_start,
+        query_region_start=query_region_start,
+        query_region_len=query_region_len,
+    )
+
+
+def build_attention_matching_turn_plan(
+    *,
+    num_computed_tokens: int,
+    synthetic_prefix_len: int,
+    token_ids: Sequence[int],
+    max_turns: int,
+    keep_recent_turns: int,
+    turn_end_token_id: int | None,
+    turn_padding_token_id: int | None = None,
+    protect_first_user: bool = True,
+    min_protected_prefix_len: int = 0,
+) -> AttentionMatchingCompactionPlan | None:
+    """Build an AM plan using completed chat turns as the compaction unit.
+
+    This mirrors Markovian Thinker turn-window semantics for TextWorld-style
+    comparisons while still using AM to synthesize KV for the evicted region.
+    The assumed rendered chat shape is:
+
+    ``system, user, assistant, user, assistant, ...``
+
+    with every message ending in ``turn_end_token_id``. If
+    ``turn_padding_token_id`` is set, a contiguous filler run immediately after
+    each message end is included in that message boundary. A completed turn is
+    a user/assistant pair after the system prefix. The plan compacts old
+    completed turns, keeps ``keep_recent_turns`` completed turns exact, and
+    also keeps any in-flight tail exact.
+    """
+    if (
+        synthetic_prefix_len <= 0
+        or max_turns <= 0
+        or keep_recent_turns <= 0
+        or turn_end_token_id is None
+        or num_computed_tokens <= 0
+    ):
+        return None
+
+    source_len = min(num_computed_tokens, len(token_ids))
+    if source_len <= 0:
+        return None
+
+    turn_ends: list[int] = []
+    pos = 0
+    while pos < source_len:
+        token_id = token_ids[pos]
+        if token_id != turn_end_token_id:
+            pos += 1
+            continue
+
+        boundary = advance_attention_matching_turn_boundary(
+            token_ids,
+            pos + 1,
+            source_len,
+            turn_padding_token_id,
+        )
+        turn_ends.append(boundary)
+        pos = boundary
+    # Need at least system + one user/assistant pair.
+    if len(turn_ends) < 3:
+        return None
+
+    completed_turns = (len(turn_ends) - 1) // 2
+    if completed_turns <= max_turns:
+        return None
+
+    keep_recent_turns = min(keep_recent_turns, max_turns, completed_turns)
+    first_kept_turn = completed_turns - keep_recent_turns
+    exact_region_start = turn_ends[2 * first_kept_turn]
+    protected_prefix_len = turn_ends[1] if protect_first_user else turn_ends[0]
+    protected_prefix_len = max(protected_prefix_len, min_protected_prefix_len)
+    protected_prefix_len = min(max(protected_prefix_len, 0), exact_region_start)
+
+    exact_kept_tokens = source_len - exact_region_start
+    compact_region_len = exact_region_start - protected_prefix_len
+    if compact_region_len <= synthetic_prefix_len:
+        return None
+
+    target_len = protected_prefix_len + synthetic_prefix_len + exact_kept_tokens
+    offset_delta = source_len - target_len
+    if offset_delta <= 0:
+        return None
+
+    query_region_start = exact_region_start
+    query_region_len = exact_kept_tokens
+    if query_region_len <= 0:
+        query_region_start = protected_prefix_len
+        query_region_len = compact_region_len
+
+    return AttentionMatchingCompactionPlan(
+        source_len=source_len,
+        protected_prefix_len=protected_prefix_len,
+        synthetic_prefix_len=synthetic_prefix_len,
         exact_kept_tokens=exact_kept_tokens,
         target_len=target_len,
         offset_delta=offset_delta,

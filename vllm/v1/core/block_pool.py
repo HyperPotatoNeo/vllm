@@ -260,13 +260,27 @@ class BlockPool:
             # align mode. We skip null blocks here.
             if blk.is_null:
                 continue
-            assert blk.block_hash is None
             block_hash = new_block_hashes[i]
-
-            # Update and added the full block to the cache.
             block_hash_with_group_id = make_block_hash_with_group_id(
                 block_hash, kv_cache_group_id
             )
+            if blk.block_hash is not None:
+                if blk.block_hash == block_hash_with_group_id:
+                    # AM compressed-cache admission can make two live requests
+                    # share the same already-cached compacted prefix blocks.
+                    # Treat those as cached rather than trying to re-hash them.
+                    self.cached_block_hash_to_block.insert(
+                        block_hash_with_group_id, blk
+                    )
+                    continue
+                raise AssertionError(
+                    "Tried to cache a block that already has a different "
+                    "prefix-cache hash. "
+                    f"block_id={blk.block_id} existing={blk.block_hash!r} "
+                    f"expected={block_hash_with_group_id!r}"
+                )
+
+            # Update and added the full block to the cache.
             blk.block_hash = block_hash_with_group_id
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
             if new_hashes is not None:

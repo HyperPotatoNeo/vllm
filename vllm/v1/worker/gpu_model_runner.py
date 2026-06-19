@@ -3,6 +3,7 @@
 
 import functools
 import gc
+import hashlib
 import itertools
 import logging
 import math
@@ -210,10 +211,18 @@ from .utils import (
 from vllm.v1.core.compaction.am_runtime import (
     DEFAULT_PROGRESSIVE_SCHEDULE,
     OMPCompaction,
+    AttentionMatchingCompactionPlan,
     AttentionMatchingSnapshot,
     AttentionMatchingRequestState,
     build_attention_matching_plan,
+    build_attention_matching_turn_plan,
     select_query_indices,
+)
+from vllm.v1.core.compaction.am_prefix_cache import (
+    build_attention_matching_prefix_cache_key,
+    build_attention_matching_turn_prefix_cache_replay,
+    build_cross_turn_query_seed,
+    hash_attention_matching_tokens,
 )
 from vllm.v1.core.compaction.shuffle_control import (
     ShuffleEvent,
@@ -956,10 +965,12 @@ class GPUModelRunner(
             )
         )
         self._attention_matching_layer_names: list[str] = []
+        self._attention_matching_layer_to_kv_cache_gid: dict[str, int] = {}
         self._attention_matching_omp = OMPCompaction(
             progressive_schedule=DEFAULT_PROGRESSIVE_SCHEDULE,
             nnls_upper_bound=1e3,
             c2_ridge_lambda=1e-3,
+            zerobeta=self.cache_config.attention_matching_zerobeta,
         )
         self._attention_matching_random_generator = torch.Generator(
             device=self.device
@@ -977,12 +988,16 @@ class GPUModelRunner(
             tuple[str, tuple[int, ...], torch.dtype],
             torch.Tensor,
         ] = {}
+        self._attention_matching_flat_kv_view_cache: dict[int, bool] = {}
         self._attention_matching_score_mod_signature: tuple[object, ...] | None = None
         self._attention_matching_score_mod_prompt_lens: tuple[
             torch.Tensor, torch.Tensor
         ] | None = None
         self._attention_matching_score_mod_beta_padded: dict[str, torch.Tensor] = {}
         self._attention_matching_score_mod_objects: dict[str, AttentionMatchingScoreMod] = {}
+        self._attention_matching_cross_turn_state_cache: dict[
+            str, AttentionMatchingRequestState
+        ] = {}
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -993,9 +1008,11 @@ class GPUModelRunner(
         )
         self._attention_matching_query_index_cache.clear()
         self._attention_matching_scratch.clear()
+        self._attention_matching_flat_kv_view_cache.clear()
         self._attention_matching_score_mod_signature = None
         self._attention_matching_score_mod_prompt_lens = None
         self._attention_matching_score_mod_beta_padded.clear()
+        self._attention_matching_cross_turn_state_cache.clear()
         if self.speculative_config:
             draft_config = self.speculative_config.draft_model_config
             if draft_config is None or draft_config.max_model_len is None:
@@ -1177,6 +1194,78 @@ class GPUModelRunner(
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
 
+    def _mrope_mm_token_ids(self) -> set[int]:
+        token_ids: set[int] = set()
+        configs = [getattr(self.model_config, "hf_config", None)]
+        hf_text_config = getattr(self.model_config, "hf_text_config", None)
+        if hf_text_config is not None:
+            configs.append(hf_text_config)
+        for config in configs:
+            if config is None:
+                continue
+            for name in (
+                "image_token_id",
+                "video_token_id",
+                "vision_start_token_id",
+                "vision_end_token_id",
+            ):
+                value = getattr(config, name, None)
+                if isinstance(value, int):
+                    token_ids.add(value)
+                elif isinstance(value, (list, tuple, set)):
+                    token_ids.update(v for v in value if isinstance(v, int))
+        return token_ids
+
+    def _assert_attention_matching_text_only_mrope_request(
+        self,
+        req_state: CachedRequestState,
+        context: str,
+        scan_prompt_tokens: bool = False,
+    ) -> None:
+        if not (self.uses_mrope and self._attention_matching_enabled):
+            return
+        if req_state.prompt_token_ids is None:
+            raise RuntimeError(
+                f"{context}: attention_matching with M-RoPE requires "
+                "prompt_token_ids."
+            )
+        if req_state.prompt_embeds is not None:
+            raise RuntimeError(
+                f"{context}: attention_matching with M-RoPE does not support "
+                "prompt_embeds."
+            )
+        if req_state.mm_features:
+            raise RuntimeError(
+                f"{context}: attention_matching with M-RoPE supports only "
+                "text-only requests; multimodal features were present."
+            )
+        mm_token_ids = self._mrope_mm_token_ids() if scan_prompt_tokens else set()
+        if (
+            mm_token_ids
+            and any(tid in mm_token_ids for tid in req_state.prompt_token_ids)
+        ):
+            raise RuntimeError(
+                f"{context}: attention_matching with M-RoPE supports only "
+                "text-only requests; multimodal sentinel token IDs were present."
+            )
+
+    def _init_text_only_mrope_positions_for_attention_matching(
+        self,
+        req_state: CachedRequestState,
+    ) -> None:
+        self._assert_attention_matching_text_only_mrope_request(
+            req_state, "_init_mrope_positions", scan_prompt_tokens=True
+        )
+        num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+            req_state.prompt_token_ids, req_state.prompt_embeds
+        )
+        positions = (
+            torch.arange(num_prompt_tokens, dtype=torch.long)
+            + int(req_state.position_offset)
+        )
+        req_state.mrope_positions = positions.unsqueeze(0).expand(3, -1).clone()
+        req_state.mrope_position_delta = 0
+
     def _validate_attention_matching_support(self) -> None:
         if not (
             self._attention_matching_enabled
@@ -1190,35 +1279,70 @@ class GPUModelRunner(
         assert not self.cache_config.cache_dtype.startswith("fp8"), (
             "long-context controls do not support fp8 KV cache storage"
         )
-        assert not self.uses_mrope, (
-            "long-context controls do not support M-RoPE models"
-        )
+        if self._shuffle_control_enabled or self._noise_control_enabled:
+            assert not self.uses_mrope, (
+                "shuffle/noise controls do not support M-RoPE models"
+            )
+        if self.uses_mrope:
+            assert self._attention_matching_enabled, (
+                "M-RoPE long-context support is only implemented for "
+                "attention_matching"
+            )
         assert self.uses_xdrope_dim == 0, (
             "long-context controls do not support XD-RoPE models"
         )
-        assert len(self.kv_cache_config.kv_cache_groups) == 1, (
-            "long-context controls currently support a single decoder "
-            "KV cache group"
-        )
-        kv_cache_group = self.kv_cache_config.kv_cache_groups[0]
-        assert isinstance(kv_cache_group.kv_cache_spec, FullAttentionSpec), (
-            "long-context controls require a full-attention KV cache"
-        )
+        if self._shuffle_control_enabled or self._noise_control_enabled:
+            assert len(self.kv_cache_config.kv_cache_groups) == 1, (
+                "shuffle/noise controls currently support a single decoder "
+                "KV cache group"
+            )
+            kv_cache_group = self.kv_cache_config.kv_cache_groups[0]
+            assert isinstance(kv_cache_group.kv_cache_spec, FullAttentionSpec), (
+                "shuffle/noise controls require a full-attention KV cache"
+            )
+            for attn_group in self.attn_groups[0]:
+                assert isinstance(attn_group.kv_cache_spec, FullAttentionSpec), (
+                    "shuffle/noise controls only support decoder "
+                    "FullAttentionSpec layers"
+                )
+                assert attn_group.kv_cache_spec.sliding_window is None, (
+                    "shuffle/noise controls do not support sliding-window layers"
+                )
+                assert attn_group.kv_cache_spec.attention_chunk_size is None, (
+                    "shuffle/noise controls do not support local-attention layers"
+                )
         self._attention_matching_layer_names = []
-        for attn_group in self.attn_groups[0]:
-            assert attn_group.backend.get_name() == "FLEX_ATTENTION", (
-                "long-context controls require --attention-backend flex_attention"
+        self._attention_matching_layer_to_kv_cache_gid = {}
+        needs_am_score_mod = (
+            self._attention_matching_enabled
+            and not self.cache_config.attention_matching_zerobeta
+        )
+        if self._attention_matching_enabled:
+            for kv_cache_gid, attn_groups in enumerate(self.attn_groups):
+                for attn_group in attn_groups:
+                    if not isinstance(attn_group.kv_cache_spec, FullAttentionSpec):
+                        continue
+                    if needs_am_score_mod:
+                        assert attn_group.backend.get_name() == "FLEX_ATTENTION", (
+                            "full-beta attention_matching requires "
+                            "--attention-backend flex_attention for score_mod "
+                            "beta replay"
+                        )
+                    assert attn_group.kv_cache_spec.sliding_window is None, (
+                        "attention_matching does not support sliding-window layers"
+                    )
+                    assert attn_group.kv_cache_spec.attention_chunk_size is None, (
+                        "attention_matching does not support local-attention layers"
+                    )
+                    for layer_name in attn_group.layer_names:
+                        self._attention_matching_layer_to_kv_cache_gid[layer_name] = (
+                            kv_cache_gid
+                        )
+                    self._attention_matching_layer_names.extend(attn_group.layer_names)
+            assert self._attention_matching_layer_names, (
+                "attention_matching requires at least one decoder "
+                "FullAttentionSpec layer"
             )
-            assert isinstance(attn_group.kv_cache_spec, FullAttentionSpec), (
-                "long-context controls only support decoder FullAttentionSpec layers"
-            )
-            assert attn_group.kv_cache_spec.sliding_window is None, (
-                "long-context controls do not support sliding-window layers"
-            )
-            assert attn_group.kv_cache_spec.attention_chunk_size is None, (
-                "long-context controls do not support local-attention layers"
-            )
-            self._attention_matching_layer_names.extend(attn_group.layer_names)
 
     def _shuffle_request_token_ids_locally(
         self,
@@ -1333,11 +1457,8 @@ class GPUModelRunner(
                 )
                 for layer_name in self._attention_matching_layer_names:
                     layer = self.compilation_config.static_forward_context[layer_name]
-                    token_kv_cache = layer.kv_cache.view(
-                        2,
-                        -1,
-                        layer.impl.num_kv_heads,
-                        layer.impl.head_size,
+                    token_kv_cache = self._attention_matching_token_kv_cache_view(
+                        layer.kv_cache, layer
                     )
                     chunk_kv = self._get_attention_matching_scratch(
                         "shuffle_chunk_kv",
@@ -1349,9 +1470,19 @@ class GPUModelRunner(
                         ),
                         token_kv_cache.dtype,
                     )
-                    torch.index_select(token_kv_cache, 1, chunk_slots, out=chunk_kv)
+                    self._attention_matching_index_select_kv_slots(
+                        layer.kv_cache,
+                        layer,
+                        chunk_slots,
+                        out=chunk_kv,
+                    )
                     shuffled_kv = chunk_kv.index_select(1, perm_tensor)
-                    token_kv_cache.index_copy_(1, chunk_slots, shuffled_kv)
+                    self._attention_matching_index_copy_kv_slots(
+                        layer.kv_cache,
+                        layer,
+                        chunk_slots,
+                        shuffled_kv,
+                    )
                 if not self.cache_config.shuffle_control_kv_only:
                     self._shuffle_request_token_ids_locally(
                         req_id,
@@ -1470,13 +1601,11 @@ class GPUModelRunner(
                 )
                 for layer_name in self._attention_matching_layer_names:
                     layer = self.compilation_config.static_forward_context[layer_name]
-                    token_kv_cache = layer.kv_cache.view(
-                        2,
-                        -1,
-                        layer.impl.num_kv_heads,
-                        layer.impl.head_size,
-                    )
-                    selected = token_kv_cache[list(kv_planes)][:, chunk_slots]
+                    selected = self._attention_matching_index_select_kv_slots(
+                        layer.kv_cache,
+                        layer,
+                        chunk_slots,
+                    )[list(kv_planes)]
                     if not torch.isfinite(selected).all():
                         raise RuntimeError(
                             f"noise_control saw non-finite KV values before noise "
@@ -1498,8 +1627,12 @@ class GPUModelRunner(
                             f"{req_id}, layer {layer_name}, chunk {chunk_index}"
                         )
                     for plane_offset, plane in enumerate(kv_planes):
-                        token_kv_cache[plane].index_copy_(
-                            0, chunk_slots, noised[plane_offset]
+                        self._attention_matching_index_copy_kv_plane_slots(
+                            layer.kv_cache,
+                            layer,
+                            plane,
+                            chunk_slots,
+                            noised[plane_offset],
                         )
                 logger.warning(
                     "[NOISE] noised request %s chunk=%d range=[%d,%d) "
@@ -1528,24 +1661,246 @@ class GPUModelRunner(
             req_state.noise_control_next_chunk_index = chunk_index + 1
         return results
 
+    def _copy_attention_matching_private_blocks(
+        self,
+        src_block_ids: list[int],
+        dst_block_ids: list[int],
+    ) -> None:
+        if not src_block_ids:
+            return
+        if len(src_block_ids) != len(dst_block_ids):
+            raise RuntimeError(
+                "AM copy-on-write block copy received mismatched src/dst "
+                f"counts: {len(src_block_ids)} vs {len(dst_block_ids)}"
+            )
+        static_forward_context = self.compilation_config.static_forward_context
+        for layer_name in self._attention_matching_layer_names:
+            layer = static_forward_context[layer_name]
+            kv_cache = layer.kv_cache
+            kv_cache_gid = self._attention_matching_kv_cache_gid_for_layer(layer_name)
+            block_size = self._attention_matching_logical_block_size(kv_cache_gid)
+            # layer.kv_cache is [2, num_blocks, block_size, kv_heads, head_dim].
+            # COW operates on physical block IDs but the AM rewrite helpers
+            # address token slots, so flatten blocks*block_size here.  Keeping
+            # the block dimension unflattened corrupts copies for small block
+            # IDs and yields empty source slices for larger IDs.
+            for src_block_id, dst_block_id in zip(
+                src_block_ids, dst_block_ids, strict=True
+            ):
+                src_slots = torch.arange(
+                    src_block_id * block_size,
+                    (src_block_id + 1) * block_size,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                dst_slots = torch.arange(
+                    dst_block_id * block_size,
+                    (dst_block_id + 1) * block_size,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                block_kv = self._attention_matching_index_select_kv_slots(
+                    kv_cache,
+                    layer,
+                    src_slots,
+                )
+                self._attention_matching_index_copy_kv_slots(
+                    kv_cache,
+                    layer,
+                    dst_slots,
+                    block_kv,
+                )
+
     def _build_attention_matching_slot_mapping(
         self,
         req_state: CachedRequestState,
         num_tokens: int,
+        *,
+        kv_cache_gid: int = 0,
     ) -> torch.Tensor:
-        block_size = self.cache_config.block_size
-        block_ids = req_state.block_ids[0]
-        block_ids_tensor = req_state.attention_matching_block_ids_tensor
-        if block_ids_tensor is None or block_ids_tensor.numel() != len(block_ids):
-            block_ids_tensor = torch.tensor(
-                block_ids,
-                device=self.device,
-                dtype=torch.long,
+        block_size = self._attention_matching_logical_block_size(kv_cache_gid)
+        if kv_cache_gid >= len(req_state.block_ids):
+            raise RuntimeError(
+                "attention_matching requested KV cache group "
+                f"{kv_cache_gid}, but request has only "
+                f"{len(req_state.block_ids)} block-id groups"
             )
-            req_state.attention_matching_block_ids_tensor = block_ids_tensor
+        block_ids = req_state.block_ids[kv_cache_gid]
+        if num_tokens > len(block_ids) * block_size:
+            raise RuntimeError(
+                "attention_matching slot mapping exceeds available blocks for "
+                f"KV cache group {kv_cache_gid}: num_tokens={num_tokens}, "
+                f"blocks={len(block_ids)}, block_size={block_size}"
+            )
+        block_ids_tensor = torch.tensor(
+            block_ids,
+            device=self.device,
+            dtype=torch.long,
+        )
         positions = self._attention_matching_positions[:num_tokens]
         return block_ids_tensor[positions // block_size] * block_size + (
             positions % block_size
+        )
+
+    def _attention_matching_kv_cache_gid_for_layer(self, layer_name: str) -> int:
+        return self._attention_matching_layer_to_kv_cache_gid.get(layer_name, 0)
+
+    def _attention_matching_logical_block_size(self, kv_cache_gid: int) -> int:
+        try:
+            kv_cache_group = self.kv_cache_config.kv_cache_groups[kv_cache_gid]
+            block_size = int(kv_cache_group.kv_cache_spec.block_size)
+        except (AttributeError, IndexError, TypeError, ValueError):
+            block_size = int(self.cache_config.block_size)
+        if block_size <= 0:
+            raise RuntimeError(
+                f"attention_matching invalid block_size={block_size} for "
+                f"KV cache group {kv_cache_gid}"
+            )
+        return block_size
+
+    def _attention_matching_try_token_kv_cache_view(
+        self,
+        kv_cache: torch.Tensor,
+        layer,
+    ) -> torch.Tensor | None:
+        cache_key = id(kv_cache)
+        cached = self._attention_matching_flat_kv_view_cache.get(cache_key)
+        if cached is False:
+            return None
+        try:
+            token_kv_cache = kv_cache.view(
+                2,
+                -1,
+                layer.impl.num_kv_heads,
+                layer.impl.head_size,
+            )
+        except RuntimeError:
+            self._attention_matching_flat_kv_view_cache[cache_key] = False
+            return None
+        self._attention_matching_flat_kv_view_cache[cache_key] = True
+        return token_kv_cache
+
+    def _attention_matching_token_kv_cache_view(
+        self,
+        kv_cache: torch.Tensor,
+        layer,
+    ) -> torch.Tensor:
+        token_kv_cache = self._attention_matching_try_token_kv_cache_view(
+            kv_cache,
+            layer,
+        )
+        if token_kv_cache is None:
+            raise RuntimeError(
+                "attention_matching expected a flattenable KV cache view for this "
+                "operation, but the cache is non-contiguous. Use the AM slot gather/"
+                "scatter helpers instead."
+            )
+        return token_kv_cache
+
+    def _attention_matching_validate_block_kv_cache(
+        self,
+        kv_cache: torch.Tensor,
+        layer,
+    ) -> int:
+        logical_block_size = int(self.cache_config.block_size)
+        physical_block_size = int(kv_cache.shape[2]) if kv_cache.dim() >= 3 else 0
+        expected = (
+            2,
+            "*",
+            f"physical block size dividing logical block size {logical_block_size}",
+            layer.impl.num_kv_heads,
+            layer.impl.head_size,
+        )
+        if (
+            kv_cache.dim() != 5
+            or kv_cache.shape[0] != 2
+            or physical_block_size <= 0
+            or logical_block_size % physical_block_size != 0
+            or kv_cache.shape[3] != layer.impl.num_kv_heads
+            or kv_cache.shape[4] != layer.impl.head_size
+        ):
+            raise RuntimeError(
+                "attention_matching found a non-flattenable KV cache with unsupported "
+                f"shape {tuple(kv_cache.shape)}; expected {expected}."
+            )
+        return physical_block_size
+
+    def _attention_matching_index_select_kv_slots(
+        self,
+        kv_cache: torch.Tensor,
+        layer,
+        slots: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        token_kv_cache = self._attention_matching_try_token_kv_cache_view(
+            kv_cache,
+            layer,
+        )
+        if token_kv_cache is not None:
+            return torch.index_select(token_kv_cache, 1, slots, out=out)
+
+        block_size = self._attention_matching_validate_block_kv_cache(kv_cache, layer)
+        block_indices = torch.div(slots, block_size, rounding_mode="floor")
+        block_offsets = slots.remainder(block_size)
+        selected = kv_cache[:, block_indices, block_offsets]
+        if out is not None:
+            out.copy_(selected)
+            return out
+        return selected
+
+    def _attention_matching_index_copy_kv_plane_slots(
+        self,
+        kv_cache: torch.Tensor,
+        layer,
+        plane: int,
+        slots: torch.Tensor,
+        values: torch.Tensor,
+    ) -> None:
+        token_kv_cache = self._attention_matching_try_token_kv_cache_view(
+            kv_cache,
+            layer,
+        )
+        if token_kv_cache is not None:
+            token_kv_cache[plane].index_copy_(0, slots, values)
+            return
+
+        block_size = self._attention_matching_validate_block_kv_cache(kv_cache, layer)
+        block_indices = torch.div(slots, block_size, rounding_mode="floor")
+        block_offsets = slots.remainder(block_size)
+        kv_cache[plane].index_put_(
+            (block_indices, block_offsets),
+            values,
+            accumulate=False,
+        )
+
+    def _attention_matching_index_copy_kv_slots(
+        self,
+        kv_cache: torch.Tensor,
+        layer,
+        slots: torch.Tensor,
+        values: torch.Tensor,
+    ) -> None:
+        token_kv_cache = self._attention_matching_try_token_kv_cache_view(
+            kv_cache,
+            layer,
+        )
+        if token_kv_cache is not None:
+            token_kv_cache.index_copy_(1, slots, values)
+            return
+        self._attention_matching_index_copy_kv_plane_slots(
+            kv_cache,
+            layer,
+            0,
+            slots,
+            values[0],
+        )
+        self._attention_matching_index_copy_kv_plane_slots(
+            kv_cache,
+            layer,
+            1,
+            slots,
+            values[1],
         )
 
     def _get_attention_matching_query_indices(
@@ -1577,6 +1932,7 @@ class GPUModelRunner(
         self,
         *,
         layer_name: str,
+        seed: int,
         num_queries: int,
         num_kv_heads: int,
         head_size: int,
@@ -1588,8 +1944,213 @@ class GPUModelRunner(
             (num_queries, num_kv_heads, head_size),
             dtype,
         )
-        query_keys.normal_(generator=self._attention_matching_random_generator)
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(seed % (2**63 - 1))
+        query_keys.normal_(generator=generator)
         return query_keys
+
+    def _get_attention_matching_query_seed(
+        self,
+        *,
+        req_id: str,
+        source_len: int,
+        version: int,
+    ) -> int:
+        base_seed = int(getattr(self.model_config, "seed", 0) or 0)
+        payload = f"{base_seed}:{req_id}:{source_len}:{version}".encode()
+        digest = hashlib.blake2b(payload, digest_size=8).digest()
+        return int.from_bytes(digest, "little") % (2**63 - 1)
+
+    def _get_attention_matching_cross_turn_query_seed(
+        self,
+        req_state: CachedRequestState,
+        plan: "AttentionMatchingCompactionPlan",
+    ) -> int:
+        compacted_tokens_hash = hash_attention_matching_tokens(
+            [
+                req_state.get_token_id(i)
+                for i in range(
+                    plan.protected_prefix_len,
+                    plan.source_len - plan.exact_kept_tokens,
+                )
+            ]
+        )
+        return build_cross_turn_query_seed(
+            base_seed=int(getattr(self.model_config, "seed", 0) or 0),
+            cache_salt=req_state.cache_salt,
+            compacted_tokens_hash=compacted_tokens_hash,
+            protected_prefix_len=plan.protected_prefix_len,
+            synthetic_prefix_len=plan.synthetic_prefix_len,
+            query_source=self.cache_config.attention_matching_query_source,
+            max_queries_per_kv_head=(
+                self.cache_config.attention_matching_max_queries_per_kv_head
+            ),
+            zerobeta=self.cache_config.attention_matching_zerobeta,
+            parent_key=req_state.attention_matching_prefix_cache_key,
+            forget_gate_enabled=(
+                self.cache_config.attention_matching_forget_gate_enabled
+            ),
+            forget_gate_alpha=self.cache_config.attention_matching_forget_gate_alpha,
+        )
+
+    def _build_attention_matching_prefix_cache_key_for_plan(
+        self,
+        req_state: CachedRequestState,
+        plan: "AttentionMatchingCompactionPlan",
+        *,
+        query_seed: int,
+        version: int,
+    ) -> str | None:
+        if (
+            not self.cache_config.enable_prefix_caching
+            or self.cache_config.prefix_caching_mode != "am_full"
+        ):
+            return None
+        compacted_tokens_hash = hash_attention_matching_tokens(
+            [
+                req_state.get_token_id(i)
+                for i in range(
+                    plan.protected_prefix_len,
+                    plan.source_len - plan.exact_kept_tokens,
+                )
+            ]
+        )
+        tail_signature = None
+        if self.cache_config.attention_matching_query_source != "random_queries":
+            tail_signature = (version, plan.source_len, plan.target_len)
+        return build_attention_matching_prefix_cache_key(
+            cache_salt=req_state.cache_salt,
+            protected_prefix_len=plan.protected_prefix_len,
+            synthetic_prefix_len=plan.synthetic_prefix_len,
+            compacted_tokens_hash=compacted_tokens_hash,
+            query_source=self.cache_config.attention_matching_query_source,
+            max_queries_per_kv_head=(
+                self.cache_config.attention_matching_max_queries_per_kv_head
+            ),
+            query_seed=query_seed,
+            zerobeta=self.cache_config.attention_matching_zerobeta,
+            parent_key=req_state.attention_matching_prefix_cache_key,
+            parent_key_start=req_state.attention_matching_prefix_cache_key_start,
+            tail_signature=tail_signature,
+            forget_gate_enabled=(
+                self.cache_config.attention_matching_forget_gate_enabled
+            ),
+            forget_gate_alpha=self.cache_config.attention_matching_forget_gate_alpha,
+        )
+
+    def _get_attention_matching_turn_end_token_id(self) -> int:
+        token_id = self.cache_config.compaction_turn_end_token_id
+        if token_id is not None:
+            return token_id
+        eos_token_id = getattr(self.model_config.hf_config, "eos_token_id", None)
+        if isinstance(eos_token_id, int):
+            return eos_token_id
+        if isinstance(eos_token_id, list) and len(eos_token_id) == 1:
+            return int(eos_token_id[0])
+        raise RuntimeError(
+            "AM turn-window compaction requires compaction_turn_end_token_id "
+            "or a single integer model eos_token_id"
+        )
+
+    def _register_attention_matching_cross_turn_state(
+        self, req_state: CachedRequestState
+    ) -> None:
+        key = req_state.attention_matching_prefix_cache_key
+        state = req_state.attention_matching_state
+        if (
+            not self.cache_config.attention_matching_cross_turn_cache
+            or key is None
+            or state is None
+            or state.synthetic_prefix_len <= 0
+        ):
+            return
+
+        layer_betas: dict[str, torch.Tensor] = {}
+        for layer_name, beta in state.layer_betas.items():
+            beta_cpu = beta.detach().to(device="cpu", non_blocking=False)
+            if is_pin_memory_available():
+                beta_cpu = beta_cpu.pin_memory()
+            layer_betas[layer_name] = beta_cpu
+        if (
+            not self.cache_config.attention_matching_zerobeta
+            and len(layer_betas) != len(self._attention_matching_layer_names)
+        ):
+            raise RuntimeError(
+                "AM cross-turn cache cannot register incomplete beta metadata "
+                f"for request {req_state.req_id} key={key[:16]} "
+                f"got_layers={len(layer_betas)} expected="
+                f"{len(self._attention_matching_layer_names)}"
+            )
+        self._attention_matching_cross_turn_state_cache[key] = (
+            AttentionMatchingRequestState(
+                synthetic_prefix_len=state.synthetic_prefix_len,
+                protected_prefix_len=state.protected_prefix_len,
+                version=state.version,
+                layer_betas=layer_betas,
+            )
+        )
+        logger.warning(
+            "[PrefixCache][AM][cross-turn] registered worker AM state "
+            "request=%s key=%s synthetic=%d version=%d",
+            req_state.req_id,
+            key[:16],
+            state.synthetic_prefix_len,
+            state.version,
+        )
+
+    def _maybe_restore_attention_matching_cross_turn_state(
+        self, req_state: CachedRequestState
+    ) -> None:
+        key = req_state.attention_matching_prefix_cache_key
+        synthetic_len = req_state.attention_matching_synthetic_prefix_len
+        if (
+            not self.cache_config.attention_matching_cross_turn_cache
+            or key is None
+            or synthetic_len <= 0
+        ):
+            return
+
+        cached = self._attention_matching_cross_turn_state_cache.get(key)
+        if cached is None:
+            if self.cache_config.attention_matching_zerobeta:
+                req_state.attention_matching_state = AttentionMatchingRequestState(
+                    synthetic_prefix_len=synthetic_len,
+                    protected_prefix_len=(
+                        req_state.attention_matching_prefix_cache_key_start
+                    ),
+                    version=1,
+                    layer_betas={},
+                )
+                return
+            raise RuntimeError(
+                "AM cross-turn compressed prefix-cache hit has no worker "
+                "score-mod metadata. This would silently drop beta and is not "
+                f"faithful. request={req_state.req_id} key={key[:16]}"
+            )
+
+        if cached.synthetic_prefix_len != synthetic_len:
+            raise RuntimeError(
+                "AM cross-turn state synthetic length mismatch for request "
+                f"{req_state.req_id}: cached={cached.synthetic_prefix_len} "
+                f"request={synthetic_len}"
+            )
+        req_state.attention_matching_state = AttentionMatchingRequestState(
+            synthetic_prefix_len=cached.synthetic_prefix_len,
+            protected_prefix_len=cached.protected_prefix_len,
+            version=cached.version,
+            layer_betas={
+                layer_name: beta.to(self.device, non_blocking=False)
+                for layer_name, beta in cached.layer_betas.items()
+            },
+        )
+        logger.warning(
+            "[PrefixCache][AM][cross-turn] restored worker AM state "
+            "request=%s key=%s synthetic=%d version=%d",
+            req_state.req_id,
+            key[:16],
+            cached.synthetic_prefix_len,
+            cached.version,
+        )
 
     def _snapshot_attention_matching_request(
         self,
@@ -1604,9 +2165,6 @@ class GPUModelRunner(
             return
 
         assert req_state.block_ids, "attention_matching snapshot requires block ids"
-        slot_mapping = self._build_attention_matching_slot_mapping(
-            req_state, req_state.num_computed_tokens
-        )
         static_forward_context = self.compilation_config.static_forward_context
 
         layer_keys: dict[str, torch.Tensor] = {}
@@ -1616,17 +2174,21 @@ class GPUModelRunner(
         for layer_name in self._attention_matching_layer_names:
             layer = static_forward_context[layer_name]
             kv_cache = layer.kv_cache
-            token_kv_cache = kv_cache.view(
-                2,
-                -1,
-                layer.impl.num_kv_heads,
-                layer.impl.head_size,
+            slot_mapping = self._build_attention_matching_slot_mapping(
+                req_state,
+                req_state.num_computed_tokens,
+                kv_cache_gid=self._attention_matching_kv_cache_gid_for_layer(layer_name),
             )
-            keys = token_kv_cache[0].index_select(0, slot_mapping).to(
+            selected_kv = self._attention_matching_index_select_kv_slots(
+                kv_cache,
+                layer,
+                slot_mapping,
+            )
+            keys = selected_kv[0].to(
                 device="cpu",
                 non_blocking=False,
             )
-            values = token_kv_cache[1].index_select(0, slot_mapping).to(
+            values = selected_kv[1].to(
                 device="cpu",
                 non_blocking=False,
             )
@@ -1685,32 +2247,32 @@ class GPUModelRunner(
             )
 
         assert req_state.block_ids, "attention_matching restore requires block ids"
-        slot_mapping = self._build_attention_matching_slot_mapping(
-            req_state, snapshot.target_len
-        )
         static_forward_context = self.compilation_config.static_forward_context
 
         for layer_name in self._attention_matching_layer_names:
             layer = static_forward_context[layer_name]
             kv_cache = layer.kv_cache
-            token_kv_cache = kv_cache.view(
-                2,
-                -1,
-                layer.impl.num_kv_heads,
-                layer.impl.head_size,
+            slot_mapping = self._build_attention_matching_slot_mapping(
+                req_state,
+                snapshot.target_len,
+                kv_cache_gid=self._attention_matching_kv_cache_gid_for_layer(layer_name),
             )
             keys = snapshot.layer_keys[layer_name].to(
                 device=self.device,
-                dtype=token_kv_cache.dtype,
+                dtype=kv_cache.dtype,
                 non_blocking=False,
             )
             values = snapshot.layer_values[layer_name].to(
                 device=self.device,
-                dtype=token_kv_cache.dtype,
+                dtype=kv_cache.dtype,
                 non_blocking=False,
             )
-            token_kv_cache[0].index_copy_(0, slot_mapping, keys)
-            token_kv_cache[1].index_copy_(0, slot_mapping, values)
+            self._attention_matching_index_copy_kv_plane_slots(
+                kv_cache, layer, 0, slot_mapping, keys
+            )
+            self._attention_matching_index_copy_kv_plane_slots(
+                kv_cache, layer, 1, slot_mapping, values
+            )
 
         req_state.num_computed_tokens = snapshot.target_len
         req_state.position_offset = snapshot.position_offset
@@ -1733,6 +2295,16 @@ class GPUModelRunner(
 
     def _update_attention_matching_score_mods(self) -> None:
         if not self._attention_matching_enabled or not self._attention_matching_layer_names:
+            return
+        if self.cache_config.attention_matching_zerobeta:
+            static_forward_context = self.compilation_config.static_forward_context
+            for layer_name in self._attention_matching_layer_names:
+                layer = static_forward_context[layer_name]
+                if hasattr(layer, "score_mod"):
+                    layer.score_mod = None
+            self._attention_matching_score_mod_signature = None
+            self._attention_matching_score_mod_prompt_lens = None
+            self._attention_matching_score_mod_beta_padded.clear()
             return
         num_reqs = self.input_batch.num_reqs
         if num_reqs == 0:
@@ -1835,19 +2407,129 @@ class GPUModelRunner(
         self,
         req_id: str,
         req_state: CachedRequestState,
+        source_len: int | None = None,
+        pre_sample: bool = False,
+        forced_plan: AttentionMatchingCompactionPlan | None = None,
+        forced_query_seed: int | None = None,
+        forced_prefix_cache_key: str | None = None,
+        preserve_suffix: bool = False,
     ) -> AttentionMatchingCompactionResult | None:
-        plan = build_attention_matching_plan(
-            num_computed_tokens=req_state.num_computed_tokens,
-            window_size=self.cache_config.compaction_window_size,
-            stride=self.cache_config.compaction_stride,
-            num_prompt_tokens=req_state.num_prompt_tokens,
-            protected_prefix_len=(
-                0
-                if self.cache_config.attention_matching_protect_user_prompts == "none"
-                else req_state.attention_matching_protected_prompt_len
-            ),
+        num_computed_tokens = (
+            req_state.num_computed_tokens if source_len is None else source_len
         )
+        if forced_plan is not None:
+            num_computed_tokens = max(
+                req_state.num_computed_tokens, forced_plan.source_len
+            )
+        if num_computed_tokens > req_state.num_tokens:
+            if not req_state.attention_matching_unknown_token_skip_logged:
+                logger.warning(
+                    "[AM] skipping compaction request %s because source_len=%d "
+                    "exceeds known token count=%d (prompt=%d output=%d "
+                    "pre_sample=%s)",
+                    req_id,
+                    num_computed_tokens,
+                    req_state.num_tokens,
+                    req_state.num_prompt_tokens,
+                    len(req_state.output_token_ids),
+                    pre_sample,
+                )
+                req_state.attention_matching_unknown_token_skip_logged = True
+            return None
+        # Trainer replay records compaction boundaries in generated-token
+        # coordinates. A boundary of 0 is replayable after the full prompt
+        # forward, but a compaction during chunked prompt prefill would require
+        # a prompt-internal replay boundary that the current trainer path does
+        # not represent. Skip AM until the complete prompt KV exists.
+        if num_computed_tokens < req_state.num_prompt_tokens:
+            if (
+                not req_state.attention_matching_prefill_skip_logged
+                and num_computed_tokens + self.scheduler_config.max_num_batched_tokens
+                >= req_state.num_prompt_tokens
+            ):
+                logger.warning(
+                    "[AM] waiting for full prompt before compaction request %s "
+                    "computed=%d prompt=%d pre_sample=%s",
+                    req_id,
+                    num_computed_tokens,
+                    req_state.num_prompt_tokens,
+                    pre_sample,
+                )
+                req_state.attention_matching_prefill_skip_logged = True
+            return None
+
+        protect_mode = self.cache_config.attention_matching_protect_user_prompts
+        if protect_mode == "none":
+            protected_prefix_len = 0
+        elif protect_mode == "all_user" or self.cache_config.compaction_max_turns <= 0:
+            protected_prefix_len = req_state.attention_matching_protected_prompt_len
+        else:
+            # Turn-window AM computes the first-user boundary from rendered
+            # chat turn markers. Treating first_user as the whole prompt would
+            # disable prompt-time turn compaction for multi-turn environments.
+            protected_prefix_len = 0
+        if self.cache_config.prefix_caching_mode in ("prefill_only", "am_full"):
+            protected_prefix_len = max(
+                protected_prefix_len,
+                min(req_state.num_prefix_cached_tokens, req_state.num_prompt_tokens),
+            )
+
+        if forced_plan is not None:
+            plan = forced_plan
+        elif self.cache_config.compaction_max_turns > 0:
+            source_tokens = [
+                req_state.get_token_id(i) for i in range(num_computed_tokens)
+            ]
+            plan = build_attention_matching_turn_plan(
+                num_computed_tokens=num_computed_tokens,
+                synthetic_prefix_len=self.cache_config.compaction_stride,
+                token_ids=source_tokens,
+                max_turns=self.cache_config.compaction_max_turns,
+                keep_recent_turns=(
+                    self.cache_config.compaction_eviction_turn_stride
+                ),
+                turn_end_token_id=self._get_attention_matching_turn_end_token_id(),
+                turn_padding_token_id=(
+                    self.cache_config.compaction_turn_padding_token_id
+                ),
+                protect_first_user=(
+                    self.cache_config.attention_matching_protect_user_prompts
+                    == "first_user"
+                ),
+                min_protected_prefix_len=protected_prefix_len,
+            )
+        else:
+            plan = build_attention_matching_plan(
+                num_computed_tokens=num_computed_tokens,
+                window_size=self.cache_config.compaction_window_size,
+                stride=self.cache_config.compaction_stride,
+                num_prompt_tokens=req_state.num_prompt_tokens,
+                protected_prefix_len=protected_prefix_len,
+            )
         if plan is None:
+            if not req_state.attention_matching_plan_skip_logged:
+                turn_count = 0
+                if self.cache_config.compaction_max_turns > 0:
+                    turn_end_token_id = self._get_attention_matching_turn_end_token_id()
+                    source_tokens = [
+                        req_state.get_token_id(i) for i in range(num_computed_tokens)
+                    ]
+                    turn_count = source_tokens.count(turn_end_token_id)
+                logger.warning(
+                    "[AM] no compaction plan for request %s source_len=%d "
+                    "prompt=%d output=%d max_turns=%d keep_recent_turns=%d "
+                    "protected_prefix=%d turn_count=%d pre_sample=%s",
+                    req_id,
+                    num_computed_tokens,
+                    req_state.num_prompt_tokens,
+                    len(req_state.output_token_ids),
+                    self.cache_config.compaction_max_turns,
+                    self.cache_config.compaction_eviction_turn_stride,
+                    protected_prefix_len,
+                    turn_count,
+                    pre_sample,
+                )
+                req_state.attention_matching_plan_skip_logged = True
             return None
 
         compaction_start = time.perf_counter()
@@ -1863,35 +2545,16 @@ class GPUModelRunner(
             plan.query_region_len,
         )
 
-        assert req_state.block_ids, "attention_matching requires block ids"
-        slot_mapping = self._build_attention_matching_slot_mapping(
-            req_state, plan.source_len
+        suffix_len = (
+            max(num_computed_tokens - plan.source_len, 0) if preserve_suffix else 0
         )
-        protected_slots = slot_mapping[: plan.protected_prefix_len]
+        slot_mapping_len = plan.source_len + suffix_len
+        assert req_state.block_ids, "attention_matching requires block ids"
         compact_region_start = plan.protected_prefix_len
         compact_region_end = compact_region_start + plan.compact_region_len
-        compact_slots = slot_mapping[compact_region_start:compact_region_end]
-        exact_slots = slot_mapping[plan.exact_region_start : plan.source_len]
         use_random_queries = (
             self.cache_config.attention_matching_query_source == "random_queries"
         )
-        if use_random_queries:
-            query_slots = slot_mapping[:0]
-        elif self.cache_config.attention_matching_query_source == "recent_cache_keys":
-            query_slots = slot_mapping[
-                plan.query_region_start : plan.query_region_start + plan.query_region_len
-            ]
-        else:
-            query_slots = compact_slots
-        target_slots = slot_mapping[: plan.target_len]
-        protected_target_slots = target_slots[: plan.protected_prefix_len]
-        synth_target_slots = target_slots[
-            plan.protected_prefix_len : plan.protected_prefix_len
-            + plan.synthetic_prefix_len
-        ]
-        exact_target_slots = target_slots[
-            plan.protected_prefix_len + plan.synthetic_prefix_len :
-        ]
         query_source_len = 0
         if not use_random_queries:
             query_source_len = (
@@ -1914,29 +2577,106 @@ class GPUModelRunner(
             )
         static_forward_context = self.compilation_config.static_forward_context
         layer_betas: dict[str, torch.Tensor] = {}
+        selected_indices_by_layer: list[list[list[int]]] = []
         emit_layer_diagnostics = logger.isEnabledFor(logging.DEBUG)
         prev_attention_matching_state = req_state.attention_matching_state
+        forget_gate_enabled = (
+            self.cache_config.attention_matching_forget_gate_enabled
+        )
+        forget_gate_alpha = float(
+            self.cache_config.attention_matching_forget_gate_alpha
+        )
+        if forget_gate_enabled and not (0.0 <= forget_gate_alpha <= 1.0):
+            raise RuntimeError(
+                "attention_matching_forget_gate_alpha must be in [0, 1], got "
+                f"{forget_gate_alpha}."
+            )
+        forget_gate_applied = False
+        if forget_gate_enabled and prev_attention_matching_state is not None:
+            if (
+                prev_attention_matching_state.synthetic_prefix_len
+                != plan.synthetic_prefix_len
+                or prev_attention_matching_state.protected_prefix_len
+                != plan.protected_prefix_len
+            ):
+                raise RuntimeError(
+                    "AM forget gate cannot blend misaligned synthetic memory for "
+                    f"request {req_id}: previous=(protected="
+                    f"{prev_attention_matching_state.protected_prefix_len}, "
+                    f"synthetic={prev_attention_matching_state.synthetic_prefix_len}) "
+                    f"current=(protected={plan.protected_prefix_len}, "
+                    f"synthetic={plan.synthetic_prefix_len})."
+                )
+            forget_gate_applied = True
+        next_version = (
+            1
+            if prev_attention_matching_state is None
+            else prev_attention_matching_state.version + 1
+        )
+        if forced_query_seed is not None:
+            query_seed = int(forced_query_seed)
+        elif (
+            self.cache_config.attention_matching_cross_turn_cache
+            and self.cache_config.attention_matching_query_source == "random_queries"
+        ):
+            query_seed = self._get_attention_matching_cross_turn_query_seed(
+                req_state, plan
+            )
+        else:
+            query_seed = self._get_attention_matching_query_seed(
+                req_id=req_id,
+                source_len=plan.source_len,
+                version=next_version,
+            )
+        prefix_cache_key = forced_prefix_cache_key
+        if prefix_cache_key is None:
+            prefix_cache_key = self._build_attention_matching_prefix_cache_key_for_plan(
+                req_state,
+                plan,
+                query_seed=query_seed,
+                version=next_version,
+            )
 
-        for layer_name in self._attention_matching_layer_names:
+        for layer_idx, layer_name in enumerate(self._attention_matching_layer_names):
             layer = static_forward_context[layer_name]
             kv_cache = layer.kv_cache
-            token_kv_cache = kv_cache.view(
-                2,
-                -1,
-                layer.impl.num_kv_heads,
-                layer.impl.head_size,
-            )
-            kv_dtype = token_kv_cache.dtype
+            kv_dtype = kv_cache.dtype
             kv_shape = (layer.impl.num_kv_heads, layer.impl.head_size)
+            slot_mapping = self._build_attention_matching_slot_mapping(
+                req_state,
+                slot_mapping_len,
+                kv_cache_gid=self._attention_matching_kv_cache_gid_for_layer(layer_name),
+            )
+            compact_slots = slot_mapping[compact_region_start:compact_region_end]
+            exact_slots = slot_mapping[plan.exact_region_start : plan.source_len]
+            if use_random_queries:
+                query_slots = slot_mapping[:0]
+            elif (
+                self.cache_config.attention_matching_query_source
+                == "recent_cache_keys"
+            ):
+                query_slots = slot_mapping[
+                    plan.query_region_start : plan.query_region_start
+                    + plan.query_region_len
+                ]
+            else:
+                query_slots = compact_slots
+            target_slots = slot_mapping[: plan.target_len]
+            synth_target_slots = target_slots[
+                plan.protected_prefix_len : plan.protected_prefix_len
+                + plan.synthetic_prefix_len
+            ]
+            exact_target_slots = target_slots[
+                plan.protected_prefix_len + plan.synthetic_prefix_len :
+            ]
+            suffix_slots = slot_mapping[plan.source_len : plan.source_len + suffix_len]
+            suffix_target_slots = slot_mapping[
+                plan.target_len : plan.target_len + suffix_len
+            ]
 
             compact_kv = self._get_attention_matching_scratch(
                 "compact_kv",
                 (2, compact_slots.numel(), *kv_shape),
-                kv_dtype,
-            )
-            protected_kv = self._get_attention_matching_scratch(
-                "protected_kv",
-                (2, protected_slots.numel(), *kv_shape),
                 kv_dtype,
             )
             exact_kv = self._get_attention_matching_scratch(
@@ -1944,6 +2684,13 @@ class GPUModelRunner(
                 (2, exact_slots.numel(), *kv_shape),
                 kv_dtype,
             )
+            suffix_kv = None
+            if suffix_slots.numel() > 0:
+                suffix_kv = self._get_attention_matching_scratch(
+                    "suffix_kv",
+                    (2, suffix_slots.numel(), *kv_shape),
+                    kv_dtype,
+                )
             query_source_kv = None
             if not use_random_queries:
                 query_source_kv = self._get_attention_matching_scratch(
@@ -1952,11 +2699,20 @@ class GPUModelRunner(
                     kv_dtype,
                 )
 
-            torch.index_select(token_kv_cache, 1, protected_slots, out=protected_kv)
-            torch.index_select(token_kv_cache, 1, compact_slots, out=compact_kv)
-            torch.index_select(token_kv_cache, 1, exact_slots, out=exact_kv)
+            self._attention_matching_index_select_kv_slots(
+                kv_cache, layer, compact_slots, out=compact_kv
+            )
+            self._attention_matching_index_select_kv_slots(
+                kv_cache, layer, exact_slots, out=exact_kv
+            )
+            if suffix_kv is not None:
+                self._attention_matching_index_select_kv_slots(
+                    kv_cache, layer, suffix_slots, out=suffix_kv
+                )
             if query_source_kv is not None:
-                torch.index_select(token_kv_cache, 1, query_slots, out=query_source_kv)
+                self._attention_matching_index_select_kv_slots(
+                    kv_cache, layer, query_slots, out=query_source_kv
+                )
             compact_keys = compact_kv[0]
             compact_values = compact_kv[1]
             exact_keys = exact_kv[0]
@@ -1964,6 +2720,7 @@ class GPUModelRunner(
             if use_random_queries:
                 query_keys = self._get_attention_matching_random_queries(
                     layer_name=layer_name,
+                    seed=query_seed + layer_idx,
                     num_queries=(
                         self.cache_config.attention_matching_max_queries_per_kv_head
                     ),
@@ -2003,7 +2760,12 @@ class GPUModelRunner(
                 device=self.device,
                 dtype=compact_keys.dtype,
             )
-            batched_synth_keys, batched_beta, batched_synth_values, _ = (
+            (
+                batched_synth_keys,
+                batched_beta,
+                batched_synth_values,
+                selected_indices,
+            ) = (
                 self._attention_matching_omp.compute_compacted_cache_batched(
                     compact_keys.transpose(0, 1),
                     compact_values.transpose(0, 1),
@@ -2011,9 +2773,37 @@ class GPUModelRunner(
                     plan.synthetic_prefix_len,
                 )
             )
+            selected_indices_by_layer.append(
+                [
+                    head_indices.detach()
+                    .to(device="cpu", dtype=torch.long)
+                    .tolist()
+                    for head_indices in selected_indices
+                ]
+            )
             synthetic_keys.copy_(batched_synth_keys.transpose(0, 1))
             synthetic_values.copy_(batched_synth_values.transpose(0, 1))
             beta.copy_(batched_beta)
+            if forget_gate_applied:
+                previous_synthetic_keys = compact_keys[: plan.synthetic_prefix_len]
+                previous_synthetic_values = compact_values[: plan.synthetic_prefix_len]
+                if not torch.isfinite(previous_synthetic_keys).all():
+                    raise RuntimeError(
+                        "attention_matching forget gate found non-finite previous "
+                        f"synthetic keys for request {req_id} layer {layer_name}"
+                    )
+                if not torch.isfinite(previous_synthetic_values).all():
+                    raise RuntimeError(
+                        "attention_matching forget gate found non-finite previous "
+                        f"synthetic values for request {req_id} layer {layer_name}"
+                    )
+                synthetic_keys.mul_(1.0 - forget_gate_alpha)
+                synthetic_keys.add_(previous_synthetic_keys, alpha=forget_gate_alpha)
+                synthetic_values.mul_(1.0 - forget_gate_alpha)
+                synthetic_values.add_(
+                    previous_synthetic_values,
+                    alpha=forget_gate_alpha,
+                )
 
             if not torch.isfinite(synthetic_keys).all():
                 raise RuntimeError(
@@ -2031,14 +2821,30 @@ class GPUModelRunner(
                     f"request {req_id} layer {layer_name}"
                 )
 
-            token_kv_cache[0].index_copy_(0, synth_target_slots, synthetic_keys)
-            token_kv_cache[1].index_copy_(0, synth_target_slots, synthetic_values)
+            self._attention_matching_index_copy_kv_plane_slots(
+                kv_cache, layer, 0, synth_target_slots, synthetic_keys
+            )
+            self._attention_matching_index_copy_kv_plane_slots(
+                kv_cache, layer, 1, synth_target_slots, synthetic_values
+            )
             if exact_target_slots.numel() > 0:
-                token_kv_cache[0].index_copy_(0, exact_target_slots, exact_keys)
-                token_kv_cache[1].index_copy_(0, exact_target_slots, exact_values)
+                self._attention_matching_index_copy_kv_plane_slots(
+                    kv_cache, layer, 0, exact_target_slots, exact_keys
+                )
+                self._attention_matching_index_copy_kv_plane_slots(
+                    kv_cache, layer, 1, exact_target_slots, exact_values
+                )
+            if suffix_kv is not None:
+                self._attention_matching_index_copy_kv_plane_slots(
+                    kv_cache, layer, 0, suffix_target_slots, suffix_kv[0]
+                )
+                self._attention_matching_index_copy_kv_plane_slots(
+                    kv_cache, layer, 1, suffix_target_slots, suffix_kv[1]
+                )
             layer_betas[layer_name] = beta
-            if protected_target_slots.numel() > 0:
-                token_kv_cache.index_copy_(1, protected_target_slots, protected_kv)
+            # Protected slots are already in-place at the front of the request
+            # layout. Do not rewrite them: under prefill_only prefix caching
+            # those blocks may be shared read-only prefix-cache hits.
             if emit_layer_diagnostics:
                 logger.debug(
                     "[AM] request %s layer %s absmax compact_k=%.3e compact_v=%.3e "
@@ -2056,37 +2862,285 @@ class GPUModelRunner(
         req_state.attention_matching_state = AttentionMatchingRequestState(
             synthetic_prefix_len=plan.synthetic_prefix_len,
             protected_prefix_len=plan.protected_prefix_len,
-            version=(
-                1
-                if prev_attention_matching_state is None
-                else prev_attention_matching_state.version + 1
-            ),
+            version=next_version,
             layer_betas=layer_betas,
         )
         req_state.attention_matching_snapshot = None
+        retained_len = plan.target_len + suffix_len
+        req_state.num_computed_tokens = (
+            max(retained_len - 1, 0) if pre_sample else retained_len
+        )
         logger.warning(
-            "[AM] finished compaction request %s target_len=%d elapsed=%.3fs",
+            "[AM] finished compaction request %s target_len=%d pre_sample=%s "
+            "suffix_len=%d retained_len=%d elapsed=%.3fs",
             req_id,
             plan.target_len,
+            pre_sample,
+            suffix_len,
+            retained_len,
             time.perf_counter() - compaction_start,
         )
         return AttentionMatchingCompactionResult(
             request_id=req_id,
+            source_len=plan.source_len,
+            target_len=plan.target_len,
             protected_prefix_len=plan.protected_prefix_len,
             synthetic_prefix_len=plan.synthetic_prefix_len,
             exact_kept_tokens=plan.exact_kept_tokens,
             position_offset_delta=plan.offset_delta,
+            query_source=self.cache_config.attention_matching_query_source,
+            max_queries_per_kv_head=(
+                self.cache_config.attention_matching_max_queries_per_kv_head
+            ),
+            query_seed=query_seed,
+            zerobeta=self.cache_config.attention_matching_zerobeta,
+            pre_sample=pre_sample,
+            prefix_cache_key=prefix_cache_key,
+            prefix_cache_key_start=plan.protected_prefix_len,
+            selected_indices=selected_indices_by_layer,
+            forget_gate_enabled=forget_gate_enabled,
+            forget_gate_alpha=forget_gate_alpha,
+            forget_gate_applied=forget_gate_applied,
+        )
+
+    def _apply_attention_matching_result_to_worker_state(
+        self,
+        req_state: CachedRequestState,
+        result: AttentionMatchingCompactionResult,
+    ) -> list[int]:
+        source_len = result.source_len
+        protected = result.protected_prefix_len
+        synthetic = result.synthetic_prefix_len
+        exact = result.exact_kept_tokens
+        all_token_ids = [req_state.get_token_id(i) for i in range(req_state.num_tokens)]
+        if result.physical_token_ids is not None:
+            physical_token_ids = list(result.physical_token_ids)
+        else:
+            exact_start = source_len - exact
+            physical_token_ids = (
+                all_token_ids[:protected]
+                + [0] * synthetic
+                + all_token_ids[exact_start:source_len]
+                + all_token_ids[source_len:]
+            )
+        prompt_len = protected + synthetic
+        req_state.prompt_token_ids = physical_token_ids[:prompt_len]
+        req_state.prompt_embeds = None
+        req_state.num_prompt_tokens = prompt_len
+        req_state.output_token_ids = physical_token_ids[prompt_len:]
+        req_state.position_offset += result.position_offset_delta
+        req_state.num_computed_tokens = (
+            max(len(physical_token_ids) - 1, 0)
+            if result.pre_sample
+            else len(physical_token_ids)
+        )
+        req_state.attention_matching_synthetic_prefix_len = synthetic
+        req_state.attention_matching_prefix_cache_key = result.prefix_cache_key
+        req_state.attention_matching_prefix_cache_key_start = (
+            result.prefix_cache_key_start
+        )
+        req_state.attention_matching_block_ids_tensor = None
+        req_state.attention_matching_plan_skip_logged = False
+        if self.cache_config.mamba_cache_mode == "align":
+            # AM shortens the visible sequence and the scheduler reindexes the
+            # exact recurrent state to the compacted tail block. The worker's
+            # mamba_state_idx is derived from the pre-AM sequence length, so it
+            # must be recomputed before the next mamba preprocess copy.
+            self.mamba_state_idx.pop(req_state.req_id, None)
+        if self.uses_mrope:
+            self._init_mrope_positions(req_state)
+        return physical_token_ids
+
+    def _run_attention_matching_turn_chain_for_request(
+        self,
+        req_id: str,
+        req_state: CachedRequestState,
+        source_len: int | None = None,
+        pre_sample: bool = False,
+    ) -> AttentionMatchingCompactionResult | None:
+        initial_source_len = (
+            req_state.num_computed_tokens if source_len is None else source_len
+        )
+        original_tokens = [
+            req_state.get_token_id(i) for i in range(initial_source_len)
+        ]
+        replay = build_attention_matching_turn_prefix_cache_replay(
+            token_ids=original_tokens,
+            base_seed=int(getattr(self.model_config, "seed", 0) or 0),
+            cache_salt=req_state.cache_salt,
+            synthetic_prefix_len=self.cache_config.compaction_stride,
+            max_turns=self.cache_config.compaction_max_turns,
+            keep_recent_turns=self.cache_config.compaction_eviction_turn_stride,
+            turn_end_token_id=self._get_attention_matching_turn_end_token_id(),
+            turn_padding_token_id=self.cache_config.compaction_turn_padding_token_id,
+            protect_first_user=(
+                self.cache_config.attention_matching_protect_user_prompts
+                == "first_user"
+            ),
+            query_source=self.cache_config.attention_matching_query_source,
+            max_queries_per_kv_head=(
+                self.cache_config.attention_matching_max_queries_per_kv_head
+            ),
+            zerobeta=self.cache_config.attention_matching_zerobeta,
+            forget_gate_enabled=(
+                self.cache_config.attention_matching_forget_gate_enabled
+            ),
+            forget_gate_alpha=self.cache_config.attention_matching_forget_gate_alpha,
+            min_protected_prefix_len=0,
+            initial_parent_key=req_state.attention_matching_prefix_cache_key,
+            initial_parent_key_start=(
+                req_state.attention_matching_prefix_cache_key_start
+            ),
+            initial_position_offset=req_state.position_offset,
+        )
+        if replay is None or replay.final_step is None:
+            return self._run_attention_matching_compaction_for_request(
+                req_id,
+                req_state,
+                source_len=source_len,
+                pre_sample=pre_sample,
+            )
+
+        if source_len is not None:
+            req_state.num_computed_tokens = max(
+                req_state.num_computed_tokens, source_len
+            )
+
+        final_result: AttentionMatchingCompactionResult | None = None
+        final_physical: list[int] = []
+        replay_steps: list[dict[str, object]] = []
+        total_evicted = 0
+
+        for step in replay.steps:
+            result = self._run_attention_matching_compaction_for_request(
+                req_id,
+                req_state,
+                pre_sample=False,
+                forced_plan=step.plan,
+                forced_query_seed=step.query_seed,
+                forced_prefix_cache_key=step.prefix_cache_key,
+                preserve_suffix=True,
+            )
+            if result is None:
+                return None
+            result.physical_token_ids = list(step.physical_token_ids_after)
+            final_physical = self._apply_attention_matching_result_to_worker_state(
+                req_state, result
+            )
+            replay_steps.append(
+                {
+                    "source_len": step.plan.source_len,
+                    "target_len": step.plan.target_len,
+                    "protected_prefix_len": step.plan.protected_prefix_len,
+                    "synthetic_prefix_len": step.plan.synthetic_prefix_len,
+                    "exact_kept_tokens": step.plan.exact_kept_tokens,
+                    "attention_matching_query_seed": step.query_seed,
+                    "attention_matching_prefix_cache_key": step.prefix_cache_key,
+                    "attention_matching_selected_indices": result.selected_indices,
+                    "attention_matching_forget_gate_enabled": (
+                        result.forget_gate_enabled
+                    ),
+                    "attention_matching_forget_gate_alpha": (
+                        result.forget_gate_alpha
+                    ),
+                    "attention_matching_forget_gate_applied": (
+                        result.forget_gate_applied
+                    ),
+                }
+            )
+            total_evicted += step.plan.offset_delta
+            final_result = result
+
+        if final_result is None or not final_physical:
+            return None
+        if pre_sample:
+            req_state.num_computed_tokens = max(len(final_physical) - 1, 0)
+
+        logger.warning(
+            "[AM] finished turn-chain compaction request %s steps=%d "
+            "source_len=%d target_len=%d evicted=%d key=%s",
+            req_id,
+            len(replay_steps),
+            initial_source_len,
+            len(final_physical),
+            total_evicted,
+            (final_result.prefix_cache_key or "")[:16],
+        )
+        return AttentionMatchingCompactionResult(
+            request_id=req_id,
+            source_len=initial_source_len,
+            target_len=len(final_physical),
+            protected_prefix_len=final_result.protected_prefix_len,
+            synthetic_prefix_len=final_result.synthetic_prefix_len,
+            exact_kept_tokens=(
+                len(final_physical)
+                - final_result.protected_prefix_len
+                - final_result.synthetic_prefix_len
+            ),
+            position_offset_delta=total_evicted,
+            query_source=final_result.query_source,
+            max_queries_per_kv_head=final_result.max_queries_per_kv_head,
+            query_seed=final_result.query_seed,
+            zerobeta=final_result.zerobeta,
+            pre_sample=pre_sample,
+            prefix_cache_key=final_result.prefix_cache_key,
+            prefix_cache_key_start=final_result.prefix_cache_key_start,
+            replay_steps=replay_steps,
+            physical_token_ids=final_physical,
+            selected_indices=final_result.selected_indices,
+            forget_gate_enabled=final_result.forget_gate_enabled,
+            forget_gate_alpha=final_result.forget_gate_alpha,
+            forget_gate_applied=final_result.forget_gate_applied,
         )
 
     def _maybe_run_attention_matching_compaction(
         self,
+        source_lens: dict[str, int] | None = None,
+        pre_sample: bool = False,
     ) -> dict[str, AttentionMatchingCompactionResult]:
         if not self._attention_matching_enabled:
             return {}
         compactions: dict[str, AttentionMatchingCompactionResult] = {}
         for req_id in self.input_batch.req_ids:
+            if source_lens is not None and req_id not in source_lens:
+                continue
             req_state = self.requests[req_id]
-            result = self._run_attention_matching_compaction_for_request(req_id, req_state)
+            if req_state.attention_matching_compaction_suppressed:
+                continue
+            request_source_len = None if source_lens is None else source_lens.get(req_id)
+            if (
+                pre_sample
+                and self.cache_config.attention_matching_cross_turn_cache
+                and self.cache_config.compaction_max_turns > 0
+            ):
+                if (
+                    req_state.output_token_ids
+                    or (
+                        request_source_len is not None
+                        and request_source_len > req_state.num_prompt_tokens
+                    )
+                ):
+                    # Turn-window AM is a between-turn memory update. Once the
+                    # scheduled source extends beyond the physical prompt, the
+                    # assistant is decoding; compacting again would create
+                    # mid-turn AM states that the orchestrator cannot represent
+                    # as a Markovian sliding window of completed turns.
+                    # Token/window AM still uses the generic path when
+                    # compaction_max_turns == 0.
+                    continue
+                result = self._run_attention_matching_turn_chain_for_request(
+                    req_id,
+                    req_state,
+                    source_len=request_source_len,
+                    pre_sample=pre_sample,
+                )
+            else:
+                result = self._run_attention_matching_compaction_for_request(
+                    req_id,
+                    req_state,
+                    source_len=request_source_len,
+                    pre_sample=pre_sample,
+                )
             if result is not None:
                 compactions[req_id] = result
         return compactions
@@ -2217,12 +3271,34 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                position_offset=new_req_data.position_offset,
                 attention_matching_protected_prompt_len=(
                     new_req_data.attention_matching_protected_prompt_len
                 ),
+                attention_matching_synthetic_prefix_len=(
+                    new_req_data.attention_matching_synthetic_prefix_len
+                ),
+                attention_matching_prefix_cache_key=(
+                    new_req_data.attention_matching_prefix_cache_key
+                ),
+                attention_matching_prefix_cache_key_start=(
+                    new_req_data.attention_matching_prefix_cache_key_start
+                ),
+                cache_salt=new_req_data.cache_salt,
+                num_prefix_cached_tokens=(
+                    new_req_data.num_prefix_cached_tokens
+                    if self.cache_config.enable_prefix_caching
+                    else 0
+                ),
                 shuffle_control_next_chunk_index=0,
                 noise_control_next_chunk_index=0,
+                attention_matching_compaction_suppressed=False,
             )
+            self._copy_attention_matching_private_blocks(
+                new_req_data.attention_matching_cow_src_block_ids,
+                new_req_data.attention_matching_cow_dst_block_ids,
+            )
+            self._maybe_restore_attention_matching_cross_turn_state(req_state)
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
 
@@ -2279,6 +3355,21 @@ class GPUModelRunner(
             )
             num_output_tokens = req_data.num_output_tokens[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
+            am_prefix_key = req_data.attention_matching_prefix_cache_keys.get(req_id)
+            if am_prefix_key is not None:
+                req_state.attention_matching_prefix_cache_key = am_prefix_key
+                req_state.attention_matching_prefix_cache_key_start = (
+                    req_data.attention_matching_prefix_cache_key_starts.get(
+                        req_id, 0
+                    )
+                )
+            req_state.attention_matching_compaction_suppressed = (
+                req_id in req_data.attention_matching_suppress_compaction_req_ids
+            )
+            self._copy_attention_matching_private_blocks(
+                req_data.attention_matching_cow_src_block_ids.get(req_id, []),
+                req_data.attention_matching_cow_dst_block_ids.get(req_id, []),
+            )
 
             if req_state.prev_num_draft_len and self.use_async_scheduling:
                 # prev_num_draft_len is used in async scheduling mode with
@@ -2341,6 +3432,9 @@ class GPUModelRunner(
                         req_state.prompt_embeds = None
                         req_state.num_prompt_tokens = prompt_len
                     req_state.output_token_ids = list(all_tids[prompt_len:])
+                if self.uses_mrope:
+                    self._init_mrope_positions(req_state)
+                self._register_attention_matching_cross_turn_state(req_state)
                 if req_index is not None:
                     self.input_batch.remove_request(req_id)
                 reqs_to_add.append(req_state)
@@ -2401,6 +3495,7 @@ class GPUModelRunner(
                         req_state,
                         req_data.attention_matching_snapshot_versions.get(req_id),
                     )
+                    self._register_attention_matching_cross_turn_state(req_state)
 
             if req_index is None:
                 # The request is not in the persistent batch.
@@ -2584,6 +3679,17 @@ class GPUModelRunner(
         self.late_interaction_runner.register_request(req_id, req_state.pooling_params)
         req_state.replace_block_ids(new_req_data.block_ids)
         req_state.num_computed_tokens = new_req_data.num_computed_tokens
+        req_state.position_offset = new_req_data.position_offset
+        req_state.attention_matching_synthetic_prefix_len = (
+            new_req_data.attention_matching_synthetic_prefix_len
+        )
+        req_state.attention_matching_prefix_cache_key = (
+            new_req_data.attention_matching_prefix_cache_key
+        )
+        req_state.attention_matching_prefix_cache_key_start = (
+            new_req_data.attention_matching_prefix_cache_key_start
+        )
+        req_state.cache_salt = new_req_data.cache_salt
         req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             req_state.prompt_token_ids, req_state.prompt_embeds
         )
@@ -2598,6 +3704,9 @@ class GPUModelRunner(
         return req_state
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
+        if self.uses_mrope and self._attention_matching_enabled:
+            self._init_text_only_mrope_positions_for_attention_matching(req_state)
+            return
         model = self.get_model()
         assert supports_mrope(model), "M-RoPE support is not implemented."
         assert req_state.prompt_token_ids is not None, (
@@ -3023,6 +4132,20 @@ class GPUModelRunner(
         self.discard_request_mask.np[:num_reqs] = (
             self.optimistic_seq_lens_cpu[:num_reqs].numpy() < num_tokens_np
         )
+        # AM tail finalization schedules hidden turn-close/padding tokens only
+        # to make the final partial block prefix-cacheable. The forward pass
+        # still produces a logit at the end of that filler prefill, but the
+        # sampled token is not part of the user-visible trajectory and must be
+        # discarded even when the filler exactly reaches max_model_len.
+        cached_req_data = scheduler_output.scheduled_cached_reqs
+        hidden_tail_req_ids = (
+            cached_req_data.attention_matching_suppress_compaction_req_ids
+        )
+        if hidden_tail_req_ids:
+            for req_id in hidden_tail_req_ids:
+                req_idx = self.input_batch.req_id_to_index.get(req_id)
+                if req_idx is not None and req_idx < num_reqs:
+                    self.discard_request_mask.np[req_idx] = True
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
         # Sync num_accepted_tokens from CPU (set by
@@ -3594,6 +4717,11 @@ class GPUModelRunner(
         return common_prefix_len if use_cascade else 0
 
     def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):
+        if self.uses_mrope and self._attention_matching_enabled:
+            self._calc_text_only_mrope_positions_for_attention_matching(
+                scheduler_output
+            )
+            return
         mrope_pos_ptr = 0
         for index, req_id in enumerate(self.input_batch.req_ids):
             req = self.requests[req_id]
@@ -3641,6 +4769,31 @@ class GPUModelRunner(
                 )
 
                 mrope_pos_ptr += completion_part_len
+
+    def _calc_text_only_mrope_positions_for_attention_matching(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        mrope_pos_ptr = 0
+        for index, req_id in enumerate(self.input_batch.req_ids):
+            req = self.requests[req_id]
+            self._assert_attention_matching_text_only_mrope_request(
+                req, "_calc_mrope_positions"
+            )
+
+            num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[index])
+            num_scheduled_tokens = int(scheduler_output.num_scheduled_tokens[req_id])
+            if num_scheduled_tokens <= 0:
+                continue
+
+            dst_start = mrope_pos_ptr
+            dst_end = mrope_pos_ptr + num_scheduled_tokens
+            positions = (
+                self.arange_np[:num_scheduled_tokens]
+                + num_computed_tokens
+                + int(req.position_offset)
+            )
+            self.mrope_positions.np[:, dst_start:dst_end] = positions[None, :]
+            mrope_pos_ptr = dst_end
 
     def _calc_xdrope_positions(self, scheduler_output: "SchedulerOutput"):
         xdrope_pos_ptr = 0
@@ -4464,6 +5617,8 @@ class GPUModelRunner(
         hidden_states: torch.Tensor,
         num_scheduled_tokens: int,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        attention_matching_compactions: dict[str, AttentionMatchingCompactionResult]
+        | None = None,
     ) -> tuple[
         dict[str, int],
         LogprobsLists | None,
@@ -4481,10 +5636,21 @@ class GPUModelRunner(
             num_nans_in_logits = self._get_nans_in_logits(logits)
 
         num_reqs = self.input_batch.num_reqs
-        discard_sampled_tokens_req_indices = np.nonzero(
-            self.discard_request_mask.np[:num_reqs]
-        )[0]
-        for i in discard_sampled_tokens_req_indices:
+        discard_sampled_tokens_req_indices = set(
+            int(i)
+            for i in np.nonzero(
+                self.discard_request_mask.np[:num_reqs]
+            )[0]
+        )
+        attention_matching_compactions = attention_matching_compactions or {}
+        if attention_matching_compactions:
+            for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                if req_id in attention_matching_compactions:
+                    discard_sampled_tokens_req_indices.add(i)
+        discard_sampled_tokens_req_indices_list = sorted(
+            discard_sampled_tokens_req_indices
+        )
+        for i in discard_sampled_tokens_req_indices_list:
             gen = self.input_batch.generators.get(int(i))
             if gen is not None:
                 gen.set_offset(gen.get_offset() - 4)
@@ -4506,7 +5672,7 @@ class GPUModelRunner(
                 # No spec decode tokens.
                 valid_sampled_token_ids = self._to_list(sampled_token_ids)
                 # Mask out the sampled tokens that should not be sampled.
-                for i in discard_sampled_tokens_req_indices:
+                for i in discard_sampled_tokens_req_indices_list:
                     valid_sampled_token_ids[int(i)].clear()
 
                 if logprobs_tensors is not None:
@@ -4516,12 +5682,12 @@ class GPUModelRunner(
                 valid_sampled_token_ids, logprobs_lists = RejectionSampler.parse_output(
                     sampled_token_ids,
                     self.input_batch.vocab_size,
-                    discard_sampled_tokens_req_indices,
+                    discard_sampled_tokens_req_indices_list,
                     logprobs_tensors=logprobs_tensors,
                 )
         else:
             valid_sampled_token_ids = []
-            invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
+            invalid_req_indices = discard_sampled_tokens_req_indices_list
             invalid_req_indices_set = set(invalid_req_indices)
 
             # Cache the sampled tokens on the GPU and avoid CPU sync.
@@ -4580,8 +5746,6 @@ class GPUModelRunner(
             events = self._maybe_run_noise_control_for_request(req_id, req_state)
             if events:
                 noise_control_results[req_id] = events
-
-        attention_matching_compactions = self._maybe_run_attention_matching_compaction()
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
@@ -5293,6 +6457,20 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        attention_matching_compactions = self._maybe_run_attention_matching_compaction(
+            source_lens={
+                req_id: (
+                    self.requests[req_id].num_computed_tokens
+                    + num_scheduled
+                )
+                for req_id, num_scheduled in (
+                    scheduler_output.num_scheduled_tokens.items()
+                )
+                if req_id in self.requests
+            },
+            pre_sample=True,
+        )
+
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
@@ -5419,6 +6597,7 @@ class GPUModelRunner(
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
+                attention_matching_compactions=attention_matching_compactions,
             )
 
         if propose_drafts_after_bookkeeping:

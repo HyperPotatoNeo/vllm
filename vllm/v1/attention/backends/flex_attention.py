@@ -40,7 +40,15 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
-torch._dynamo.config.recompile_limit = 16
+torch._dynamo.config.recompile_limit = max(
+    torch._dynamo.config.recompile_limit, 64
+)
+torch._dynamo.config.cache_size_limit = max(
+    torch._dynamo.config.cache_size_limit, 128
+)
+torch._dynamo.config.accumulated_cache_size_limit = max(
+    torch._dynamo.config.accumulated_cache_size_limit, 1024
+)
 create_block_mask_compiled = torch.compile(
     create_block_mask, fullgraph=True, mode="reduce-overhead"
 )

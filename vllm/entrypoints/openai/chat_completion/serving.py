@@ -1620,6 +1620,44 @@ class OpenAIServingChat(OpenAIServing):
                     num_output_tokens_at_compaction=e.num_output_tokens_at_compaction,
                     tokens_evicted=e.tokens_evicted,
                     position_offset_after=e.position_offset_after,
+                    num_prompt_tokens=e.num_prompt_tokens,
+                    evict_start=e.evict_start,
+                    compaction_strategy=e.compaction_strategy,
+                    source_len=e.source_len,
+                    target_len=e.target_len,
+                    protected_prefix_len=e.protected_prefix_len,
+                    synthetic_prefix_len=e.synthetic_prefix_len,
+                    exact_kept_tokens=e.exact_kept_tokens,
+                    attention_matching_query_source=(
+                        e.attention_matching_query_source
+                    ),
+                    attention_matching_max_queries_per_kv_head=(
+                        e.attention_matching_max_queries_per_kv_head
+                    ),
+                    attention_matching_query_seed=e.attention_matching_query_seed,
+                    attention_matching_zerobeta=e.attention_matching_zerobeta,
+                    attention_matching_pre_sample=e.attention_matching_pre_sample,
+                    attention_matching_replay_steps=(
+                        e.attention_matching_replay_steps
+                    ),
+                    attention_matching_cache_hit_tokens=(
+                        e.attention_matching_cache_hit_tokens
+                    ),
+                    attention_matching_selected_indices=(
+                        e.attention_matching_selected_indices
+                    ),
+                    attention_matching_forget_gate_enabled=(
+                        e.attention_matching_forget_gate_enabled
+                    ),
+                    attention_matching_forget_gate_alpha=(
+                        e.attention_matching_forget_gate_alpha
+                    ),
+                    attention_matching_forget_gate_applied=(
+                        e.attention_matching_forget_gate_applied
+                    ),
+                    attention_matching_hidden_tail_token_ids=(
+                        e.attention_matching_hidden_tail_token_ids
+                    ),
                 )
                 for e in compaction_events
             ]

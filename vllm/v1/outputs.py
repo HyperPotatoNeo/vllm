@@ -215,10 +215,25 @@ class ECConnectorOutput:
 @dataclass
 class AttentionMatchingCompactionResult:
     request_id: str
+    source_len: int
+    target_len: int
     protected_prefix_len: int
     synthetic_prefix_len: int
     exact_kept_tokens: int
     position_offset_delta: int
+    query_source: str = ""
+    max_queries_per_kv_head: int = 0
+    query_seed: int = 0
+    zerobeta: bool = False
+    pre_sample: bool = False
+    prefix_cache_key: str | None = None
+    prefix_cache_key_start: int = 0
+    replay_steps: list[dict[str, object]] | None = None
+    physical_token_ids: list[int] | None = None
+    selected_indices: list[list[list[int]]] | None = None
+    forget_gate_enabled: bool = False
+    forget_gate_alpha: float = 0.5
+    forget_gate_applied: bool = False
 
 
 @dataclass

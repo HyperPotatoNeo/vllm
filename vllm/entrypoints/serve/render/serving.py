@@ -183,6 +183,23 @@ class OpenAIServingRender:
         Called directly by render_chat_request and delegated to by
         OpenAIServingChat.render_chat_request after its engine-aware checks.
         """
+        prompt_token_ids = getattr(request, "prompt_token_ids", None)
+        if prompt_token_ids is not None:
+            try:
+                token_ids = [int(tok) for tok in prompt_token_ids]
+            except (TypeError, ValueError):
+                return self.create_error_response(
+                    "prompt_token_ids must be a list of integer token IDs"
+                )
+            if not token_ids:
+                return self.create_error_response("prompt_token_ids must be non-empty")
+            # kv-eviction sends block-aligned, pre-tokenized prompts here. Do
+            # not render the chat template again: vLLM's KV cache must use the
+            # exact same prompt IDs that the trainer will replay.
+            return list(request.messages), [
+                tokens_input(token_ids, cache_salt=request.cache_salt)
+            ]
+
         tokenizer = self.renderer.tokenizer
 
         tool_parser = self.tool_parser

@@ -165,6 +165,33 @@ class Request:
         self.attention_matching_snapshot_version: int | None = None
         self.attention_matching_restore_pending: bool = False
         self.attention_matching_target_len: int | None = None
+        # Prefix-cache namespace for compacted AM KV. Ordinary token hashes are
+        # not sufficient after AM because the synthetic token IDs are placeholders
+        # for KV that depends on the compacted source history.
+        self.attention_matching_prefix_cache_key: str | None = None
+        self.attention_matching_prefix_cache_key_start: int = 0
+        self.attention_matching_prefix_cache_hash_start: int = 0
+        self.attention_matching_synthetic_prefix_len: int = 0
+        # Cross-turn compressed-cache admission mutates the physical prompt to
+        # the AM-compressed representation only after saving the full logical
+        # prompt here. This lets the scheduler fall back losslessly on misses.
+        self.attention_matching_original_prompt_token_ids: list[int] | None = None
+        self.attention_matching_cross_turn_candidate: bool = False
+        self.attention_matching_cross_turn_event: object | None = None
+        self.attention_matching_cross_turn_replay: object | None = None
+        self.attention_matching_cross_turn_replay_index: int = -1
+        # Prefix-cache copy-on-write metadata. If a request reuses compressed
+        # AM blocks and may later mutate them, the scheduler privatizes the
+        # physical blocks and the worker copies KV from src -> dst once.
+        self.attention_matching_cow_src_block_ids: list[int] = []
+        self.attention_matching_cow_dst_block_ids: list[int] = []
+        # AM prefix-cache tail finalization computes deterministic hidden
+        # turn-close/filler KV so short generated tails become full, cacheable
+        # blocks. Hidden tokens are not returned to the client and do not count
+        # toward max_tokens.
+        self.prefix_cache_tail_finalizing = False
+        self.prefix_cache_tail_final_status = None
+        self.prefix_cache_tail_hidden_tokens = 0
 
         # Multi-modal related
         self.mm_features = mm_features or []
@@ -201,6 +228,11 @@ class Request:
         self.update_block_hashes()
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
+        self.skip_writing_prefix_cache = False
+        self.prefix_cache_skip_reason: str | None = None
+        self.prefix_cache_write_skip_logged = False
+        self.prefix_cache_read_hit_logged = False
+        self.prefix_cache_prefill_only_skip_logged = False
 
         # Used for streaming
         self.resumable = resumable
@@ -243,6 +275,21 @@ class Request:
             self._output_token_ids.extend(token_ids)
             self._all_token_ids.extend(token_ids)
             self.num_total_generated += len(token_ids)
+
+        self.update_block_hashes()
+
+    def append_hidden_output_token_ids(
+        self,
+        token_ids: int | list[int],
+    ) -> None:
+        if isinstance(token_ids, int):
+            self._output_token_ids.append(token_ids)
+            self._all_token_ids.append(token_ids)
+            self.prefix_cache_tail_hidden_tokens += 1
+        else:
+            self._output_token_ids.extend(token_ids)
+            self._all_token_ids.extend(token_ids)
+            self.prefix_cache_tail_hidden_tokens += len(token_ids)
 
         self.update_block_hashes()
 

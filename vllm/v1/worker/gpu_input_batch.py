@@ -60,11 +60,20 @@ class CachedRequestState:
     # KV cache compaction: cumulative evicted tokens for RoPE correction.
     position_offset: int = 0
     attention_matching_protected_prompt_len: int = 0
+    attention_matching_synthetic_prefix_len: int = 0
+    attention_matching_prefix_cache_key: str | None = None
+    attention_matching_prefix_cache_key_start: int = 0
+    cache_salt: str | None = None
+    num_prefix_cached_tokens: int = 0
     shuffle_control_next_chunk_index: int = 0
     noise_control_next_chunk_index: int = 0
     attention_matching_state: AttentionMatchingRequestState | None = None
     attention_matching_snapshot: AttentionMatchingSnapshot | None = None
     attention_matching_block_ids_tensor: torch.Tensor | None = None
+    attention_matching_compaction_suppressed: bool = False
+    attention_matching_prefill_skip_logged: bool = False
+    attention_matching_plan_skip_logged: bool = False
+    attention_matching_unknown_token_skip_logged: bool = False
 
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(

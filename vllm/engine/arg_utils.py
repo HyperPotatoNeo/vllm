@@ -68,6 +68,7 @@ from vllm.config.cache import (
     MambaCacheMode,
     MambaDType,
     PrefixCachingHashAlgo,
+    PrefixCachingMode,
 )
 from vllm.config.device import Device
 from vllm.config.kernel import MoEBackend
@@ -453,6 +454,7 @@ class EngineArgs:
     )
     block_size: int | None = None
     enable_prefix_caching: bool | None = None
+    prefix_caching_mode: PrefixCachingMode = CacheConfig.prefix_caching_mode
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
@@ -630,14 +632,35 @@ class EngineArgs:
     compaction_window_size: int = CacheConfig.compaction_window_size
     compaction_stride: int = CacheConfig.compaction_stride
     compaction_strategy: str = CacheConfig.compaction_strategy
+    compaction_max_turns: int = CacheConfig.compaction_max_turns
+    compaction_eviction_turn_stride: int = (
+        CacheConfig.compaction_eviction_turn_stride
+    )
+    compaction_turn_end_token_id: int | None = CacheConfig.compaction_turn_end_token_id
+    compaction_turn_padding_token_id: int | None = (
+        CacheConfig.compaction_turn_padding_token_id
+    )
     attention_matching_max_queries_per_kv_head: int = (
         CacheConfig.attention_matching_max_queries_per_kv_head
     )
     attention_matching_query_source: str = (
         CacheConfig.attention_matching_query_source
     )
+    attention_matching_zerobeta: bool = CacheConfig.attention_matching_zerobeta
     attention_matching_protect_user_prompts: str = (
         CacheConfig.attention_matching_protect_user_prompts
+    )
+    attention_matching_cross_turn_cache: bool = (
+        CacheConfig.attention_matching_cross_turn_cache
+    )
+    attention_matching_allow_partial_cross_turn_cache_hits: bool = (
+        CacheConfig.attention_matching_allow_partial_cross_turn_cache_hits
+    )
+    attention_matching_forget_gate_enabled: bool = (
+        CacheConfig.attention_matching_forget_gate_enabled
+    )
+    attention_matching_forget_gate_alpha: float = (
+        CacheConfig.attention_matching_forget_gate_alpha
     )
     shuffle_control_chunk_size: int = CacheConfig.shuffle_control_chunk_size
     shuffle_control_probability: float = CacheConfig.shuffle_control_probability
@@ -1038,6 +1061,9 @@ class EngineArgs:
             "--prefix-caching-hash-algo", **cache_kwargs["prefix_caching_hash_algo"]
         )
         cache_group.add_argument(
+            "--prefix-caching-mode", **cache_kwargs["prefix_caching_mode"]
+        )
+        cache_group.add_argument(
             "--calculate-kv-scales", **cache_kwargs["calculate_kv_scales"]
         )
         cache_group.add_argument(
@@ -1074,6 +1100,21 @@ class EngineArgs:
             "--compaction-strategy", **cache_kwargs["compaction_strategy"]
         )
         cache_group.add_argument(
+            "--compaction-max-turns", **cache_kwargs["compaction_max_turns"]
+        )
+        cache_group.add_argument(
+            "--compaction-eviction-turn-stride",
+            **cache_kwargs["compaction_eviction_turn_stride"],
+        )
+        cache_group.add_argument(
+            "--compaction-turn-end-token-id",
+            **cache_kwargs["compaction_turn_end_token_id"],
+        )
+        cache_group.add_argument(
+            "--compaction-turn-padding-token-id",
+            **cache_kwargs["compaction_turn_padding_token_id"],
+        )
+        cache_group.add_argument(
             "--attention-matching-max-queries-per-kv-head",
             **cache_kwargs["attention_matching_max_queries_per_kv_head"],
         )
@@ -1082,8 +1123,30 @@ class EngineArgs:
             **cache_kwargs["attention_matching_query_source"],
         )
         cache_group.add_argument(
+            "--attention-matching-zerobeta",
+            **cache_kwargs["attention_matching_zerobeta"],
+        )
+        cache_group.add_argument(
             "--attention-matching-protect-user-prompts",
             **cache_kwargs["attention_matching_protect_user_prompts"],
+        )
+        cache_group.add_argument(
+            "--attention-matching-cross-turn-cache",
+            **cache_kwargs["attention_matching_cross_turn_cache"],
+        )
+        cache_group.add_argument(
+            "--attention-matching-allow-partial-cross-turn-cache-hits",
+            **cache_kwargs[
+                "attention_matching_allow_partial_cross_turn_cache_hits"
+            ],
+        )
+        cache_group.add_argument(
+            "--attention-matching-forget-gate-enabled",
+            **cache_kwargs["attention_matching_forget_gate_enabled"],
+        )
+        cache_group.add_argument(
+            "--attention-matching-forget-gate-alpha",
+            **cache_kwargs["attention_matching_forget_gate_alpha"],
         )
         cache_group.add_argument(
             "--shuffle-control-chunk-size",
@@ -1701,6 +1764,7 @@ class EngineArgs:
             num_gpu_blocks_override=self.num_gpu_blocks_override,
             sliding_window=sliding_window,
             enable_prefix_caching=self.enable_prefix_caching,
+            prefix_caching_mode=self.prefix_caching_mode,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             calculate_kv_scales=self.calculate_kv_scales,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
@@ -1714,12 +1778,29 @@ class EngineArgs:
             compaction_window_size=self.compaction_window_size,
             compaction_stride=self.compaction_stride,
             compaction_strategy=self.compaction_strategy,
+            compaction_max_turns=self.compaction_max_turns,
+            compaction_eviction_turn_stride=self.compaction_eviction_turn_stride,
+            compaction_turn_end_token_id=self.compaction_turn_end_token_id,
+            compaction_turn_padding_token_id=self.compaction_turn_padding_token_id,
             attention_matching_max_queries_per_kv_head=(
                 self.attention_matching_max_queries_per_kv_head
             ),
             attention_matching_query_source=self.attention_matching_query_source,
+            attention_matching_zerobeta=self.attention_matching_zerobeta,
             attention_matching_protect_user_prompts=(
                 self.attention_matching_protect_user_prompts
+            ),
+            attention_matching_cross_turn_cache=(
+                self.attention_matching_cross_turn_cache
+            ),
+            attention_matching_allow_partial_cross_turn_cache_hits=(
+                self.attention_matching_allow_partial_cross_turn_cache_hits
+            ),
+            attention_matching_forget_gate_enabled=(
+                self.attention_matching_forget_gate_enabled
+            ),
+            attention_matching_forget_gate_alpha=(
+                self.attention_matching_forget_gate_alpha
             ),
             shuffle_control_chunk_size=self.shuffle_control_chunk_size,
             shuffle_control_probability=self.shuffle_control_probability,
@@ -1741,9 +1822,16 @@ class EngineArgs:
 
         # Compaction incompatibility guards.
         if self.compaction_window_size > 0:
-            assert not self.enable_prefix_caching, (
-                "Prefix caching is incompatible with KV cache compaction"
-            )
+            if self.enable_prefix_caching:
+                assert self.compaction_strategy == "attention_matching" and (
+                    self.prefix_caching_mode
+                    in ("prefill_only", "am_full", "am_unsafe")
+                ), (
+                    "Prefix caching with KV cache compaction is supported only "
+                    "for attention_matching with prefix_caching_mode="
+                    "'prefill_only', experimental 'am_full', or experimental "
+                    "negative-control 'am_unsafe'."
+                )
             assert self.pipeline_parallel_size <= 1, (
                 "Pipeline parallelism is incompatible with KV cache compaction"
             )
@@ -1758,6 +1846,70 @@ class EngineArgs:
                 )
             assert self.compaction_window_size > self.compaction_stride, (
                 "compaction_window_size must exceed compaction_stride"
+            )
+        if self.compaction_max_turns > 0:
+            assert self.compaction_strategy == "attention_matching", (
+                "turn-window compaction is currently implemented only for "
+                'compaction_strategy="attention_matching"; do not use the '
+                "Markovian/TextWorld turn knobs with FIFO unless the FIFO "
+                "turn path is restored explicitly."
+            )
+            assert self.compaction_window_size > 0, (
+                "compaction_max_turns requires compaction_window_size > 0 "
+                "so the AM manager is active and capacity checks still run"
+            )
+            assert self.compaction_stride > 0, (
+                "compaction_max_turns requires compaction_stride > 0; in AM "
+                "turn mode this is the synthetic KV prefix length"
+            )
+            assert self.compaction_eviction_turn_stride <= self.compaction_max_turns, (
+                "compaction_eviction_turn_stride must be <= compaction_max_turns "
+                "for AM turn-window mode because it is the number of recent "
+                "completed turns kept exact"
+            )
+            assert self.attention_matching_protect_user_prompts != "all_user", (
+                "AM turn-window mode cannot use "
+                'attention_matching_protect_user_prompts="all_user"; that '
+                "would protect every user turn and defeat turn compaction. "
+                'Use "first_user" or "none".'
+            )
+        if self.attention_matching_cross_turn_cache:
+            assert self.compaction_strategy == "attention_matching", (
+                "attention_matching_cross_turn_cache requires "
+                'compaction_strategy="attention_matching".'
+            )
+            assert self.enable_prefix_caching, (
+                "attention_matching_cross_turn_cache requires prefix caching."
+            )
+            assert self.prefix_caching_mode == "am_full", (
+                "attention_matching_cross_turn_cache requires "
+                'prefix_caching_mode="am_full" so synthetic KV is keyed by '
+                "AM source state."
+            )
+            assert self.compaction_max_turns > 0, (
+                "attention_matching_cross_turn_cache currently targets "
+                "turn-window AM and requires compaction_max_turns > 0."
+            )
+            assert self.compaction_turn_padding_token_id is not None, (
+                "attention_matching_cross_turn_cache requires "
+                "compaction_turn_padding_token_id. Cross-turn compressed "
+                "prefix hits depend on hidden tail finalization using the "
+                "same block-alignment filler token as the orchestrator's "
+                "padded prompts."
+            )
+            assert self.attention_matching_query_source == "random_queries", (
+                "attention_matching_cross_turn_cache requires "
+                'attention_matching_query_source="random_queries"; tail-derived '
+                "query sources make the synthetic KV depend on the exact "
+                "recent suffix and defeat cross-turn reuse."
+            )
+        if self.attention_matching_forget_gate_enabled:
+            assert self.compaction_strategy == "attention_matching", (
+                "attention_matching_forget_gate_enabled requires "
+                'compaction_strategy="attention_matching".'
+            )
+            assert 0.0 <= self.attention_matching_forget_gate_alpha <= 1.0, (
+                "attention_matching_forget_gate_alpha must be in [0, 1]."
             )
 
         ray_runtime_env = None

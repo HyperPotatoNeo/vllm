@@ -7,6 +7,8 @@ circular import. The heavier CompactingKVCacheManager lives in manager.py
 and imports from here.
 """
 
+from typing import Any
+
 import msgspec
 
 
@@ -39,3 +41,27 @@ class CompactionEvent(
     # physical position P = P + position_offset, recovering the absolute
     # logical position from before eviction.
     position_offset_after: int
+
+    # Optional trailing metadata. Defaults preserve compatibility with older
+    # three-field FIFO events while carrying enough state for trainer-side AM
+    # replay when compaction_strategy="attention_matching".
+    num_prompt_tokens: int = 0
+    evict_start: int = 0
+    compaction_strategy: str = "fifo"
+    source_len: int = 0
+    target_len: int = 0
+    protected_prefix_len: int = 0
+    synthetic_prefix_len: int = 0
+    exact_kept_tokens: int = 0
+    attention_matching_query_source: str = ""
+    attention_matching_max_queries_per_kv_head: int = 0
+    attention_matching_query_seed: int = 0
+    attention_matching_zerobeta: bool = False
+    attention_matching_pre_sample: bool = False
+    attention_matching_replay_steps: list[dict[str, Any]] | None = None
+    attention_matching_cache_hit_tokens: int = 0
+    attention_matching_selected_indices: list[list[list[int]]] | None = None
+    attention_matching_forget_gate_enabled: bool = False
+    attention_matching_forget_gate_alpha: float = 0.5
+    attention_matching_forget_gate_applied: bool = False
+    attention_matching_hidden_tail_token_ids: list[int] | None = None
