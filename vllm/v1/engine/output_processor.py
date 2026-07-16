@@ -643,8 +643,16 @@ class OutputProcessor:
             # Don't clobber to None if a later step omits the field (e.g.
             # because omit_defaults dropped it on serialization or the field
             # is unset for a request that had events in a prior step).
-            if engine_core_output.compaction_events is not None:
-                req_state.compaction_events = engine_core_output.compaction_events
+            # KV cache compaction: the scheduler streams only NEW events each
+            # step (delta), so append them to the accumulated per-request list.
+            # (Previously it re-sent the full cumulative list every step, which
+            # leaked host RAM because each event carries context-length arrays.)
+            if engine_core_output.compaction_events:
+                if req_state.compaction_events is None:
+                    req_state.compaction_events = []
+                req_state.compaction_events.extend(
+                    engine_core_output.compaction_events
+                )
             # Same overwrite-on-non-None semantics for the recall verdict.
             if engine_core_output.managed_context_restore_kind is not None:
                 req_state.managed_context_restore_kind = (

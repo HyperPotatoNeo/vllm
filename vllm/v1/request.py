@@ -200,6 +200,13 @@ class Request:
         self.segment_generated_base: int = 0
         # History of compaction events (included in API response metadata).
         self.compaction_events: list = []
+        # Cursor: number of compaction_events already streamed to the client.
+        # The scheduler sends only events[compaction_events_sent:] each step
+        # (delta) instead of the full cumulative list, which previously leaked
+        # host RAM in the front-end because each event carries context-length
+        # kept_indices/kept_token_ids arrays. The output processor appends the
+        # deltas, so the client still ends up with the full cumulative list.
+        self.compaction_events_sent: int = 0
         # Flag: request was compacted and needs model runner rebuild.
         self.needs_rebuild: bool = False
         # Managed context: model-selected retries must prefill their visible

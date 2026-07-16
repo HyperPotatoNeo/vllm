@@ -3757,9 +3757,19 @@ class Scheduler(SchedulerInterface):
         request.is_prefill_chunk = False
         request.needs_rebuild = True
         request.skip_reading_prefix_cache = True
-        request._kve_compact_replay_refill_snapshot = replay_snapshot  # type: ignore[attr-defined]
+        # Only arm the exact-KV replay-refill (which emits death indices and
+        # requires the FlexAttention backend) when refill is actually enabled.
+        # Otherwise a preempted request that had prior evictions would be
+        # flagged for replay with no backend support wired up, crashing on the
+        # flash backend. With refill disabled, fall back to a plain re-prefill.
+        refill_enabled = self._compact_replay_refill_enabled()
+        request._kve_compact_replay_refill_snapshot = (  # type: ignore[attr-defined]
+            replay_snapshot if refill_enabled else None
+        )
         request._kve_compact_replay_refill_active = (  # type: ignore[attr-defined]
-            replay_snapshot is not None and replay_snapshot.evictions > 0
+            refill_enabled
+            and replay_snapshot is not None
+            and replay_snapshot.evictions > 0
         )
         request._kve_reprefill_after_flush = True  # type: ignore[attr-defined]
         request._kve_phase4_reprefill_after_pin_release = (  # type: ignore[attr-defined]
@@ -6343,12 +6353,26 @@ class Scheduler(SchedulerInterface):
         )
         self._queue_finished_request_output(request)
 
+    def _take_unsent_compaction_events(self, request) -> list | None:
+        """Return compaction events not yet streamed to the client and advance
+        the per-request cursor. KV-eviction emits fat events (each carries
+        context-length kept_indices/kept_token_ids); re-sending the full
+        cumulative list every decode step leaked host RAM in the front-end
+        (~0.9 GB/s -> pod OOM). Sending only the delta keeps client semantics
+        identical (the output processor appends the deltas) while making the
+        per-step cost O(new events) instead of O(all events)."""
+        events = request.compaction_events
+        if not events:
+            return None
+        sent = getattr(request, "compaction_events_sent", 0)
+        if sent >= len(events):
+            return None
+        delta = list(events[sent:])
+        request.compaction_events_sent = len(events)
+        return delta
+
     def _queue_finished_request_output(self, request: Request) -> None:
-        compaction_events = (
-            list(request.compaction_events)
-            if request.compaction_events
-            else None
-        )
+        compaction_events = self._take_unsent_compaction_events(request)
         self._pending_engine_core_outputs[request.client_index].append(
             EngineCoreOutput(
                 request_id=request.request_id,
@@ -14263,11 +14287,7 @@ class Scheduler(SchedulerInterface):
                     request._pending_finish_status = None
                 else:
                     request.status = RequestStatus.FINISHED_STOPPED
-                compaction_events = (
-                    list(request.compaction_events)
-                    if request.compaction_events
-                    else None
-                )
+                compaction_events = self._take_unsent_compaction_events(request)
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,
@@ -14405,16 +14425,13 @@ class Scheduler(SchedulerInterface):
                 or stopped
             ):
                 # Add EngineCoreOutput for this Request.
-                # Send the full cumulative compaction_events list (overwrite
-                # semantics at the client). Events are append-only and the
-                # list is short (one per stride's worth of generation), so
-                # the per-step overhead is negligible. Only included when
-                # non-empty to keep non-compaction outputs unchanged.
-                compaction_events = (
-                    list(request.compaction_events)
-                    if request.compaction_events
-                    else None
-                )
+                # Stream only the NEW compaction events since the last step
+                # (delta), not the full cumulative list. Each event carries
+                # context-length kept_indices/kept_token_ids, so re-sending the
+                # whole list every decode step leaked host RAM in the front-end
+                # (~0.9 GB/s -> pod OOM). The output processor appends deltas,
+                # so the client still assembles the full cumulative list.
+                compaction_events = self._take_unsent_compaction_events(request)
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,
